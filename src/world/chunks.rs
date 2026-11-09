@@ -386,6 +386,15 @@ pub(crate) struct PropAssets {
     crossarm: Handle<Mesh>,
     /// The unit catenary wire, x from 0 to 1.
     wire: Handle<Mesh>,
+    /// Cross-street drop line: the same catenary at a tighter sag (R3.13).
+    cross_wire: Handle<Mesh>,
+    /// The long lamp bracket reaching over the road (real size, R3.13).
+    long_lamp_arm: Handle<Mesh>,
+    /// The glowing lens under the long bracket's head (real size).
+    long_lamp_head: Handle<Mesh>,
+    /// Scaffold deck planks: weathered plywood, the one warm brown in the
+    /// street furniture.
+    plank: Handle<StandardMaterial>,
     /// Street-lamp head: the one emissive material in the world. The lamps
     /// are on at golden hour -- warm dots along every street, picked up by
     /// the bloom pass, no real light budget spent.
@@ -449,6 +458,10 @@ fn build_prop_assets(
         lamp_head: meshes.add(crate::world::props::bake_lamp_head()),
         crossarm: meshes.add(crate::world::props::bake_crossarm()),
         wire: meshes.add(crate::world::props::bake_wire()),
+        cross_wire: meshes.add(crate::world::overhead::bake_cross_wire()),
+        long_lamp_arm: meshes.add(crate::world::overhead::bake_long_lamp_arm()),
+        long_lamp_head: meshes.add(crate::world::overhead::bake_long_lamp_head()),
+        plank: matte([0.34, 0.26, 0.18], 0.95),
         lamp_glow,
         wire_dark: matte([0.05, 0.05, 0.06], 1.0),
     }
@@ -917,6 +930,53 @@ fn spawn_prop(
             object.base,
             // x spans pole to pole; y/z carry the span-proportional sag and
             // keep the cable near-round (plan side sizes it, see bake_wire).
+            object.size,
+        ),
+        // R3.13: the cross-street layer. Cables keep their z scale at 1 so the
+        // 2.5 cm section survives an 8-12 m span (the along-street run scales
+        // both y and z by span/30, which would thin a short drop to 6 mm).
+        PropKind::CrossWire => (
+            "CrossWire",
+            props.cross_wire.clone(),
+            props.wire_dark.clone(),
+            object.base,
+            object.size,
+        ),
+        PropKind::LongLampArm => (
+            "LongLampArm",
+            props.long_lamp_arm.clone(),
+            props.fixture(0),
+            object.base,
+            object.size,
+        ),
+        PropKind::LongLampHead => (
+            "LongLampHead",
+            props.long_lamp_head.clone(),
+            props.lamp_glow.clone(),
+            object.base,
+            object.size,
+        ),
+        // Scaffold parts are planted parts: the posts stand on the ground, the
+        // beams and deck sit at their own clear heights.
+        PropKind::ScaffoldPost => (
+            "ScaffoldPost",
+            assets.unit_cylinder.clone(),
+            props.fixture(0),
+            object.base + object.size.y * 0.5,
+            object.size,
+        ),
+        PropKind::ScaffoldBeam => (
+            "ScaffoldBeam",
+            assets.unit_cube.clone(),
+            props.fixture(object.variant),
+            object.base + object.size.y * 0.5,
+            object.size,
+        ),
+        PropKind::ScaffoldDeck => (
+            "ScaffoldDeck",
+            assets.unit_cube.clone(),
+            props.plank.clone(),
+            object.base + object.size.y * 0.5,
             object.size,
         ),
     };

@@ -43,6 +43,12 @@ fn main() {
                             PropKind::LampHead => "prop/lamp_head",
                             PropKind::CrossArm => "prop/crossarm",
                             PropKind::Wire => "prop/wire",
+                            PropKind::CrossWire => "prop/xwire",
+                            PropKind::LongLampArm => "prop/long_arm",
+                            PropKind::LongLampHead => "prop/long_head",
+                            PropKind::ScaffoldPost => "prop/scaf_post",
+                            PropKind::ScaffoldBeam => "prop/scaf_beam",
+                            PropKind::ScaffoldDeck => "prop/scaf_deck",
                         },
                     };
                     *counts.entry(key).or_default() += 1;

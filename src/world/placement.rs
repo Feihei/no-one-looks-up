@@ -338,6 +338,19 @@ pub fn plan_chunk(graph: &LayoutGraph, seed: u64, chunk: (i32, i32), tree_assets
                 curb,
             );
         }
+        // R3.13: the cross-street overhead layer -- cables, long lamp brackets
+        // and scaffolds, everything that hangs OVER the road instead of
+        // standing beside it. Placed once per edge rather than per side,
+        // because a span belongs to both curbs at once. It replays the pole
+        // and tree streams instead of drawing from them, so no approved
+        // position moves.
+        crate::world::overhead::place_overhead_furniture(
+            &mut plan,
+            graph,
+            seed,
+            edge_index,
+            tree_assets,
+        );
     }
 
     for (block_index, block) in graph.blocks.iter().enumerate() {
@@ -639,26 +652,91 @@ fn place_street_trees(
     tree_assets: u8,
     curb: f32,
 ) {
-    let probability = params.street_tree_probability;
-    if probability <= 0.0 || tree_assets == 0 {
+    if params.street_tree_probability <= 0.0 || tree_assets == 0 {
         return;
     }
-    let candidates = (edge_length / TREE_SPACING).floor().max(1.0) as usize;
     // Half the setback: the tree stands between curb and facade.
     let perp = curb + params.setback * 0.5;
+    let line = street_tree_line(
+        rng,
+        params.street_tree_probability,
+        edge_length,
+        tree_assets,
+    );
+    for (along, tree) in line {
+        let position = edge_mid + edge_dir * along + edge_normal * perp;
+        plan.objects.push(PlacedObject {
+            kind: PlacedKind::StreetTree,
+            position,
+            yaw: tree.yaw,
+            size: bevy::math::Vec3::ZERO,
+            footprint_half: bevy::math::Vec2::ZERO,
+            wear: 0.0,
+            variant: 0,
+            tree: Some(tree),
+            base: 0.0,
+        });
+    }
+}
 
+/// The street trees one edge side actually grows, as `(along offset,
+/// instance)` pairs.
+///
+/// Single source of truth for the tree stream's draw order: one probability
+/// roll per candidate (drawn whether or not it is used, so the stream stays
+/// stable) and three instance draws per tree. Both the plan and the
+/// cross-street pass in `world::overhead` go through it, so the overhead layer
+/// sees the real trunks instead of a second guess at where they are.
+fn street_tree_line(
+    rng: &mut StdRng,
+    probability: f32,
+    edge_length: f32,
+    tree_assets: u8,
+) -> Vec<(f32, TreeInstance)> {
+    let candidates = (edge_length / TREE_SPACING).floor().max(1.0) as usize;
+    let mut line = Vec::new();
     for i in 0..candidates {
-        // Draw the probability roll for every candidate, whether or not it
-        // is used, so the stream stays stable.
         let roll: f32 = rng.random();
         if roll > probability {
             continue;
         }
         let t = (i as f32 + 0.5) / candidates as f32;
         let along = (t - 0.5) * edge_length;
-        let position = edge_mid + edge_dir * along + edge_normal * perp;
-        push_tree(plan, rng, PlacedKind::StreetTree, position, tree_assets);
+        line.push((
+            along,
+            TreeInstance {
+                asset: rng.random_range(0..tree_assets),
+                scale: rng.random_range(TREE_SCALE_MIN..=TREE_SCALE_MAX),
+                yaw: rng.random_range(0.0..std::f32::consts::TAU),
+            },
+        ));
     }
+    line
+}
+
+/// Along-offsets of the street trees one edge side grows, without building a
+/// plan.
+///
+/// A replay of [`street_tree_line`] on the same per-edge salt stream, for
+/// placement rules that must not grow through a tree. The along offset is
+/// fixed before the three instance draws, so any positive `tree_assets` yields
+/// the same offsets -- callers that only need the positions can pass `1`.
+pub fn street_tree_alongs(
+    seed: u64,
+    edge_index: u32,
+    side: u32,
+    probability: f32,
+    edge_length: f32,
+    tree_assets: u8,
+) -> Vec<f32> {
+    if probability <= 0.0 || tree_assets == 0 {
+        return Vec::new();
+    }
+    let mut rng = edge_rng(seed, edge_index, 1000 + side * 16);
+    street_tree_line(&mut rng, probability, edge_length, tree_assets)
+        .into_iter()
+        .map(|(along, _)| along)
+        .collect()
 }
 
 /// Dense trees filling a FOREST block (the original `_place_trees_in_forest_block`).

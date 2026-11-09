@@ -14,6 +14,11 @@
 //! sagging between the poles -- lines against the sky are what a walk
 //! through an old district actually looks like.
 //!
+//! Everything here touches the ground or a wall. The layer that hangs **over**
+//! the road -- cross-street cables, long cantilevered lamp brackets, scaffolds
+//! -- lives in [`crate::world::overhead`], because it answers to a different
+//! rule (ADR-0006): nothing up there may come within 3.5 m of the street.
+//!
 //! # Everything is a shared mesh, scaled per instance
 //!
 //! Like the roofs (11.3): one unit cube and one unit cylinder cover every
@@ -74,6 +79,22 @@ pub enum PropKind {
     CrossArm,
     /// One catenary wire span between two consecutive poles.
     Wire,
+    /// 跨街电线: a cable strung from a pole on one curb to the pole opposite
+    /// it (R3.13, see `world::overhead`).
+    CrossWire,
+    /// 悬挑灯臂: a long bracket off a pole reaching over the middle of the
+    /// road, with [`PropKind::LongLampHead`] glowing at its tip.
+    LongLampArm,
+    /// The lamp head at the end of a long bracket.
+    LongLampHead,
+    /// 棚架立柱: a scaffold upright on the curb line, outside the walkable
+    /// street. Stands on the ground, so it is not part of the overhead
+    /// clearance rule.
+    ScaffoldPost,
+    /// 棚架横梁: a scaffold beam over the road (longitudinal or transverse).
+    ScaffoldBeam,
+    /// 棚架顶板: the deck planks a scaffold carries over the street.
+    ScaffoldDeck,
 }
 
 /// Height of the 雨棚 wall mount above the ground (m): just under the
@@ -144,7 +165,7 @@ pub const WIRE_RADIUS: f32 = 0.02;
 
 /// Appends one prop. `variant` reuses the facade variant slot as a material
 /// selector: 0 = standard finish, 1 = rusted (or the second awning canvas).
-fn push_prop(
+pub(crate) fn push_prop(
     plan: &mut ChunkPlan,
     kind: PropKind,
     position: bevy::math::Vec2,
@@ -464,6 +485,51 @@ pub fn place_building_props(
     }
 }
 
+/// One utility pole on an edge side's curb line.
+///
+/// The pole line is the *only* furniture the rest of the city can hang things
+/// from (cross-street cables, long lamp brackets), so it is exposed as data
+/// instead of being spawned straight out of a local loop.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PoleSlot {
+    /// Offset from the edge midpoint along the edge (m).
+    pub along: f32,
+    /// Whether this pole carries the short lamp bracket.
+    pub lamp: bool,
+    /// Yaw jitter of the pole-top crossarm (rad), added to
+    /// `edge_yaw(edge_normal)` by the spawner.
+    pub crossarm_jitter: f32,
+}
+
+/// The pole line of one edge side, as a pure replayable function.
+///
+/// Same three draws per pole, in the same order, as the original inline loop,
+/// so extracting it moved no pole by a millimetre (the furniture stability
+/// test pins that). The cross-street pass in `world::overhead` replays it to
+/// hang cables on real poles rather than guessing where the poles are.
+pub fn pole_slots(seed: u64, edge_index: u32, side: u32, edge_length: f32) -> Vec<PoleSlot> {
+    let mut rng = edge_salt_rng(seed, edge_index, side);
+    // Pole slots along the edge, evenly spaced like the tree candidates,
+    // with one deterministic micro-jitter so a street of poles does not
+    // read as a parade. The jitter draws even when nothing else does, so
+    // the stream stays stable under any future rule change.
+    let count = ((edge_length / POLE_SPACING).round() as usize).max(2);
+    let mut slots = Vec::with_capacity(count);
+    for i in 0..count {
+        let t = (i as f32 + 0.5) / count as f32;
+        let along = (t - 0.5) * edge_length + rng.random_range(-2.5..=2.5);
+        // Street lamps are common but not universal on old streets.
+        let lamp = rng.random::<f32>() < 0.45;
+        let crossarm_jitter = rng.random_range(-CROSSARM_YAW_JITTER..=CROSSARM_YAW_JITTER);
+        slots.push(PoleSlot {
+            along,
+            lamp,
+            crossarm_jitter,
+        });
+    }
+    slots
+}
+
 /// Places the street furniture of one edge side (R3.11 step 11.5): utility
 /// poles, lamp arms with their emissive heads, and the wire spans between
 /// consecutive poles.
@@ -487,21 +553,12 @@ pub fn place_street_furniture(
     edge_length: f32,
     curb: f32,
 ) {
-    let mut rng = edge_salt_rng(seed, edge_index, side);
     let street_dir = -edge_normal;
     let stand_line = edge_mid + edge_normal * (curb + POLE_STANDOFF);
+    let slots = pole_slots(seed, edge_index, side, edge_length);
 
-    // Pole slots along the edge, evenly spaced like the tree candidates,
-    // with one deterministic micro-jitter so a street of poles does not
-    // read as a parade. The jitter draws even when nothing else does, so
-    // the stream stays stable under any future rule change.
-    let slots = ((edge_length / POLE_SPACING).round() as usize).max(2);
-    let mut alongs: Vec<f32> = Vec::with_capacity(slots);
-    for i in 0..slots {
-        let t = (i as f32 + 0.5) / slots as f32;
-        let along = (t - 0.5) * edge_length + rng.random_range(-2.5..=2.5);
-        alongs.push(along);
-        let position = stand_line + edge_dir * along;
+    for slot in &slots {
+        let position = stand_line + edge_dir * slot.along;
         push_prop(
             plan,
             PropKind::Pole,
@@ -511,10 +568,9 @@ pub fn place_street_furniture(
             0.0,
             0,
         );
-        // Street lamps are common but not universal on old streets.
-        if rng.random::<f32>() < 0.45 {
+        if slot.lamp {
             // The arm is baked reaching local +x; aim it over the road.
-            let arm_yaw = (-street_dir.y).atan2(street_dir.x);
+            let arm_yaw = edge_yaw(street_dir);
             push_prop(
                 plan,
                 PropKind::LampArm,
@@ -537,13 +593,11 @@ pub fn place_street_furniture(
         // 横担: the crossarm the wire run meets. Square across the street by
         // default (the wires run along it), with a small per-pole yaw so a
         // street of poles does not read as stamped copies.
-        let crossarm_yaw =
-            edge_yaw(edge_normal) + rng.random_range(-CROSSARM_YAW_JITTER..=CROSSARM_YAW_JITTER);
         push_prop(
             plan,
             PropKind::CrossArm,
             position,
-            crossarm_yaw,
+            edge_yaw(edge_normal) + slot.crossarm_jitter,
             Vec3::ONE,
             CROSSARM_MOUNT,
             0,
@@ -552,12 +606,12 @@ pub fn place_street_furniture(
     // Wire spans between consecutive poles, three stacked heights each.
     // Each span starts at the earlier pole and scales to the actual gap;
     // the yaw aims local +x along the street.
-    for w in 0..alongs.len().saturating_sub(1) {
-        let span = alongs[w + 1] - alongs[w];
+    for w in 0..slots.len().saturating_sub(1) {
+        let span = slots[w + 1].along - slots[w].along;
         if span <= 1.0 {
             continue;
         }
-        let start = stand_line + edge_dir * alongs[w];
+        let start = stand_line + edge_dir * slots[w].along;
         for (rung, height) in WIRE_HEIGHTS.iter().enumerate() {
             push_prop(
                 plan,
@@ -574,7 +628,7 @@ pub fn place_street_furniture(
 
 /// Yaw that turns local +x to `dir` (same convention as the buildings'
 /// yaw fix: `Quat::from_rotation_y` maps +x to `(cos y, -sin y)`).
-fn edge_yaw(dir: bevy::math::Vec2) -> f32 {
+pub(crate) fn edge_yaw(dir: bevy::math::Vec2) -> f32 {
     (-dir.y).atan2(dir.x)
 }
 
@@ -592,7 +646,7 @@ fn edge_salt_rng(seed: u64, edge: u32, side: u32) -> StdRng {
 // --- mesh baking -----------------------------------------------------------
 
 /// One axis-aligned box, six quads wound CCW seen from outside.
-fn push_box(buf: &mut MeshBuf, min: [f32; 3], max: [f32; 3]) {
+pub(crate) fn push_box(buf: &mut MeshBuf, min: [f32; 3], max: [f32; 3]) {
     let [x0, y0, z0] = min;
     let [x1, y1, z1] = max;
     buf.quad([x1, y0, z1], [x1, y0, z0], [x1, y1, z0], [x1, y1, z1]);
@@ -687,30 +741,40 @@ pub fn bake_lamp_arm() -> Mesh {
 /// The lamp head: the glowing box that sits in the arm's bracket, same
 /// origin and orientation as [`bake_lamp_arm`]. Separate mesh so the head
 /// carries the emissive material while the arm stays matte.
+///
+/// It must **protrude** from the bracket: the housing in [`bake_lamp_arm`] is
+/// a closed box, so a head that sat inside it (the first version did) was
+/// simply occluded -- the one emissive prop in the city never showed a single
+/// lit pixel. The lens now hangs 1.8 cm below the housing's underside, which
+/// is exactly the face a walker at eye height sees it from.
 pub fn bake_lamp_head() -> Mesh {
     let mut buf = MeshBuf::new();
-    push_box(&mut buf, [1.17, -0.13, -0.10], [1.38, -0.01, 0.10]);
+    push_box(&mut buf, [1.19, -0.168, -0.095], [1.36, -0.14, 0.095]);
     buf.build()
 }
 
 /// One catenary wire span, baked from x = 0 to x = 1, sagging along a
-/// parabola pinned to y = 0 at both ends with an absolute [`WIRE_SAG`]
-/// dip at the middle.
+/// parabola pinned to y = 0 at both ends with an absolute `sag` dip at the
+/// middle.
 ///
 /// Instances translate to the *earlier* pole of the span, scale x by the
-/// real pole-to-pole distance and y by `span / WIRE_NOMINAL`: the dip then
-/// grows with the span the way a real catenary does, and the 2 cm cable
-/// stays within a whisker of round (its z scale runs 0.013-0.027 over the
-/// 20-40 m spans the streets produce).
-pub fn bake_wire() -> Mesh {
+/// real pole-to-pole distance and y by `span / nominal`: the dip then
+/// grows with the span the way a real catenary does, and the cable keeps
+/// its baked radius on the z axis.
+///
+/// Shared by the three-wire run along a street ([`bake_wire`]) and the
+/// cross-street drop lines in `world::overhead` ([`bake_cross_wire`]): the
+/// two differ only in sag, radius and nominal span, which is what the
+/// parameters are.
+pub(crate) fn bake_catenary(sag: f32, radius: f32) -> Mesh {
     const SEGMENTS: usize = 8;
     let mut buf = MeshBuf::new();
-    let sag = |x: f32| 4.0 * WIRE_SAG * x * (1.0 - x);
-    // A thin tube with a diamond section: at 2 cm nobody can tell it from
-    // a circle, and it quarters the vertex count.
+    let dip = |x: f32| 4.0 * sag * x * (1.0 - x);
+    // A thin tube with a diamond section: at a couple of centimetres nobody
+    // can tell it from a circle, and it quarters the vertex count.
     let ring = |x: f32| {
-        let r = WIRE_RADIUS;
-        let y = -sag(x);
+        let r = radius;
+        let y = -dip(x);
         [[x, y + r, 0.0], [x, y, r], [x, y - r, 0.0], [x, y, -r]]
     };
     for s in 0..SEGMENTS {
@@ -732,6 +796,11 @@ pub fn bake_wire() -> Mesh {
     buf.tri(b[0], b[1], b[2]);
     buf.tri(b[0], b[2], b[3]);
     buf.build()
+}
+
+/// The three-wire run along a street, at [`WIRE_SAG`] / [`WIRE_RADIUS`].
+pub fn bake_wire() -> Mesh {
+    bake_catenary(WIRE_SAG, WIRE_RADIUS)
 }
 
 /// Places the street furniture of one edge side (R3.11 step 11.5): utility
