@@ -150,6 +150,26 @@ pub const LAMP_MOUNT: f32 = 7.5;
 /// dot per pole, picked up by the bloom pass, no real light budget spent.
 pub const LAMP_EMISSIVE: f32 = 4.0;
 
+/// Distance from the camera at which a lamp's emissive lens is switched off
+/// (m). Applies to both the short bracket's head and the long cross-street
+/// one.
+///
+/// The lens is a 2 cm-tall emissive sliver hanging under its shade, and the
+/// scene camera runs `Msaa::Off` (bevy_elements needs a single-sample depth
+/// prepass for its cloud pass). A sliver narrower than a pixel row is not
+/// faded by anything: it covers the row on one frame and misses it on the
+/// next, and bloom turns that on/off into a twinkle. At the scene's 45°
+/// vertical FOV and 1080p, the lens clears a full pixel row only inside ~50 m,
+/// is 0.65 px tall at 80 m, and is a point past 100 m. 60 m is where the dot
+/// has already stopped being a resolved shape: cutting there costs nothing the
+/// eye was reading and removes the whole range that twinkles.
+///
+/// No fade band, on purpose. `VisibilityRange`'s crossfade is a screen-space
+/// dither, and on a 2 px dot a dither only trades one flicker for another for
+/// the length of the approach. The matte shade above the lens stays put, so
+/// the fixture still reads down the street -- only the light goes out.
+pub const LAMP_GLOW_RANGE: f32 = 60.0;
+
 /// Wire sag baked into the unit-span mesh, at [`WIRE_NOMINAL`] span (m).
 /// Instances scale y by `span / WIRE_NOMINAL`, so the dip grows with the
 /// span the way a real catenary does.

@@ -13,6 +13,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
+use bevy::camera::visibility::VisibilityRange;
 use bevy::prelude::*;
 
 use crate::plugins::facade::{FacadeMaterial, facade_material};
@@ -816,6 +817,17 @@ fn spawn_roof(
     }
 }
 
+/// Visibility range that switches a lamp's emissive lens off past
+/// [`crate::world::props::LAMP_GLOW_RANGE`].
+///
+/// Abrupt, not crossfaded: the lens is already under a pixel tall at that
+/// distance, and a dithered fade would animate that sliver instead of removing
+/// it (see the constant's note). Everything else in the world is drawn at
+/// every distance the chunk window reaches.
+fn lamp_glow_range() -> VisibilityRange {
+    VisibilityRange::abrupt(0.0, crate::world::props::LAMP_GLOW_RANGE)
+}
+
 /// Spawns one prop entity (R3.11 step 11.4).
 ///
 /// Two mesh conventions meet here: unit meshes (cube, cylinder) scale by
@@ -980,7 +992,7 @@ fn spawn_prop(
             object.size,
         ),
     };
-    parent.spawn((
+    let mut spawned = parent.spawn((
         Name::new(name),
         Mesh3d(mesh),
         MeshMaterial3d(material),
@@ -988,6 +1000,12 @@ fn spawn_prop(
             .with_rotation(rotation)
             .with_scale(scale),
     ));
+    // The two emissive lenses are the only subpixel-bright surfaces in the
+    // world, and the only props with a draw distance: a bright sliver that
+    // small does not fade out, it blinks (see `LAMP_GLOW_RANGE`).
+    if matches!(kind, PropKind::LampHead | PropKind::LongLampHead) {
+        spawned.insert(lamp_glow_range());
+    }
 }
 
 /// Spawns a chunk's planned content under its root: buildings as BoxMesh
@@ -1419,6 +1437,56 @@ mod tests {
             }
             assert_eq!(checked, near, "{name} is missing on some trees");
         }
+    }
+
+    #[test]
+    fn only_the_lamp_lenses_have_a_draw_distance() {
+        // A lamp's lens is a 3 cm emissive sliver: past the range it is a
+        // subpixel dot whose coverage flips between frames, which reads as a
+        // twinkle. Everything else in a chunk -- poles, wires, awnings, the
+        // scaffold deck -- is drawn at every distance the chunk window reaches,
+        // so the range has to stay on the two lenses and nowhere else.
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, super::WorldPlugin))
+            .init_resource::<ButtonInput<KeyCode>>()
+            .init_resource::<Assets<Mesh>>()
+            .init_resource::<Assets<StandardMaterial>>()
+            .init_resource::<Assets<crate::plugins::season::TreeSeasonMaterial>>();
+        app.world_mut().spawn((
+            Camera3d::default(),
+            Transform::from_xyz(CENTER, 1.6, CENTER),
+        ));
+        for _ in 0..30 {
+            app.update();
+        }
+
+        let mut query = app.world_mut().query::<(&Name, Option<&VisibilityRange>)>();
+        let mut lenses = 0usize;
+        for (name, range) in query.iter(app.world()) {
+            let name = name.as_str();
+            let is_lens = name == "LampHead" || name == "LongLampHead";
+            // Tree tiers carry their own ranges (40/110/220 m) and are not
+            // props; everything else must be unconditionally drawn.
+            let is_tree = name.starts_with("Tree");
+            match (is_lens, range) {
+                (true, Some(range)) => {
+                    let want = crate::world::props::LAMP_GLOW_RANGE;
+                    assert_eq!(range.start_margin, 0.0..0.0, "{name} start");
+                    assert_eq!(range.end_margin, want..want, "{name} end");
+                    assert!(
+                        range.is_abrupt(),
+                        "{name} dithers its last metres: a sub-pixel lens strung out \
+                         over a fade band only flickers differently"
+                    );
+                    lenses += 1;
+                }
+                (true, None) => panic!("{name} has no draw distance and will twinkle"),
+                (false, Some(_)) if is_tree => {}
+                (false, Some(_)) => panic!("{name} was given a draw distance"),
+                (false, None) => {}
+            }
+        }
+        assert!(lenses > 0, "no lamp lenses spawned in the shoulder chunks");
     }
 
     #[test]
