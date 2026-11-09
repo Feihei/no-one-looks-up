@@ -424,9 +424,10 @@ pub fn bake_skeleton_lod(
             continue;
         }
         let radius = branch.radius;
-        // A frustum whose top is ~(radius_ratio) of its bottom gives the branch
-        // its taper without a second mesh.
-        let taper = profile.radius_ratio.clamp(0.25, 0.95);
+        // Taper comes from the segment's own two radii, not from the profile's
+        // per-level ratio: a long limb is split into segments and its taper has
+        // to run along the whole limb, or the chain pinches at every joint.
+        let taper = (branch.end_radius / radius).clamp(0.25, 1.0);
         let unit = ConicalFrustumMeshBuilder::new(taper, 1.0, 1.0, BRANCH_SIDES)
             .build()
             // Unit tube runs +Y from its base; move the base to the origin before
@@ -620,10 +621,12 @@ fn leaf_spray(
     let side0 = anchor.dir.cross(seed_axis).normalize();
     let side1 = anchor.dir.cross(side0).normalize();
 
-    // Spread the cluster's cards over most of the twig. Longer branches host
-    // several clusters, and each one covers a different stretch because its
-    // anchor sits at a different point along the branch.
-    let spray = (cluster_radius * 1.2).min(anchor.len).max(0.08);
+    // Spread the cluster's cards over a SHORT stretch of the twig. When this
+    // followed the whole limb, every cluster smeared its cards along a metre of
+    // straight wood and the crown read as a cylinder of leaves wrapped around
+    // each limb. Long limbs are also segmented now, so an anchor is already
+    // short; the spray stays well inside it.
+    let spray = (cluster_radius * 0.8).min(anchor.len * 0.7).max(0.08);
 
     // A card's half-extent. Long axis = the old cluster silhouette; short axis
     // follows the species' baked mask aspect so the leaf is not stretched.

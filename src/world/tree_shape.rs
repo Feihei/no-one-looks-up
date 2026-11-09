@@ -95,6 +95,25 @@ pub struct TreeProfile {
     /// swallow it (the aspen read as "pole with a ball" at any `leaf_min_level`
     /// because foliage started at 55% of every limb).
     pub leaf_start: f32,
+    /// Longest straight run (as a fraction of `height`) a limb may keep before
+    /// it is split into another segment.
+    ///
+    /// A limb baked as one long straight tube has two failure modes the player
+    /// sees: bare spokes where the foliage does not reach, or a cylinder of
+    /// leaf cards wrapped around the tube. Short segments keep every straight
+    /// piece below leaf-cluster size, and the limb becomes a polyline the
+    /// foliage can follow.
+    pub max_segment: f32,
+    /// Total bend of one limb in degrees (±). Spread across the limb's
+    /// segments, so a limb is an arc instead of a set of straight spokes.
+    pub limb_curve_deg: f32,
+    /// How strongly a deeper generation turns AWAY from the crown axis instead
+    /// of climbing (0 = every child keeps `up_bias`, 1 = the deepest twigs
+    /// leave the crown's core radially).
+    ///
+    /// This is the "is the crown a ball or a column" knob: limbs climb out of
+    /// the trunk, then the twigs fan outward, which rounds the envelope.
+    pub crown_rounding: f32,
     /// Overall height (m). Skeleton units are multiplied by this at the end.
     pub height: f32,
     /// Overall width (m) — scales XZ only, so a 3 m x 2 m aspen keeps its
@@ -146,14 +165,15 @@ pub const TREE_PROFILES: [TreeProfile; 3] = [
         // each limb long enough to lift the crown to 3x eye height.
         children: (2, 3),
         child_span: (0.72, 0.85),
-        // Narrow spread + very strong upward bias = limbs that climb rather
-        // than splay. This is the aspen's whole silhouette: tall and
-        // columnar. At up_bias 0.55 the branches still splayed enough that
-        // every variant read as a ball on a pole.
-        spread_deg: (14.0, 26.0),
+        // Narrow spread + strong upward bias = limbs that climb rather than
+        // splay. This is the aspen's silhouette: tall and columnar. Widened
+        // 2026-11-09 (14-26 / jitter 20) because the column read as too
+        // uniform: a real aspen is loose and ragged, with a few limbs breaking
+        // the envelope. It must stay a column, not become a ball.
+        spread_deg: (16.0, 44.0),
         whorl_deg: 200.0,
-        jitter_deg: 20.0,
-        up_bias: 0.75,
+        jitter_deg: 30.0,
+        up_bias: 0.62,
         // One clump per branch plus runs spaced along it: distributing the
         // same cards over every generation reads as a continuous crown instead
         // of a clump at each twig tip.
@@ -178,6 +198,13 @@ pub const TREE_PROFILES: [TreeProfile; 3] = [
         // the canopy back above 3x eye height, which is the complaint this
         // was meant to fix.
         leaf_start: 0.5,
+        // 0.05 of 14 m = every straight run stays under 0.7 m, so the longest
+        // tube is about one leaf clump; the limb itself is an arc.
+        max_segment: 0.05,
+        limb_curve_deg: 22.0,
+        // Keeps the crown a narrow dome rather than a column of straight
+        // spokes, without opening it into a ball.
+        crown_rounding: 0.6,
         height: 14.0,
         width: 4.2,
     },
@@ -222,6 +249,11 @@ pub const TREE_PROFILES: [TreeProfile; 3] = [
         // Clumps stay on the twig; 0.5 put them a clump-radius clear of it.
         leaf_spread: 0.18,
         leaf_start: 0.5,
+        max_segment: 0.055,
+        limb_curve_deg: 22.0,
+        // A street tree's crown is read as a ball: the deep twigs fan outward
+        // until the envelope is roughly as wide as it is tall.
+        crown_rounding: 0.75,
         height: 11.5,
         width: 5.5,
     },
@@ -256,6 +288,9 @@ pub const TREE_PROFILES: [TreeProfile; 3] = [
         leaf_density: 0.82,
         leaf_spread: 0.18,
         leaf_start: 0.45,
+        max_segment: 0.06,
+        limb_curve_deg: 24.0,
+        crown_rounding: 0.85,
         height: 10.5,
         width: 7.5,
     },
@@ -291,8 +326,15 @@ pub struct Branch {
     pub end: [f32; 3],
     /// Radius at the start (m).
     pub radius: f32,
+    /// Radius at the end (m). A long limb is split into several of these
+    /// segments, so the taper has to run along the whole limb, not restart at
+    /// every segment.
+    pub end_radius: f32,
     /// Branching level (0 = trunk).
     pub level: u8,
+    /// Which growth step (limb) this segment belongs to. Segments of one limb
+    /// share it, so the limb can be measured as a whole.
+    pub limb: u32,
 }
 
 /// A generated tree: branches first (trunk order), then foliage.
@@ -397,6 +439,18 @@ fn add(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
     [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
 }
 
+fn sub(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+}
+
+fn magnitude(v: [f32; 3]) -> f32 {
+    (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt()
+}
+
+fn distance(a: [f32; 3], b: [f32; 3]) -> f32 {
+    magnitude(sub(b, a))
+}
+
 fn scale(v: [f32; 3], s: f32) -> [f32; 3] {
     [v[0] * s, v[1] * s, v[2] * s]
 }
@@ -441,6 +495,80 @@ struct Pending {
     level: u8,
 }
 
+/// Splits one pending limb into short segments along a shallow arc.
+///
+/// One long straight tube is what the player sees as either a bare spoke or a
+/// cylinder of leaves: no foliage on the long middle, and whatever does attach
+/// wraps the tube. Segmenting keeps every straight run under `max_segment` and
+/// bends the limb, so the leaf clusters sit on a curve the eye reads as a
+/// branch.
+fn build_chain(
+    rng: &mut StdRng,
+    pending: &Pending,
+    end_radius: f32,
+    limb: u32,
+    profile: &TreeProfile,
+) -> Vec<Branch> {
+    let max_segment = (profile.max_segment * profile.height).max(0.3);
+    let count = ((pending.length / max_segment).ceil() as usize).clamp(1, 8);
+    let step = pending.length / count as f32;
+    // One arc per limb, in a random plane: no two limbs curve alike.
+    let bend = profile.limb_curve_deg.to_radians() * rng.random_range(-1.0..1.0);
+    let roll = rng.random_range(0.0..std::f32::consts::TAU);
+    let mut segments = Vec::with_capacity(count);
+    let mut cursor = pending.start;
+    for index in 0..count {
+        // Turn grows along the limb, so it leaves the fork pointing the way a
+        // limb should and bends over its own length.
+        let dir = tilt(
+            pending.dir,
+            bend * (index as f32 + 1.0) / count as f32,
+            roll,
+        );
+        let end = add(cursor, scale(dir, step));
+        let from = index as f32 / count as f32;
+        let to = (index as f32 + 1.0) / count as f32;
+        segments.push(Branch {
+            start: cursor,
+            end,
+            radius: pending.radius + (end_radius - pending.radius) * from,
+            end_radius: pending.radius + (end_radius - pending.radius) * to,
+            level: pending.level,
+            limb,
+        });
+        cursor = end;
+    }
+    segments
+}
+
+/// Point and forward direction at fraction `t` along a segment chain.
+fn along_chain(chain: &[Branch], t: f32) -> ([f32; 3], [f32; 3]) {
+    let total: f32 = chain.iter().map(|b| distance(b.start, b.end)).sum();
+    let mut target = total * t.clamp(0.0, 1.0);
+    for (index, branch) in chain.iter().enumerate() {
+        let len = distance(branch.start, branch.end);
+        if target <= len || index + 1 == chain.len() {
+            let local = if len > 1e-6 {
+                (target / len).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            return (
+                lerp(branch.start, branch.end, local),
+                normalize(sub(branch.end, branch.start)),
+            );
+        }
+        target -= len;
+    }
+    (chain[0].start, normalize(sub(chain[0].end, chain[0].start)))
+}
+
+/// Position of `y` inside the crown's height range (0 at the crown base, 1 at
+/// the top of the height budget), clamped.
+fn height_fraction(y: f32, base: f32, span: f32) -> f32 {
+    ((y - base) / span).clamp(0.0, 1.0)
+}
+
 /// Grows one tree of `species` from `seed`. `id` only salts the stream so
 /// two nearby trees of the same species look different.
 pub fn grow_tree(seed: u64, species: u8, id: u64) -> TreeSkeleton {
@@ -469,6 +597,9 @@ pub fn grow_tree_with(seed: u64, species: u8, id: u64, profile: &TreeProfile) ->
         ..Default::default()
     };
     let mut queue: std::collections::VecDeque<Pending> = std::collections::VecDeque::new();
+    // Identifier for one growth step, shared by all the segments it splits
+    // into: a limb has to be measurable as a whole even after segmentation.
+    let mut limb = 0u32;
 
     // Normalized units everywhere, scaled at the end: `height` is the trunk
     // length of a full-height tree, so a "1.0 tall" profile is `height` m.
@@ -487,36 +618,36 @@ pub fn grow_tree_with(seed: u64, species: u8, id: u64, profile: &TreeProfile) ->
     });
 
     while let Some(branch) = queue.pop_front() {
-        let end = add(branch.start, scale(branch.dir, branch.length));
-        skeleton.branches.push(Branch {
-            start: branch.start,
-            end,
-            radius: branch.radius,
-            level: branch.level,
-        });
+        let end_radius = branch.radius * profile.radius_ratio;
+        let chain = build_chain(&mut rng, &branch, end_radius, limb, profile);
+        limb += 1;
         skeleton.total_length += branch.length;
+        skeleton.branches.extend_from_slice(&chain);
 
-        // Foliage: clusters at the tip plus an optional run along the branch.
+        // Foliage: clusters at the limb tip plus an optional run along it.
         //
-        // Clusters are placed ON the branch axis (a short step back from the
-        // tip) rather than orbiting it. Orbiting put the outermost blobs clear
-        // of the crown, and once `leaf_density` thinned the field they hung in
+        // Clusters are placed ON the limb (a short step back from the tip)
+        // rather than orbiting it. Orbiting put the outermost blobs clear of
+        // the crown, and once `leaf_density` thinned the field they hung in
         // the air as debris instead of reading as leaf mass.
         if branch.level >= profile.leaf_min_level {
             let level_above = (branch.level - profile.leaf_min_level) as f32;
             let radius =
                 profile.leaf_radius * profile.leaf_radius_ratio.powf(level_above) * profile.height;
+            // Run clusters cover the leafy part of the limb only; the stretch
+            // from the fork to `leaf_start` stays bare so the limb's base and
+            // the trunk keep their silhouette.
+            let start = profile.leaf_start.clamp(0.0, 0.95);
             let clusters = profile.leaf_clusters.max(1);
             for index in 0..clusters {
-                // A few blobs along the last stretch of the branch, so the
-                // cluster is a clump rather than one ball balanced on the tip.
-                let start = profile.leaf_start.clamp(0.0, 0.95);
+                // A few clusters along the last stretch of the limb, so the
+                // tip is a clump rather than one ball balanced on the end.
                 let t = if clusters <= 1 {
                     (start + 1.0) * 0.5
                 } else {
                     start + (1.0 - start) * index as f32 / (clusters - 1) as f32
                 };
-                let center = lerp(branch.start, end, t);
+                let (center, dir) = along_chain(&chain, t);
                 let drift = radius * profile.leaf_spread;
                 let offset = [
                     leaf_rng.random_range(-drift..=drift),
@@ -526,16 +657,17 @@ pub fn grow_tree_with(seed: u64, species: u8, id: u64, profile: &TreeProfile) ->
                 skeleton.foliage.push(Foliage {
                     center: add(center, offset),
                     radius: radius * leaf_rng.random_range(0.75..=1.15),
-                    // Leaves at a branch tip continue along the branch, which is
+                    // Leaves at a limb tip continue along the limb, which is
                     // where a tip cluster actually points.
-                    outward: branch.dir,
+                    outward: dir,
                 });
             }
-            for run in 1..=profile.run_clusters(branch.length) {
-                let t = run as f32 / (profile.run_clusters(branch.length) as f32 + 1.0);
-                let center = lerp(branch.start, end, t);
+            let runs = profile.run_clusters(branch.length);
+            for run in 1..=runs {
+                let t = start + (1.0 - start) * run as f32 / (runs as f32 + 1.0);
+                let (center, dir) = along_chain(&chain, t);
                 let side = tilt(
-                    branch.dir,
+                    dir,
                     std::f32::consts::FRAC_PI_2,
                     leaf_rng.random_range(0.0..std::f32::consts::TAU),
                 );
@@ -591,6 +723,18 @@ pub fn grow_tree_with(seed: u64, species: u8, id: u64, profile: &TreeProfile) ->
         let child_radius = branch.radius * profile.radius_ratio;
         let mut roll = rng.random_range(0.0..std::f32::consts::TAU);
         let step = profile.whorl_deg.to_radians() / count as f32;
+        // Crown envelope: the trunk's children climb, deeper twigs leave the
+        // crown's core outward. Without this every generation is pulled the
+        // same way and the crown is a column.
+        //
+        // The outward direction is horizontal-radial with a height-dependent
+        // upward tilt, NOT the normal of a sphere around a fixed centre: a
+        // centre computed from the height BUDGET sits above the finished crown,
+        // which points every limb downward and flattens the tree.
+        let crown_base = profile.trunk_length * profile.height;
+        let crown_span = (profile.height - crown_base).max(0.1);
+        let rounding = (profile.crown_rounding * level as f32 / profile.max_level.max(1) as f32)
+            .clamp(0.0, 1.0);
         for length in lengths {
             let spread = rng
                 .random_range(profile.spread_deg.0..=profile.spread_deg.1)
@@ -598,12 +742,32 @@ pub fn grow_tree_with(seed: u64, species: u8, id: u64, profile: &TreeProfile) ->
             let jitter = rng
                 .random_range(-profile.jitter_deg..=profile.jitter_deg)
                 .to_radians();
-            let mut dir = tilt(branch.dir, spread, roll + jitter);
-            dir = normalize(lerp(dir, [0.0, 1.0, 0.0], profile.up_bias));
             // Children leave from partway along the parent, not all from its
-            // tip: that single detail removes the "scarecrow" look.
+            // tip: that single detail removes the "scarecrow" look. On a
+            // segmented limb the fork follows the limb's own curve.
             let fork = rng.random_range(0.72..=1.0);
-            let start = lerp(branch.start, end, fork);
+            let (start, dir) = along_chain(&chain, fork);
+            let mut dir = tilt(dir, spread, roll + jitter);
+            if rounding > 0.0 {
+                // Horizontal direction away from the trunk axis. Near the axis
+                // (a fork at the trunk top) any horizontal direction works.
+                let mut radial = [start[0], 0.0, start[2]];
+                if magnitude(radial) < 1e-4 {
+                    radial = tilt([0.0, 1.0, 0.0], 1.0, roll);
+                }
+                let radial = normalize(radial);
+                // Lower limbs open nearly horizontal, upper ones climb: the
+                // dome of a crown, not a pancake and not a column.
+                let up = (0.35 + height_fraction(start[1], crown_base, crown_span) * 1.1).min(1.6);
+                let outward = normalize([radial[0], up, radial[2]]);
+                dir = normalize(lerp(dir, outward, rounding));
+            }
+            // `up_bias` fades with the same depth so the two do not fight.
+            dir = normalize(lerp(
+                dir,
+                [0.0, 1.0, 0.0],
+                profile.up_bias * (1.0 - rounding),
+            ));
             queue.push_back(Pending {
                 start,
                 dir,
@@ -716,6 +880,49 @@ mod tests {
         assert_ne!(a, b, "two trees of one species must not be clones");
         let c = grow_tree(0x4845_4144, 2, 0);
         assert_ne!(a, c, "species must change the shape");
+    }
+
+    #[test]
+    fn limbs_are_split_into_short_straight_runs() {
+        // Regression (2026-11-09): a limb baked as one long straight tube
+        // either carried no foliage on its middle or wrapped the cards around
+        // it like a cylinder. No straight run may be longer than a leaf clump.
+        for (species, profile) in TREE_PROFILES.iter().enumerate() {
+            let cap = (profile.max_segment * profile.height).max(0.3);
+            for variant in 0..4 {
+                let tree = grow_tree(0x4845_4144, species as u8, variant);
+                for branch in &tree.branches {
+                    let len = distance(branch.start, branch.end);
+                    assert!(
+                        len <= cap + 1e-3,
+                        "species {species} variant {variant}: a straight run is {len:.2} m, \
+                         over the {cap:.2} m cap"
+                    );
+                }
+                let trunk = tree.branches.iter().filter(|b| b.level == 0).count();
+                assert!(
+                    trunk > 1,
+                    "species {species} variant {variant}: the trunk was never split"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn round_crowned_species_close_into_a_ball() {
+        // Species 1 (street) and 2 (broadleaf) are the round-crowned trees.
+        // The aspen stays a column on purpose: it is a poplar.
+        for species in [1u8, 2] {
+            for variant in 0..4 {
+                let tree = grow_tree(0x4845_4144, species, variant);
+                let ratio = tree.crown_width() / tree.crown_height();
+                assert!(
+                    ratio > 0.6,
+                    "species {species} variant {variant}: crown is a column \
+                     ({ratio:.2} wide per metre tall)"
+                );
+            }
+        }
     }
 
     #[test]
