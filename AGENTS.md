@@ -44,6 +44,7 @@ serde_json = "1"
 | 世界生成策略（两阶段生成/Chunk 流式） | `.agents/adr-0002-world-generation.md` |
 | 天空系统方案（Bevy 0.20 Atmosphere + bevy_elements） | `.agents/adr-0003-sky-system.md` |
 | 放置/碰撞/季节（Block 优先 + 负形街道） | `.agents/adr-0004-placement-collision-seasons.md` |
+| 跨街上部元素（电线/悬挑灯臂/棚架 + 净空契约） | `.agents/adr-0006-cross-street-overhead.md` |
 | 引擎迁移映射（Godot → Bevy，含被否决选项） | `.agents/adr-0005-engine-migration.md` |
 | 术语定义 | `.agents/glossary.md` |
 | 开发任务与里程碑（checkbox 分阶段） | `.agents/dev-plan.md` |
@@ -82,6 +83,9 @@ serde_json = "1"
 - [ ] Block 优先生成：Block 为正形、街道为负形；内部道路物理删除（adr-0004）
 - [ ] 负形街道碰撞模型：实心不可见凸棱柱（y=0..2m），街宽 6–10m + jitter，相邻街区实体不交叠（几何验证测试 OVERLAPS=0 必须保留）
 - [ ] 建筑沿 edge 放置 + BlockType 差异化参数表 + setback（1/5/10m）
+- [ ] 跨街层（adr-0006）：竖直件（灯柱/棚架立柱）必须落在 curb 外的碰撞棱柱内；只有横拉电线、灯臂横杆、棚架梁/顶板允许跨在路上空，且**下沿 ≥ `OVERHEAD_MIN_CLEARANCE` (3.5m)**，只能通过 `world::overhead::overhead_lowest` 计算，不得在别处重算垂度/下垂
+- [ ] 跨街层挂接既有流：`props::pole_slots` / `placement::street_tree_alongs` 只重放不新开流；本层专属 salt 13000，抽取顺序固定（电线 → 长灯臂 → 棚架）
+- [ ] **自发光件是唯一有绘制距离的道具**：`LampHead` / `LongLampHead` 带 `VisibilityRange::abrupt(0, props::LAMP_GLOW_RANGE = 60m)`（相机 `Msaa::Off`，薄发光片在远处只会闪不会淡）；其余道具/杆件/棚架一律无绘制距离，`chunks::tests::only_the_lamp_lenses_have_a_draw_distance` 钉死这条边界
 - [ ] 树：5 种资产懒加载，行道树概率 20/60/80%，FOREST 密 8m 间距，PLAZA 稀疏，树不带碰撞
 - [ ] 季节：四季参数表（leaf_density/leaf_color/sway_strength），开局选定后单局不变；全局 uniform 零开销切换
 - [ ] 存档 = seed + 地图尺寸 + 季节枚举 + 探索位图 + 玩家位姿；恢复 <1s
@@ -117,12 +121,14 @@ serde_json = "1"
 
 | 阶段 | 内容 | 状态 |
 |------|------|------|
-| R0 | 项目骨架 + 依赖锁定 + 版本验证 | 完成（2026-10-20，R0.5 树资产仅 3/5 种，其余待 .blend） |
+| R0 | 项目骨架 + 依赖锁定 + 版本验证 | 完成（2026-10-20） |
 | R1 | 天空系统迁移（Atmosphere + bevy_elements + DuskSky） | 完成（2026-10-20；黄昏渐变饱和度待人眼迭代） |
-| R2 | 布局图/WorldGrid + Chunk 流式（Rust 移植） | 待开始 |
-| R3 | 放置/碰撞/季节（负形街道模型） | 待开始 |
-| R4 | 存档与菜单 | 待开始 |
-| R5 | 声音与润色（原 M5 未完成，顺延） | 待开始 |
+| R2 | 布局图/WorldGrid + Chunk 流式（Rust 移植） | 完成（2026-10-21） |
+| R3 | 放置/碰撞/季节（负形街道模型） | 完成（3.1-3.8；3.9-3.13 见下） |
+| R3.9-3.12 | 程序化树 / 叶卡 / 立面与屋顶 / 观感修复 | 完成（2026-10-27 ～ 11-05，待实机验收） |
+| R3.13 | 跨街上部元素（电线/悬挑灯臂/防护棚） | 实现完成（2026-11-09，待实机验收；见 adr-0006） |
+| R4 | 存档与菜单 | 完成（2026-10-24；按钮/完成弹窗接线留 R5.6） |
+| R5 | 声音与润色 | 待开始 |
 
 ## 风险
 
