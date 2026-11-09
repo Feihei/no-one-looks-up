@@ -35,7 +35,7 @@ pub const TREE_SHAPE_SEED: u64 = 0x4845_4144; // "HEAD"
 /// Hard cap on clusters distributed along one branch. Higher values let the
 /// leaf mass follow the limbs deep into the crown (so branches read as
 /// running *through* foliage) at a small instancing cost.
-pub const RUN_CLUSTER_CAP: f32 = 6.0;
+pub const RUN_CLUSTER_CAP: f32 = 9.0;
 
 /// How one species grows. Defaults come from [`TREE_PROFILES`].
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -82,8 +82,12 @@ pub struct TreeProfile {
     /// reading as one solid mass.
     pub leaf_density: f32,
     /// How far a tip cluster may drift off the branch axis, as a fraction of
-    /// its own radius. Above ~0.8 the outermost blobs detach from the crown
-    /// and read as floating debris when thinned.
+    /// its own radius.
+    ///
+    /// This is the "does the leaf clump touch its twig" knob. 0.15-0.20 keeps
+    /// every clump anchored; the 0.45-0.50 values were authored for opaque
+    /// blobs and, once the card geometry started anchoring its petiole edge at
+    /// the cluster centre, put whole clumps half a metre off a 1 cm twig.
     pub leaf_spread: f32,
     /// Earliest point along a leafy branch where clusters may start, as a
     /// fraction of its length. Leaving the first stretch of a limb bare is
@@ -120,14 +124,24 @@ pub const TREE_PROFILES: [TreeProfile; 3] = [
         // read as a third of the tree in the gallery ("mushroom on a stick").
         trunk_length: 0.17,
         trunk_radius: 0.045,
-        radius_ratio: 0.62,
+        // 0.56 keeps every radius step visibly thinner: the terminal twig of a
+        // 14 m aspen lands at ~1.2 cm instead of the 3.3 cm a 0.62 ratio leaves
+        // (which read as a wire, not a twig). See `MIN_BAKED_RADIUS` in
+        // `tree_mesh`: nothing that carries leaves may be culled.
+        radius_ratio: 0.56,
         child_len_ratio: 0.7,
-        // Foliage from the SECOND fork, so the first fork (trunk -> 2-3 main
-        // limbs) stays bare and visible. `leaf_start` keeps the lower part of
-        // each limb bare too, so the fork reads as a Y instead of vanishing
-        // into the canopy the moment the blobs start.
-        leaf_min_level: 2,
-        max_level: 4,
+        // Foliage from the FIRST fork onward, i.e. the main limbs, the
+        // secondary limbs and every twig below them. Leaves only on the last
+        // generations left the crown as a ring of separate clumps at the twig
+        // tips; the player read "balls in the sky", not one tree. The lower
+        // generations now carry sparse sprays as well, which is what ties the
+        // crown together. Leaves still start at `leaf_start` so the limb bases
+        // and the trunk keep the bare Y silhouette.
+        leaf_min_level: 1,
+        // One more split than before: trunk -> limbs -> secondaries -> twigs ->
+        // leaf-bearing twigs. Three levels were what made the silhouette stop
+        // at a stubby hand.
+        max_level: 5,
         // 2-3 limbs with a tight budget: fixing it at 2 with a 0.96 span made
         // each limb long enough to lift the crown to 3x eye height.
         children: (2, 3),
@@ -140,13 +154,25 @@ pub const TREE_PROFILES: [TreeProfile; 3] = [
         whorl_deg: 200.0,
         jitter_deg: 20.0,
         up_bias: 0.75,
-        leaf_clusters: 3,
-        leaf_radius: 0.085,
+        // One clump per branch plus runs spaced along it: distributing the
+        // same cards over every generation reads as a continuous crown instead
+        // of a clump at each twig tip.
+        leaf_clusters: 1,
+        // ~0.43 m cards at 14 m tall. The old 0.085 (0.66 m cards) was sized
+        // for opaque blobs; with a visible leaf mask on the card it reads as a
+        // metre-wide leaf.
+        leaf_radius: 0.055,
         leaf_radius_ratio: 0.88,
-        leaf_run_spacing: 0.34,
+        // Runs every 0.35 m instead of 0.5: the long L1/L2 limbs carry a
+        // continuous spray of clusters instead of two or three separate beads.
+        // The cap is what used to truncate those limbs at 6 clusters.
+        leaf_run_spacing: 0.35,
         crown_floor: 0.18,
-        leaf_density: 0.72,
-        leaf_spread: 0.45,
+        leaf_density: 0.78,
+        // Tight anchoring: a tip clump may drift at most 0.15 of its own radius
+        // off the twig axis. The old 0.45 was authored for opaque blobs; with
+        // cards it put petioles half a metre off a 1 cm twig.
+        leaf_spread: 0.15,
         // Foliage starts low on the limbs: the crown base is what the player
         // actually reads from eye height. Demanding a fully exposed Y pushed
         // the canopy back above 3x eye height, which is the complaint this
@@ -161,23 +187,40 @@ pub const TREE_PROFILES: [TreeProfile; 3] = [
         // sit a metre higher than its neighbours'.
         trunk_length: 0.24,
         trunk_radius: 0.055,
-        radius_ratio: 0.73,
+        // 0.52 instead of 0.73: the old terminal limb was an 8.6 cm-radius log.
+        // Two extra generations now taper to ~1.6 cm-radius twigs (3 cm across).
+        radius_ratio: 0.52,
         child_len_ratio: 0.74,
+        // Same as the aspen: leaves from the first fork down to the twigs, so
+        // the main and secondary limbs carry sprays too. Terminal-only foliage
+        // was the "cloud of separate clumps" the player saw.
         leaf_min_level: 1,
-        max_level: 3,
-        children: (2, 4),
+        // Four splits, one more than the "stubby hand" the old 3-level shape
+        // ended in.
+        max_level: 4,
+        // Capped at 3 children: with 2-4 the extra levels multiplied into 81
+        // terminal twigs and the card budget (this species takes 2.6x cards)
+        // doubled.
+        children: (2, 3),
         child_span: (0.72, 0.88),
         spread_deg: (40.0, 60.0),
         whorl_deg: 360.0,
         jitter_deg: 26.0,
         up_bias: 0.24,
-        leaf_clusters: 3,
-        leaf_radius: 0.1,
+        leaf_clusters: 1,
+        // ~0.35 m cards. The old 0.10 baked 0.53 m compound leaves, which read
+        // as individual giant leaves rather than a locust canopy.
+        leaf_radius: 0.07,
         leaf_radius_ratio: 0.9,
-        leaf_run_spacing: 0.5,
+        // The roundest crown was also the emptiest (84% sky in the side
+        // elevation): few, widely spaced clusters read as separate balls.
+        // Tight run spacing plus almost-full density fills the gaps along the
+        // main and secondary limbs.
+        leaf_run_spacing: 0.28,
         crown_floor: 0.18,
-        leaf_density: 0.74,
-        leaf_spread: 0.5,
+        leaf_density: 0.9,
+        // Clumps stay on the twig; 0.5 put them a clump-radius clear of it.
+        leaf_spread: 0.18,
         leaf_start: 0.5,
         height: 11.5,
         width: 5.5,
@@ -186,23 +229,32 @@ pub const TREE_PROFILES: [TreeProfile; 3] = [
     TreeProfile {
         trunk_length: 0.26,
         trunk_radius: 0.07,
-        radius_ratio: 0.8,
+        // The heaviest profile tapered slowest (0.80), so its terminal limb was
+        // a 13 cm-radius log. 0.52 brings it to ~1.9 cm while the first two
+        // limb generations stay visibly heavy.
+        radius_ratio: 0.52,
         child_len_ratio: 0.82,
-        leaf_min_level: 2,
-        max_level: 3,
+        // Foliage from the heavy limbs' first fork down through the twigs.
+        leaf_min_level: 1,
+        // One more split so the limbs end in twigs, not in stubs.
+        max_level: 4,
         children: (2, 3),
         child_span: (0.72, 0.88),
         spread_deg: (42.0, 64.0),
         whorl_deg: 210.0,
         jitter_deg: 34.0,
         up_bias: 0.16,
-        leaf_clusters: 4,
-        leaf_radius: 0.15,
-        leaf_radius_ratio: 1.0,
-        leaf_run_spacing: 0.3,
+        leaf_clusters: 1,
+        // ~0.42 m cards. 0.15 baked a 1.06 m blade: the willow's lanceolate
+        // mask became the "one-metre diamond leaf" the player flagged.
+        leaf_radius: 0.06,
+        leaf_radius_ratio: 0.92,
+        // Same tightening as the street tree: 0.5 m spacing left the heavy
+        // limbs as bare spokes between clumps (77% sky).
+        leaf_run_spacing: 0.28,
         crown_floor: 0.24,
-        leaf_density: 0.66,
-        leaf_spread: 0.5,
+        leaf_density: 0.82,
+        leaf_spread: 0.18,
         leaf_start: 0.45,
         height: 10.5,
         width: 7.5,
@@ -403,6 +455,14 @@ pub fn grow_tree(seed: u64, species: u8, id: u64) -> TreeSkeleton {
 /// parameter sets side by side).
 pub fn grow_tree_with(seed: u64, species: u8, id: u64, profile: &TreeProfile) -> TreeSkeleton {
     let mut rng = species_rng(seed ^ id.wrapping_mul(0x2545_F491_4F6C_DD1D), species);
+    // Foliage draws from its own stream. Cluster jitter consumes draws while
+    // the queue is still being walked, so one shared stream meant retuning a
+    // foliage knob (`leaf_run_spacing`) reshaped every branch of the tree.
+    // The skeleton must stay put when only the leaves are retuned.
+    let mut leaf_rng = species_rng(
+        seed ^ id.wrapping_mul(0x2545_F491_4F6C_DD1D),
+        species.wrapping_add(0x80),
+    );
 
     let mut skeleton = TreeSkeleton {
         species,
@@ -459,13 +519,13 @@ pub fn grow_tree_with(seed: u64, species: u8, id: u64, profile: &TreeProfile) ->
                 let center = lerp(branch.start, end, t);
                 let drift = radius * profile.leaf_spread;
                 let offset = [
-                    rng.random_range(-drift..=drift),
-                    rng.random_range(-drift..=drift),
-                    rng.random_range(-drift..=drift),
+                    leaf_rng.random_range(-drift..=drift),
+                    leaf_rng.random_range(-drift..=drift),
+                    leaf_rng.random_range(-drift..=drift),
                 ];
                 skeleton.foliage.push(Foliage {
                     center: add(center, offset),
-                    radius: radius * rng.random_range(0.75..=1.15),
+                    radius: radius * leaf_rng.random_range(0.75..=1.15),
                     // Leaves at a branch tip continue along the branch, which is
                     // where a tip cluster actually points.
                     outward: branch.dir,
@@ -477,13 +537,13 @@ pub fn grow_tree_with(seed: u64, species: u8, id: u64, profile: &TreeProfile) ->
                 let side = tilt(
                     branch.dir,
                     std::f32::consts::FRAC_PI_2,
-                    rng.random_range(0.0..std::f32::consts::TAU),
+                    leaf_rng.random_range(0.0..std::f32::consts::TAU),
                 );
                 skeleton.foliage.push(Foliage {
                     // Side offset capped below the blob radius: attached, not
                     // floating.
                     center: add(center, scale(side, radius * profile.leaf_spread)),
-                    radius: radius * rng.random_range(0.8..=1.2),
+                    radius: radius * leaf_rng.random_range(0.8..=1.2),
                     // A run cluster hangs off the SIDE of the limb, so its
                     // petiole points back at the branch and its tip points away
                     // along that side vector.

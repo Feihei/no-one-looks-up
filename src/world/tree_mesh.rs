@@ -108,8 +108,16 @@ fn species_foliage(species: u8) -> FoliageBake {
         "sophora" => FoliageBake {
             cell,
             aspect,
-            cards_scale: 2.6,
-            reach_scale: 0.80,
+            // The compound leaf stays the finest silhouette, and now that every
+            // limb generation carries sprays the street tree's crown has only
+            // ~100 clusters against the aspen's ~230: 1.5x per clump left it
+            // with fewer cards overall than the (smaller) aspen. 2.0x keeps the
+            // locust the finer, more fragmented crown the art direction asks
+            // for, at 51 tiny cards per spray.
+            cards_scale: 2.3,
+            // Just under 1.0: enough extra fragmentation without shrinking the
+            // cards so far that the crown loses coverage between sprays.
+            reach_scale: 0.95,
         },
         _ => FoliageBake {
             cell,
@@ -147,16 +155,21 @@ const FAR_CARDS_PER_CLUSTER: usize = 6;
 /// with their CENTRES, so each card only had to be small; radial cards only fill
 /// it along their own length.
 const CARD_REACH_FRACTION: f32 = 0.30;
-/// Radius of the small ball around a cluster's branch point that petioles may
-/// attach within, as a fraction of the cluster radius.
+/// How many turns the card spiral makes along one branch.
 ///
-/// A twig is a short line, not a mathematical point, so leaves hang off a
-/// stretch of it. Keeping the ball this small keeps every petiole visually on
-/// the branch while letting cards fill the inner volume instead of a shell.
-const ATTACH_FRACTION: f32 = 0.28;
-/// Branches thinner than this (m) are dropped from the bake: at any walking
-/// distance they are sub-pixel, and the finest twigs are ~40% of all parts.
-const MIN_BAKED_RADIUS: f32 = 0.035;
+/// 2.5 turns over the cards of one cluster reads as alternate/spiral
+/// phyllotaxis: every card leaves the twig at its own height and its own
+/// azimuth, so the foliage spreads ALONG the twig instead of forming a ball
+/// around one point.
+const SPRAY_TURNS: f32 = 2.5;
+/// Branches thinner than this (m) are dropped from the bake.
+///
+/// The old 3.5 cm threshold silently deleted the aspen's entire final
+/// generation (~40 twigs), and those twigs were the ones carrying foliage:
+/// every leaf clump on a culled twig hung in mid-air with no stem under it.
+/// The threshold must therefore stay BELOW the thinnest leaf-bearing twig of
+/// every profile; `leafy_branches_outlive_the_cull` asserts exactly that.
+const MIN_BAKED_RADIUS: f32 = 0.010;
 
 /// Sway weight written into `COLOR.r` for foliage vertices.
 ///
@@ -439,6 +452,22 @@ pub fn bake_skeleton_lod(
     let cards =
         ((lod.cards_per_cluster() as f32 * foliage_bake.cards_scale).round() as usize).max(1);
 
+    // The twigs that carry the leaves, as anchor lines. Cards are laid out
+    // ALONG one of these instead of around a cluster centre: a 1.2 m leaf ball
+    // centred on a 2 cm twig reads as a clump floating in front of the branch,
+    // while a spiral of cards anchored on the twig itself reads as leaves
+    // growing out of it.
+    let anchors: Vec<BranchAnchor> = skeleton
+        .branches
+        .iter()
+        // Only leaf-bearing generations are anchors. A cluster dangling near a
+        // thick limb would otherwise attach its cards to that limb (a petiole
+        // offset of `0.7 * limb radius`, centimetres off the visible twig) and
+        // put leaves on a branch the profile deliberately keeps bare.
+        .filter(|branch| branch.level >= profile.leaf_min_level)
+        .filter_map(BranchAnchor::from_branch)
+        .collect();
+
     for (index, foliage) in skeleton.foliage.iter().enumerate() {
         if index % stride != 0 {
             continue;
@@ -447,16 +476,17 @@ pub fn bake_skeleton_lod(
             continue;
         }
         let center = Vec3::from_array(foliage.center);
-        // The cluster's radius now sizes the CARDS rather than a ball: a card
-        // spans the cluster's diameter, so a few of them cover the volume the
-        // sphere used to. The reach scale pairs with the card count (more,
-        // smaller cards for the pinnate species) so the total coverage of one
-        // cluster stays put.
+        let Some((anchor, along)) = BranchAnchor::nearest(&anchors, center) else {
+            continue;
+        };
+        // The cluster's radius sizes the CARDS, not a ball. The reach scale
+        // pairs with the card count (more, smaller cards for the pinnate
+        // species) so the total coverage of one cluster stays put.
         let cluster_radius = (foliage.radius * blob_scale * foliage_bake.reach_scale).max(0.05);
-        leaf_parts.push(leaf_cards(
-            center,
+        leaf_parts.push(leaf_spray(
+            anchor,
+            along,
             cluster_radius,
-            Vec3::from_array(foliage.outward),
             index,
             cards,
             top,
@@ -508,16 +538,54 @@ fn with_branch_season_data(mut mesh: Mesh, top: f32) -> Mesh {
     mesh
 }
 
-/// Builds `cards` crossed quads spanning a sphere of `reach` metres at `center`.
+/// One branch treated as the line leaf cards hang from.
+#[derive(Clone, Copy)]
+struct BranchAnchor {
+    start: Vec3,
+    dir: Vec3,
+    len: f32,
+    radius: f32,
+}
+
+impl BranchAnchor {
+    fn from_branch(branch: &crate::world::tree_shape::Branch) -> Option<Self> {
+        let start = Vec3::from_array(branch.start);
+        let delta = Vec3::from_array(branch.end) - start;
+        let len = delta.length();
+        (len >= 1e-3).then(|| Self {
+            start,
+            dir: delta / len,
+            len,
+            radius: branch.radius,
+        })
+    }
+
+    /// The branch segment nearest to `p`, plus the distance along it.
+    fn nearest(anchors: &[Self], p: Vec3) -> Option<(Self, f32)> {
+        let mut best: Option<(f32, Self, f32)> = None;
+        for anchor in anchors {
+            let along = (p - anchor.start).dot(anchor.dir).clamp(0.0, anchor.len);
+            let distance = p.distance_squared(anchor.start + anchor.dir * along);
+            if best.as_ref().is_none_or(|(d, _, _)| distance < *d) {
+                best = Some((distance, *anchor, along));
+            }
+        }
+        best.map(|(_, anchor, along)| (anchor, along))
+    }
+}
+
+/// Builds `cards` quads spiralling along one branch, each petiole on the twig.
 ///
-/// Cards are rotated about the vertical axis at even intervals plus a
-/// per-cluster offset, with a slow tilt, so a crown has cards facing every
-/// direction instead of a fan of parallel planes. `foliage` carries the
-/// species' atlas (u0, u1) and its baked mask aspect (see [`species_foliage`]).
-fn leaf_cards(
-    center: Vec3,
+/// The old layout wrapped the cards around a cluster centre up to a metre off
+/// the twig. In game that read as a green clump floating beside the branch and,
+/// from most angles, as "the leaves are one big bunched ball". A helix along
+/// the twig uses the same card count and triangle budget but leaves (pun
+/// intended) the foliage loose and divergent, because every card departs from
+/// a different point of the twig at a different azimuth.
+fn leaf_spray(
+    anchor: BranchAnchor,
+    anchor_at: f32,
     cluster_radius: f32,
-    outward: Vec3,
     cluster: usize,
     cards: usize,
     top: f32,
@@ -531,7 +599,7 @@ fn leaf_cards(
 
     // Per-cluster sway phase, so neighbouring cards do not move in lockstep.
     let phase = ((cluster as f32 * 0.618_034).fract()).clamp(0.0, 1.0);
-    let sway = SWAY_WEIGHT_FOLIAGE * (1.0 + SWAY_HEIGHT_GAIN * height_term(center.y, top));
+    let sway = SWAY_WEIGHT_FOLIAGE * (1.0 + SWAY_HEIGHT_GAIN * height_term(anchor.start.y, top));
 
     // Deterministic scatter, so the same tree always bakes the same cards.
     let mut hash = (cluster as u32).wrapping_mul(0x9E37_79B9).wrapping_add(1);
@@ -542,102 +610,58 @@ fn leaf_cards(
         (hash & 0xFFFF) as f32 / 65535.0
     };
 
-    // The direction the leaves grow along: from the branch out toward the tips.
-    // A leaf card is not free to rotate -- its texture has a petiole at the
-    // BOTTOM edge and a tip at the TOP -- so this is the card's up axis. The
-    // first bake ignored it and the cards pointed everywhere, which reads as
-    // "the texture is rotated wrong" from any angle.
-    let up = if outward.length_squared() < 1e-6 {
+    // Two axes perpendicular to the twig: the cards leave it in every direction
+    // around these.
+    let seed_axis = if anchor.dir.y.abs() < 0.9 {
         Vec3::Y
     } else {
-        outward.normalize()
+        Vec3::X
     };
-    // A stable "right" for the card plane. Any perpendicular will do, but it
-    // must not depend on the frame: picking one from the up axis keeps the bake
-    // deterministic.
-    let seed_axis = if up.y.abs() < 0.9 { Vec3::Y } else { Vec3::X };
-    let right0 = up.cross(seed_axis).normalize();
-    let face0 = right0.cross(up).normalize();
+    let side0 = anchor.dir.cross(seed_axis).normalize();
+    let side1 = anchor.dir.cross(side0).normalize();
+
+    // Spread the cluster's cards over most of the twig. Longer branches host
+    // several clusters, and each one covers a different stretch because its
+    // anchor sits at a different point along the branch.
+    let spray = (cluster_radius * 1.2).min(anchor.len).max(0.08);
+
+    // A card's half-extent. Long axis = the old cluster silhouette; short axis
+    // follows the species' baked mask aspect so the leaf is not stretched.
+    let half_h = cluster_radius * CARD_REACH_FRACTION * 1.15;
+    let half_w = half_h * foliage.aspect;
 
     for card in 0..cards {
-        // Fan the cards around the growth axis at even intervals, plus a
-        // per-cluster twist so two clusters never stack their cards at the same
-        // angles. Rotating about `up` leaves the petiole-to-tip direction
-        // intact, which is the whole point: every card's bottom still faces the
-        // branch.
-        let twist = (cluster as f32 * 2.399_963
-            + card as f32 * std::f32::consts::TAU / cards as f32)
-            % std::f32::consts::TAU;
-        // A little lean, so the fan has depth rather than being a flat rosette.
-        //
-        // The lean is capped well under 90 degrees on purpose: past that the
-        // card tips past perpendicular, its tip starts pointing BACK at the
-        // branch, and the leaf looks folded under. 35 degrees keeps every card
-        // visibly growing outward while still breaking the fan out of one plane.
-        let lean = (next_unit() * 2.0 - 1.0) * 0.6;
-        // Build the frame explicitly instead of composing two axis-angle
-        // rotations. Composing `from_axis_angle(up, twist)` with a lean about a
-        // perpendicular re-orthogonalises `up`, and the tilt then bleeds into
-        // the growth direction: measured on a real tree, a few cards ended up
-        // with their tips pointing back at the branch. Building the basis by
-        // rotating the two perpendicular vectors and then re-deriving the
-        // growth vector keeps the tilt purely cosmetic.
-        let (sin_t, cos_t) = twist.sin_cos();
-        let (sin_l, cos_l) = lean.sin_cos();
-        let right = right0 * cos_t + face0 * sin_t;
-        let face = face0 * cos_t - right0 * sin_t;
-        // Tip direction: mostly `up`, leaning toward the card's face.
-        let grow = (up * cos_l + face * sin_l).normalize();
-        // Re-orthogonalise the card's own axis so the quad stays planar.
-        let right = (right - grow * right.dot(grow)).normalize_or_zero();
-        let right = if right.length_squared() < 1e-6 {
-            right0
+        let u = if cards <= 1 {
+            0.5
         } else {
-            right
+            card as f32 / (cards - 1) as f32
         };
+        // Walk along the twig while rotating the departure azimuth: a spiral
+        // (alternate phyllotaxis), not a rosette at one point.
+        let s = (anchor_at + (u - 0.5) * spray + (next_unit() - 0.5) * spray * 0.12)
+            .clamp(0.0, anchor.len);
+        let angle = u * SPRAY_TURNS * std::f32::consts::TAU + phase;
+        let radial = side0 * angle.cos() + side1 * angle.sin();
+        // A little lean toward the branch tip, so the spray points up the twig
+        // instead of forming a flat bottle-brush.
+        let lean = (next_unit() * 2.0 - 1.0) * 0.5;
+        let grow = (radial * lean.cos() + anchor.dir * lean.sin()).normalize();
+        // The petiole sits on the bark, not inside the wood.
+        let attach = anchor.start + anchor.dir * s + radial * (anchor.radius * 0.7);
+        // Card width axis: any perpendicular to `grow`, rolled per card so the
+        // card planes do not all contain the twig.
+        let right0 = grow.cross(anchor.dir).normalize_or_zero();
+        let right0 = if right0.length_squared() < 1e-6 {
+            side0
+        } else {
+            right0
+        };
+        let face0 = grow.cross(right0).normalize();
+        let roll = next_unit() * std::f32::consts::TAU;
+        let right = right0 * roll.cos() + face0 * roll.sin();
         let face_axis = right.cross(grow).normalize();
 
-        // A smaller card than the cluster, so several of them compose a clump.
-        //
-        // Option A (2026-11-05): the card's LONG axis keeps the old size so the
-        // cluster silhouette is unchanged, and the SHORT axis follows the
-        // species' mask aspect. The old code forced every card into a fixed
-        // ~0.87 (w/h) box regardless of the leaf, which stretched the broadleaf
-        // mask but -- far worse -- smeared the narrow pinnate/lanceolate masks
-        // into a solid blob, so every species read as one "big leaf" with no
-        // compound structure and no readable orientation. `aspect` is the
-        // species' baked mask width/height (see `LeafProfile::mask_aspect`),
-        // carried through `FoliageBake`.
-        let half_h = cluster_radius * CARD_REACH_FRACTION * 1.15;
-        let half_w = half_h * foliage.aspect;
-
-        // Anchor the card's PETIOLE edge on the twig and let it grow outward.
-        //
-        // The old bake pushed the card CENTRE out along a shell of 0.72-1.0
-        // cluster radii, and `dir` was mostly the card's plane normal, not the
-        // growth direction. The petiole edge therefore sat up to a full radius
-        // away from the branch and the clump baked into a hollow ring: a
-        // close-up showed a green wreath with the twig hanging in the empty
-        // middle.
-        //
-        // The attach point is drawn from a small ball around `center` rather
-        // than `center` itself. A twig is a short line, and leaves hang off a
-        // stretch of it; pinning every petiole to one coordinate made a
-        // pinpoint starburst that no longer looked like foliage on a branch.
-        // 0.28 cluster radii is close enough to read as "on the twig" while
-        // still filling the clump's interior.
-        let (u, v) = (next_unit(), next_unit());
-        let cos_theta = u * 2.0 - 1.0;
-        let sin_theta = (1.0 - cos_theta * cos_theta).sqrt();
-        let phi = v * std::f32::consts::TAU;
-        let attach_dir = Vec3::new(sin_theta * phi.cos(), cos_theta, sin_theta * phi.sin());
-        // sqrt biases the radius inwards: most petioles hug the twig, a few sit
-        // at the outer edge of the ball.
-        let attach = cluster_radius * ATTACH_FRACTION * next_unit().sqrt();
-        // A little sideways spread, capped below the card's own half-width so
-        // the petiole edge still crosses the attach point.
-        let lateral = (next_unit() * 2.0 - 1.0) * half_w * 0.35;
-        let card_center = center + attach_dir * attach + right * lateral + grow * half_h;
+        let card_center = attach + grow * half_h;
         let corners = [
             [-half_w, -half_h],
             [half_w, -half_h],
@@ -649,9 +673,8 @@ fn leaf_cards(
             .iter()
             .zip([[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]])
         {
-            // Local x follows `right0` in the card's rotated frame, local y is
-            // the growth direction. `v = 0` is the TOP of the texture (the tip),
-            // so +y must be where the tip goes.
+            // Local x is the card's width, local y the growth direction. `v = 0`
+            // is the TOP of the texture (the tip), so +y is where the tip goes.
             let local = right * corner[0] + grow * corner[1];
             positions.push((card_center + local).to_array());
             // Cards are drawn double-sided, so one normal per quad is enough;
@@ -743,6 +766,76 @@ mod tests {
         match m.attribute(Mesh::ATTRIBUTE_POSITION).expect("positions") {
             bevy::mesh::VertexAttributeValues::Float32x3(v) => v.clone(),
             other => panic!("unexpected position layout: {other:?}"),
+        }
+    }
+
+    /// Distance from `p` to one branch segment (m).
+    fn branch_distance(branch: &crate::world::tree_shape::Branch, p: Vec3) -> f32 {
+        let start = Vec3::from_array(branch.start);
+        let delta = Vec3::from_array(branch.end) - start;
+        let len2 = delta.length_squared();
+        let t = if len2 < 1e-9 {
+            0.0
+        } else {
+            ((p - start).dot(delta) / len2).clamp(0.0, 1.0)
+        };
+        p.distance(start + delta * t)
+    }
+
+    /// Index and distance of the branch nearest to `p`.
+    fn nearest_branch(
+        skeleton: &crate::world::tree_shape::TreeSkeleton,
+        p: Vec3,
+    ) -> Option<(usize, f32)> {
+        skeleton
+            .branches
+            .iter()
+            .enumerate()
+            .map(|(index, branch)| (index, branch_distance(branch, p)))
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+    }
+
+    /// Index of the leaf-bearing branch nearest to `p`: the carrier the bake
+    /// anchors a cluster on.
+    fn nearest_leafy_branch(
+        skeleton: &crate::world::tree_shape::TreeSkeleton,
+        p: Vec3,
+        min_level: u8,
+    ) -> Option<usize> {
+        skeleton
+            .branches
+            .iter()
+            .enumerate()
+            .filter(|(_, branch)| branch.level >= min_level)
+            .min_by(|a, b| branch_distance(a.1, p).total_cmp(&branch_distance(b.1, p)))
+            .map(|(index, _)| index)
+    }
+
+    #[test]
+    fn leafy_branches_outlive_the_cull() {
+        // Regression (2026-11-08): foliage is placed on every branch at or
+        // above `leaf_min_level`, but the bake silently drops any branch
+        // thinner than `MIN_BAKED_RADIUS`. The aspen's whole L4 generation
+        // (3.3 cm) fell under the old 3.5 cm threshold while still carrying
+        // three leaf clumps each, so half the crown's foliage hung in mid-air
+        // with no twig underneath. A branch that carries leaves must be thick
+        // enough to survive the Near-tier cull.
+        for (species, profile) in TREE_PROFILES.iter().enumerate() {
+            let tree = crate::world::tree_shape::grow_tree(
+                crate::world::tree_shape::TREE_SHAPE_SEED,
+                species as u8,
+                0,
+            );
+            let thinnest_leafy = tree
+                .branches
+                .iter()
+                .filter(|b| b.level >= profile.leaf_min_level)
+                .map(|b| b.radius)
+                .fold(f32::INFINITY, f32::min);
+            assert!(
+                thinnest_leafy >= MIN_BAKED_RADIUS,
+                "species {species}: thinnest leaf-bearing twig is {thinnest_leafy:.3} m, below the                  {MIN_BAKED_RADIUS:.3} m bake threshold -- its leaves float",
+            );
         }
     }
 
@@ -886,93 +979,15 @@ mod tests {
     }
 
     #[test]
-    fn every_card_points_its_tip_outward_and_its_petiole_at_the_branch() {
+    fn every_card_points_its_tip_away_from_the_branch() {
         // The texture has the petiole on its BOTTOM edge (v = 1) and the tip on
-        // its TOP edge (v = 0). So for every card, the tip edge must lie
-        // further along the cluster's growth direction than the petiole edge.
+        // its TOP edge (v = 0). For every card the tip edge must therefore sit
+        // further from the carrying twig than the petiole edge.
         //
-        // Ignoring this was a real bug: cards were rotated freely, every leaf
-        // pointed somewhere different, and the crown read as "the texture is
-        // rotated wrong" no matter which way you looked at it.
-        for species in 0..TREE_PROFILES.len() as u8 {
-            let skeleton = crate::world::tree_shape::grow_tree(
-                crate::world::tree_shape::TREE_SHAPE_SEED,
-                species,
-                0,
-            );
-            let profile = TREE_PROFILES[species as usize];
-            let parts = bake_skeleton(&skeleton, &profile, species);
-            let positions = positions(&parts.leaves);
-            let uvs = match parts.leaves.attribute(Mesh::ATTRIBUTE_UV_0).expect("uv0") {
-                bevy::mesh::VertexAttributeValues::Float32x2(v) => v.clone(),
-                other => panic!("unexpected uv layout: {other:?}"),
-            };
-
-            // `leaf_cards` writes CARD_REACH_FRACTION-sized quads at the near
-            // tier, in skeleton order, so the cursor can be walked. The count
-            // is per species now (the pinnate crown takes more, smaller cards).
-            let foliage = species_foliage(species);
-            let cards = ((TreeLod::Near.cards_per_cluster() as f32 * foliage.cards_scale).round()
-                as usize)
-                .max(1);
-            let mut cursor = 0usize;
-            let mut checked = 0usize;
-            for foliage in &skeleton.foliage {
-                let outward = Vec3::from_array(foliage.outward).normalize_or_zero();
-                if outward.length_squared() < 1e-6 {
-                    continue;
-                }
-                if cursor + cards * 4 > positions.len() {
-                    break;
-                }
-                for card in 0..cards {
-                    let quad = &uvs[cursor + card * 4..cursor + card * 4 + 4];
-                    let pos = &positions[cursor + card * 4..cursor + card * 4 + 4];
-                    // Compare the MIDPOINTS of the tip and petiole edges: taking
-                    // one corner from each measures a diagonal, which mixes in
-                    // the card's width and makes the check meaningless.
-                    let mut tip = Vec3::ZERO;
-                    let mut petiole = Vec3::ZERO;
-                    let (mut n_tip, mut n_petiole) = (0u32, 0u32);
-                    for (uv, p) in quad.iter().zip(pos.iter()) {
-                        if uv[1] < 0.5 {
-                            tip += Vec3::from_array(*p);
-                            n_tip += 1;
-                        } else {
-                            petiole += Vec3::from_array(*p);
-                            n_petiole += 1;
-                        }
-                    }
-                    if n_tip == 0 || n_petiole == 0 {
-                        continue;
-                    }
-                    let tip = tip / n_tip as f32;
-                    let petiole = petiole / n_petiole as f32;
-                    let along = (tip - petiole).dot(outward);
-                    assert!(
-                        along > 0.0,
-                        "species {species}: a card points its tip back at the branch (dot {along:.3})"
-                    );
-                    checked += 1;
-                }
-                cursor += cards * 4;
-            }
-            assert!(
-                checked > 50,
-                "species {species}: only {checked} cards were checked"
-            );
-        }
-    }
-
-    #[test]
-    fn every_card_grows_out_of_its_branch_attachment_point() {
-        // Regression (2026-11-05): cards used to sit on a shell of 0.72-1.0
-        // cluster radii, displaced sideways along the card's plane normal, so a
-        // close-up showed a hollow green ring with the twig alone in the empty
-        // middle -- "the leaves do not touch the branch". The petiole edge now
-        // anchors at the cluster centre (the point on the twig the cluster
-        // hangs from), so every petiole must stay within a small fraction of
-        // the cluster radius of it.
+        // This replaces the old "compare against the cluster's outward vector"
+        // check: a spray has no single outward direction, and the invariant
+        // that matters is that leaves grow OFF the branch, not which way one
+        // cluster happened to face.
         for species in 0..TREE_PROFILES.len() as u8 {
             let skeleton = crate::world::tree_shape::grow_tree(
                 crate::world::tree_shape::TREE_SHAPE_SEED,
@@ -997,9 +1012,100 @@ mod tests {
                 if cursor + cards * 4 > positions.len() {
                     break;
                 }
-                let center = Vec3::from_array(cluster.center);
-                // Near tier: blob stride 1, no radius cull, blob scale 1.
-                let radius = (cluster.radius * foliage.reach_scale).max(0.05);
+                // The bake anchors a cluster on the nearest LEAF-BEARING branch
+                // to its centre, so measure against that same carrier. Taking
+                // the nearest branch to each PETIOLE instead misfires in a dense
+                // crown: an unrelated twig often crosses right against the
+                // attachment point, and a card growing radially from its own
+                // stem can then look "stuck" to that stranger limb.
+                let carrier = nearest_leafy_branch(
+                    &skeleton,
+                    Vec3::from_array(cluster.center),
+                    profile.leaf_min_level,
+                );
+                for card in 0..cards {
+                    let quad = &uvs[cursor + card * 4..cursor + card * 4 + 4];
+                    let pos = &positions[cursor + card * 4..cursor + card * 4 + 4];
+                    // Compare the MIDPOINTS of the tip and petiole edges: taking
+                    // one corner from each measures a diagonal, which mixes in
+                    // the card's width and makes the check meaningless.
+                    let mut tip = Vec3::ZERO;
+                    let mut petiole = Vec3::ZERO;
+                    let (mut n_tip, mut n_petiole) = (0u32, 0u32);
+                    for (uv, p) in quad.iter().zip(pos.iter()) {
+                        if uv[1] < 0.5 {
+                            tip += Vec3::from_array(*p);
+                            n_tip += 1;
+                        } else {
+                            petiole += Vec3::from_array(*p);
+                            n_petiole += 1;
+                        }
+                    }
+                    if n_tip == 0 || n_petiole == 0 {
+                        continue;
+                    }
+                    let tip = tip / n_tip as f32;
+                    let petiole = petiole / n_petiole as f32;
+                    // Measure against the carrier twig this cluster was baked
+                    // onto, not whichever branch happens to be nearest.
+                    let Some(carrier) = carrier else {
+                        continue;
+                    };
+                    let branch = &skeleton.branches[carrier];
+                    let petiole_distance = branch_distance(branch, petiole);
+                    let tip_distance = branch_distance(branch, tip);
+                    assert!(
+                        petiole_distance <= 0.10,
+                        "species {species}: a petiole sits {petiole_distance:.2} m off the twig"
+                    );
+                    assert!(
+                        tip_distance >= petiole_distance + 0.05,
+                        "species {species}: a card tip ({tip_distance:.2} m) barely leaves the \
+                         twig ({petiole_distance:.2} m)"
+                    );
+                    checked += 1;
+                }
+                cursor += cards * 4;
+            }
+            assert!(
+                checked > 50,
+                "species {species}: only {checked} cards were checked"
+            );
+        }
+    }
+
+    #[test]
+    fn every_card_grows_out_of_its_branch_attachment_point() {
+        // Regression history: cards sat on a shell 0.72-1.0 cluster radii from
+        // the twig, then on a ball 0.28 radii from it -- both still read as
+        // foliage floating beside a branch, with the twig visible in the empty
+        // middle or in front of a solid leaf blob. The spray now anchors the
+        // petiole EDGE on the bark, so its distance to the nearest branch
+        // segment must stay at branch-surface scale.
+        for species in 0..TREE_PROFILES.len() as u8 {
+            let skeleton = crate::world::tree_shape::grow_tree(
+                crate::world::tree_shape::TREE_SHAPE_SEED,
+                species,
+                0,
+            );
+            let profile = TREE_PROFILES[species as usize];
+            let parts = bake_skeleton(&skeleton, &profile, species);
+            let positions = positions(&parts.leaves);
+            let uvs = match parts.leaves.attribute(Mesh::ATTRIBUTE_UV_0).expect("uv0") {
+                bevy::mesh::VertexAttributeValues::Float32x2(v) => v.clone(),
+                other => panic!("unexpected uv layout: {other:?}"),
+            };
+
+            let foliage = species_foliage(species);
+            let cards = ((TreeLod::Near.cards_per_cluster() as f32 * foliage.cards_scale).round()
+                as usize)
+                .max(1);
+            let mut cursor = 0usize;
+            let mut checked = 0usize;
+            for _cluster in &skeleton.foliage {
+                if cursor + cards * 4 > positions.len() {
+                    break;
+                }
                 for card in 0..cards {
                     let quad = &uvs[cursor + card * 4..cursor + card * 4 + 4];
                     let pos = &positions[cursor + card * 4..cursor + card * 4 + 4];
@@ -1015,16 +1121,14 @@ mod tests {
                         continue;
                     }
                     let petiole = petiole / n as f32;
-                    let distance = petiole.distance(center);
-                    // Upper bound: the attach ball (0.28) plus the lateral
-                    // spread of the petiole edge (0.35 of a half-width, itself
-                    // 0.30 * 1.15 of the cluster radius) -- about 0.38r for the
-                    // widest mask. Still far below the 0.72-1.0 shell the cards
-                    // used to sit on.
+                    let Some((_, distance)) = nearest_branch(&skeleton, petiole) else {
+                        continue;
+                    };
+                    // 10 cm is a generous bound: the petiole is placed on the
+                    // bark of a leaf-bearing twig, whose radius is under 3 cm.
                     assert!(
-                        distance <= radius * 0.40,
-                        "species {species}: a petiole sits {:.2} cluster radii from the branch",
-                        distance / radius
+                        distance <= 0.10,
+                        "species {species}: a petiole sits {distance:.2} m from the nearest twig"
                     );
                     checked += 1;
                 }
