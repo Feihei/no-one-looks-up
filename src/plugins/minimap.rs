@@ -8,8 +8,9 @@
 //! the city stay blank (the discovery feedback ADR-0001 asks for).
 //!
 //! Toggled with `M` while walking (see [`crate::core::input::MINIMAP_TOGGLE`]);
-//! hidden by default, hidden in every non-playing phase.
+//! shown by default while playing, hidden in every non-playing phase.
 
+use bevy::input::InputSystems;
 use bevy::math::Rot2;
 use bevy::prelude::*;
 
@@ -50,7 +51,13 @@ impl Plugin for MinimapPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<MinimapVisible>()
             .init_resource::<MinimapUiRoot>()
-            .add_systems(PreUpdate, toggle_minimap)
+            .add_systems(
+                PreUpdate,
+                // Input systems clear + replay `ButtonInput` every PreUpdate;
+                // reading it before that would miss or double-count the M
+                // press depending on how Bevy resolves the ambiguity.
+                toggle_minimap.after(InputSystems),
+            )
             .add_systems(
                 Update,
                 (sync_minimap_root, rebuild_roads, update_player_marker).chain(),
@@ -59,8 +66,16 @@ impl Plugin for MinimapPlugin {
 }
 
 /// Whether the minimap is shown (toggled with `M` while playing).
-#[derive(Resource, Debug, Default, Clone, Copy)]
+#[derive(Resource, Debug, Clone, Copy)]
 struct MinimapVisible(bool);
+
+impl Default for MinimapVisible {
+    fn default() -> Self {
+        // A HUD is information you should not have to ask for: visible from
+        // the first step, `M` hides it.
+        Self(true)
+    }
+}
 
 /// Root entity of the minimap UI, plus the layer roads are spawned under.
 #[derive(Resource, Debug, Default)]
@@ -335,31 +350,30 @@ mod tests {
         let mut app = minimap_app(GamePhase::Playing);
         app.update();
         assert!(
-            !app.world().resource::<MinimapVisible>().0,
-            "hidden by default"
+            app.world().resource::<MinimapVisible>().0,
+            "a HUD is visible without being asked for"
         );
-        assert!(
-            app.world().resource::<MinimapUiRoot>().entity.is_none(),
-            "no minimap before it is toggled on"
-        );
-
-        press(&mut app, MINIMAP_TOGGLE);
-        assert!(app.world().resource::<MinimapVisible>().0);
         assert!(
             app.world().resource::<MinimapUiRoot>().entity.is_some(),
-            "toggling on spawns the minimap root"
+            "playing spawns the minimap right away"
         );
 
         press(&mut app, MINIMAP_TOGGLE);
         assert!(!app.world().resource::<MinimapVisible>().0);
-        assert!(app.world().resource::<MinimapUiRoot>().entity.is_none());
+        assert!(
+            app.world().resource::<MinimapUiRoot>().entity.is_none(),
+            "M hides the minimap"
+        );
+
+        press(&mut app, MINIMAP_TOGGLE);
+        assert!(app.world().resource::<MinimapVisible>().0);
+        assert!(app.world().resource::<MinimapUiRoot>().entity.is_some());
     }
 
     #[test]
     fn leaving_the_playing_phase_hides_the_minimap() {
         let mut app = minimap_app(GamePhase::Playing);
         app.update();
-        press(&mut app, MINIMAP_TOGGLE);
         assert!(app.world().resource::<MinimapUiRoot>().entity.is_some());
 
         *app.world_mut().resource_mut::<GamePhase>() = GamePhase::Paused;

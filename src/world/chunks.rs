@@ -1713,9 +1713,22 @@ mod tests {
     #[test]
     fn player_chunk_changes_are_tracked_and_explored() {
         use crate::world::explored::{ExploredBitmap, PlayerChunkChanged};
+
+        // Messages live in a double buffer that `message_update_system`
+        // swaps every frame, so inspecting the raw resource from outside the
+        // app is timing-dependent (flaky under parallel test load). Drain
+        // them with a real reader inside the app instead.
+        #[derive(Resource, Default)]
+        struct Recorded(Vec<PlayerChunkChanged>);
+        fn record(mut reader: MessageReader<PlayerChunkChanged>, mut out: ResMut<Recorded>) {
+            out.0.extend(reader.read().cloned());
+        }
+
         let mut app = App::new();
         app.add_plugins((MinimalPlugins, super::WorldPlugin))
-            .init_resource::<ButtonInput<KeyCode>>();
+            .init_resource::<ButtonInput<KeyCode>>()
+            .init_resource::<Recorded>()
+            .add_systems(PreUpdate, record);
         app.world_mut().spawn((
             Camera3d::default(),
             Transform::from_xyz(CENTER, 1.6, CENTER),
@@ -1742,13 +1755,12 @@ mod tests {
         app.update();
         app.update();
 
-        let messages: Vec<_> = app
+        let last = app
             .world()
-            .resource::<bevy::ecs::message::Messages<PlayerChunkChanged>>()
-            .iter_current_update_messages()
-            .copied()
-            .collect();
-        let last = messages.last().expect("a chunk change was sent");
+            .resource::<Recorded>()
+            .0
+            .last()
+            .expect("a chunk change was sent");
         assert_eq!(last.new_chunk, (10, 8));
         assert_eq!(last.old_chunk, Some((8, 8)));
 
