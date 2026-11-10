@@ -100,29 +100,33 @@ fn species_foliage(species: u8) -> FoliageBake {
     match species {
         // 槐: many small compound leaves, the finely fragmented silhouette.
         // The street profile grows fewer, larger clusters than the aspen, so
-        // the card count more than doubles to keep the locust the finest
-        // silhouette of the three. The reach stays close to the base size:
-        // shrinking it with the card size left the crown visibly thinner than
-        // the aspen's, so the extra cards now buy density instead of only
+        // the card count rises well above the simple blades to keep the locust
+        // the finest silhouette of the three. The reach stays close to the base
+        // size: shrinking it with the card size left the crown visibly thinner
+        // than the aspen's, so the extra cards buy density instead of only
         // fragmentation.
         "sophora" => FoliageBake {
             cell,
             aspect,
-            // The compound leaf stays the finest silhouette, and now that every
-            // limb generation carries sprays the street tree's crown has only
-            // ~100 clusters against the aspen's ~230: 1.5x per clump left it
-            // with fewer cards overall than the (smaller) aspen. 2.0x keeps the
-            // locust the finer, more fragmented crown the art direction asks
-            // for, at 51 tiny cards per spray.
-            cards_scale: 2.3,
+            // Card COUNT has to track the clump's AREA, not its count of them:
+            // a compound leaf is a narrow card (4 cm of blade), so 22 of them
+            // cover ~0.2 m2 while a 0.5 m-radius clump presents ~0.7 m2. 1.3x
+            // keeps a run of small clumps reading as continuous foliage while
+            // the whole species set stays inside the per-tree triangle budget.
+            cards_scale: 1.3,
             // Just under 1.0: enough extra fragmentation without shrinking the
             // cards so far that the crown loses coverage between sprays.
             reach_scale: 0.95,
         },
+        // Simple blades (杨, 柳): the base count over-covers an already dense
+        // cluster once the crown carries a spray on every twig, and the species
+        // set has a hard triangle budget (`the_pinnate_crown_takes_more_
+        // smaller_cards`). 0.8 x 22 = 18 cards still reads as one mass because
+        // the sprays overlap; the street tree keeps the finer 29.
         _ => FoliageBake {
             cell,
             aspect,
-            cards_scale: 1.0,
+            cards_scale: 0.8,
             reach_scale: 1.0,
         },
     }
@@ -774,15 +778,29 @@ mod tests {
 
     /// Distance from `p` to one branch segment (m).
     fn branch_distance(branch: &crate::world::tree_shape::Branch, p: Vec3) -> f32 {
+        branch_distance_squared(branch, p).sqrt()
+    }
+
+    /// Squared distance from `p` to one branch segment, computed with the same
+    /// arithmetic `BranchAnchor::nearest` uses.
+    ///
+    /// The bake compares squared distances of points built from a NORMALISED
+    /// direction; measuring with the raw segment parameterisation rounds
+    /// differently, and two neighbouring twigs both ~6 cm from a cluster can
+    /// then swap places. The test would measure the petiole against a segment
+    /// the bake never anchored on (0.25 m off, in the broadleaf crown), so this
+    /// mirrors `BranchAnchor::from_branch` + `nearest` exactly and
+    /// `nearest_leafy_branch` breaks ties the same way.
+    fn branch_distance_squared(branch: &crate::world::tree_shape::Branch, p: Vec3) -> f32 {
         let start = Vec3::from_array(branch.start);
         let delta = Vec3::from_array(branch.end) - start;
-        let len2 = delta.length_squared();
-        let t = if len2 < 1e-9 {
-            0.0
-        } else {
-            ((p - start).dot(delta) / len2).clamp(0.0, 1.0)
-        };
-        p.distance(start + delta * t)
+        let len = delta.length();
+        if len < 1e-3 {
+            return f32::INFINITY;
+        }
+        let dir = delta / len;
+        let along = (p - start).dot(dir).clamp(0.0, len);
+        p.distance_squared(start + dir * along)
     }
 
     /// Index and distance of the branch nearest to `p`.
@@ -800,6 +818,11 @@ mod tests {
 
     /// Index of the leaf-bearing branch nearest to `p`: the carrier the bake
     /// anchors a cluster on.
+    ///
+    /// Skips degenerate segments exactly like `BranchAnchor::from_branch` does;
+    /// otherwise a zero-length stub wins the "nearest" comparison here while the
+    /// bake anchors on the real twig, and the measured petiole distance is that
+    /// of the wrong branch.
     fn nearest_leafy_branch(
         skeleton: &crate::world::tree_shape::TreeSkeleton,
         p: Vec3,
@@ -810,7 +833,15 @@ mod tests {
             .iter()
             .enumerate()
             .filter(|(_, branch)| branch.level >= min_level)
-            .min_by(|a, b| branch_distance(a.1, p).total_cmp(&branch_distance(b.1, p)))
+            .filter(|(_, branch)| {
+                (Vec3::from_array(branch.end) - Vec3::from_array(branch.start)).length() >= 1e-3
+            })
+            // Squared distance + first-minimum tie-break: the same comparison
+            // `BranchAnchor::nearest` runs, so the test and the bake can never
+            // disagree about which twig carries a cluster.
+            .min_by(|a, b| {
+                branch_distance_squared(a.1, p).total_cmp(&branch_distance_squared(b.1, p))
+            })
             .map(|(index, _)| index)
     }
 
@@ -1057,8 +1088,13 @@ mod tests {
                     let branch = &skeleton.branches[carrier];
                     let petiole_distance = branch_distance(branch, petiole);
                     let tip_distance = branch_distance(branch, tip);
+                    // Measured against the AXIS, so the allowance has to cover
+                    // the bark: a running cluster on a first-generation limb
+                    // sits 0.7 x radius off the axis, which is 0.12 m on a
+                    // 0.32 m-thick street-tree limb. What the check is really
+                    // about is the petiole not leaving the bark.
                     assert!(
-                        petiole_distance <= 0.10,
+                        petiole_distance <= branch.radius + 0.10,
                         "species {species}: a petiole sits {petiole_distance:.2} m off the twig"
                     );
                     assert!(
@@ -1124,13 +1160,14 @@ mod tests {
                         continue;
                     }
                     let petiole = petiole / n as f32;
-                    let Some((_, distance)) = nearest_branch(&skeleton, petiole) else {
+                    let Some((nearest, distance)) = nearest_branch(&skeleton, petiole) else {
                         continue;
                     };
-                    // 10 cm is a generous bound: the petiole is placed on the
-                    // bark of a leaf-bearing twig, whose radius is under 3 cm.
+                    // Axis distance, so allow for the bark: a spray on a thick
+                    // first-generation limb leaves the bark, not the axis.
+                    let bark = skeleton.branches[nearest].radius;
                     assert!(
-                        distance <= 0.10,
+                        distance <= bark + 0.10,
                         "species {species}: a petiole sits {distance:.2} m from the nearest twig"
                     );
                     checked += 1;

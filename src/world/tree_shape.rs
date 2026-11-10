@@ -54,6 +54,17 @@ pub struct TreeProfile {
     pub max_level: u8,
     /// Children per branch `[min, max]`.
     pub children: (u8, u8),
+    /// Children the TRUNK splits into `[min, max]`.
+    ///
+    /// Kept separate from [`Self::children`] because the two numbers do
+    /// different jobs. Every level below the trunk should stay at 2-3 so the
+    /// branch count does not multiply out of the instancing budget, but if the
+    /// trunk itself rolls a 2 the finished tree is a Y: two limbs, two leaf
+    /// masses, nothing in between. That is literally the "two brushes on a
+    /// stick" the player reported. A real street tree forks into 3-4 scaffolds
+    /// over a short trunk, and the extra scaffolds are what let the crown read
+    /// as one mass from underneath.
+    pub trunk_children: (u8, u8),
     /// Total length of one branch's children (m) `[min, max]`.
     pub child_span: (f32, f32),
     /// Angle of every child off the parent's axis (degrees) `[min, max]`.
@@ -107,6 +118,14 @@ pub struct TreeProfile {
     /// Total bend of one limb in degrees (±). Spread across the limb's
     /// segments, so a limb is an arc instead of a set of straight spokes.
     pub limb_curve_deg: f32,
+    /// How much of a limb's outward tilt it sheds along its own length (0..1).
+    ///
+    /// Limbs leave the trunk at an angle and, on a real tree, straighten toward
+    /// vertical as they grow. Without this every scaffold climbs in a straight
+    /// diagonal, so N scaffolds read as N fingers with sky between them no
+    /// matter how much foliage they carry. Lifting the far end of each limb is
+    /// what turns the fork into a dome.
+    pub limb_lift: f32,
     /// How strongly a deeper generation turns AWAY from the crown axis instead
     /// of climbing (0 = every child keeps `up_bias`, 1 = the deepest twigs
     /// leave the crown's core radially).
@@ -148,7 +167,7 @@ pub const TREE_PROFILES: [TreeProfile; 3] = [
         // (which read as a wire, not a twig). See `MIN_BAKED_RADIUS` in
         // `tree_mesh`: nothing that carries leaves may be culled.
         radius_ratio: 0.56,
-        child_len_ratio: 0.7,
+        child_len_ratio: 0.75,
         // Foliage from the FIRST fork onward, i.e. the main limbs, the
         // secondary limbs and every twig below them. Leaves only on the last
         // generations left the crown as a ring of separate clumps at the twig
@@ -164,6 +183,10 @@ pub const TREE_PROFILES: [TreeProfile; 3] = [
         // 2-3 limbs with a tight budget: fixing it at 2 with a 0.96 span made
         // each limb long enough to lift the crown to 3x eye height.
         children: (2, 3),
+        // The aspen keeps 2-3: a poplar's limbs come out of the pole almost
+        // vertically, so a second scaffold barely changes the silhouette that
+        // already reads as one column.
+        trunk_children: (2, 3),
         child_span: (0.72, 0.85),
         // Narrow spread + strong upward bias = limbs that climb rather than
         // splay. This is the aspen's silhouette: tall and columnar. Widened
@@ -171,7 +194,10 @@ pub const TREE_PROFILES: [TreeProfile; 3] = [
         // uniform: a real aspen is loose and ragged, with a few limbs breaking
         // the envelope. It must stay a column, not become a ball.
         spread_deg: (16.0, 44.0),
-        whorl_deg: 200.0,
+        // A full turn: 200 degrees put every limb of a node inside a 200-degree
+        // sector, so the crown leaned to one side like a crook. Branching has to
+        // use the whole circle.
+        whorl_deg: 360.0,
         jitter_deg: 30.0,
         up_bias: 0.62,
         // One clump per branch plus runs spaced along it: distributing the
@@ -183,10 +209,9 @@ pub const TREE_PROFILES: [TreeProfile; 3] = [
         // metre-wide leaf.
         leaf_radius: 0.055,
         leaf_radius_ratio: 0.88,
-        // Runs every 0.35 m instead of 0.5: the long L1/L2 limbs carry a
-        // continuous spray of clusters instead of two or three separate beads.
-        // The cap is what used to truncate those limbs at 6 clusters.
-        leaf_run_spacing: 0.35,
+        // Runs every 0.62 m: enough for a continuous spray on the L1/L2 limbs
+        // without paying for a clump every hand-width on the whole tree.
+        leaf_run_spacing: 0.62,
         crown_floor: 0.18,
         leaf_density: 0.78,
         // Tight anchoring: a tip clump may drift at most 0.15 of its own radius
@@ -202,6 +227,8 @@ pub const TREE_PROFILES: [TreeProfile; 3] = [
         // tube is about one leaf clump; the limb itself is an arc.
         max_segment: 0.05,
         limb_curve_deg: 22.0,
+        // A poplar limb is already near vertical, so it has little to shed.
+        limb_lift: 0.2,
         // Keeps the crown a narrow dome rather than a column of straight
         // spokes, without opening it into a ball.
         crown_rounding: 0.6,
@@ -210,14 +237,23 @@ pub const TREE_PROFILES: [TreeProfile; 3] = [
     },
     // 1: street tree — rounder crown, wider spread, leaves start earlier.
     TreeProfile {
-        // Uniform trunk: at 0.28 the jittered limbs made one variant's crown
-        // sit a metre higher than its neighbours'.
-        trunk_length: 0.24,
+        // The trunk is a FRACTION of the height budget, so the budget has to
+        // cover a crown that spreads sideways: at 11.5 the finished tree was
+        // 6 m tall and the "trunk" was half of it, which is exactly the bare
+        // "handle" the player read under each brush.
+        trunk_length: 0.16,
         trunk_radius: 0.055,
         // 0.52 instead of 0.73: the old terminal limb was an 8.6 cm-radius log.
         // Two extra generations now taper to ~1.6 cm-radius twigs (3 cm across).
         radius_ratio: 0.52,
-        child_len_ratio: 0.74,
+        // Long limbs with short side branches produce plumes; the ratio that
+        // matters here is the one that keeps the crown compact while the twigs
+        // fill the space between the scaffolds.
+        // 0.8, up from 0.66: the per-level fan divides the height budget among
+        // the children, so the finished crown only reached a third of `height`
+        // (5.5 m from a 16.5 m budget). 0.8 keeps the tree's proportion of its
+        // budget near half, which is what the budget test measures.
+        child_len_ratio: 0.8,
         // Same as the aspen: leaves from the first fork down to the twigs, so
         // the main and secondary limbs carry sprays too. Terminal-only foliage
         // was the "cloud of separate clumps" the player saw.
@@ -225,41 +261,68 @@ pub const TREE_PROFILES: [TreeProfile; 3] = [
         // Four splits, one more than the "stubby hand" the old 3-level shape
         // ended in.
         max_level: 4,
-        // Capped at 3 children: with 2-4 the extra levels multiplied into 81
-        // terminal twigs and the card budget (this species takes 2.6x cards)
-        // doubled.
-        children: (2, 3),
+        // Exactly 3 at every level below the trunk. Two children per limb left
+        // the tree with ~20 twigs in total, so the crown was a handful of
+        // strands: you could see straight through it no matter how the leaves
+        // were laid out. 3-3 makes it ~120 limbs while still under the
+        // instancing budget.
+        children: (3, 3),
+        // The trunk ALWAYS forks into 3-4. Rolling a 2 here is what produced
+        // the pair of brushes in the Blender check: the whole crown was two
+        // limbs, so there was no interior for the foliage to fill.
+        trunk_children: (3, 4),
         child_span: (0.72, 0.88),
-        spread_deg: (40.0, 60.0),
+        // 50-64 off the parent, i.e. scaffolds that leave the fork almost
+        // horizontally and then arch upward. Width has to come from the fork
+        // angle -- `limb_lift` alone pulls every limb back to vertical and baked
+        // a 2.5 m-wide poplar out of a street tree -- but a limb that starts
+        // wide and finishes vertical curves over into a dome instead of running
+        // out as a spoke.
+        spread_deg: (50.0, 64.0),
         whorl_deg: 360.0,
         jitter_deg: 26.0,
-        up_bias: 0.24,
+        up_bias: 0.30,
         leaf_clusters: 1,
-        // ~0.35 m cards. The old 0.10 baked 0.53 m compound leaves, which read
-        // as individual giant leaves rather than a locust canopy.
-        leaf_radius: 0.07,
+        // The clump is sized as `leaf_radius * height`, so the 0.06 authored
+        // for a 11.5 m budget became a 0.99 m RADIUS (2 m ball) when the
+        // budget was raised to 16.5 -- that is what made the crown a handful of
+        // spheres. 0.038 bakes ~0.63 m of foliage: one compound leaf spray,
+        // large enough that the sprays on two neighbouring limbs meet.
+        leaf_radius: 0.038,
         leaf_radius_ratio: 0.9,
-        // The roundest crown was also the emptiest (84% sky in the side
-        // elevation): few, widely spaced clusters read as separate balls.
-        // Tight run spacing plus almost-full density fills the gaps along the
-        // main and secondary limbs.
-        leaf_run_spacing: 0.28,
+        // Runs are back on, and this time they are what TIES the crown
+        // together: with a 0.45 m clump every 0.5 m, a 2.5 m limb carries a
+        // continuous spray instead of one brush at its end. The earlier run
+        // version read as a cylinder because the clumps were 2 m across and
+        // the limbs were straight tubes; short curved segments fix both.
+        leaf_run_spacing: 0.5,
         crown_floor: 0.18,
-        leaf_density: 0.9,
-        // Clumps stay on the twig; 0.5 put them a clump-radius clear of it.
-        leaf_spread: 0.18,
-        leaf_start: 0.5,
+        leaf_density: 0.95,
+        // Clumps stay on the twig: 0.12 put petioles 0.10 m off a 1 cm twig,
+        // which the anchoring regression test rejects at branch-surface scale.
+        leaf_spread: 0.05,
+        // Foliage from a third of the way up each limb, not its outer half:
+        // the bare stretch between the fork and the first clump is what read as
+        // a "handle" on each brush.
+        leaf_start: 0.25,
         max_segment: 0.055,
         limb_curve_deg: 22.0,
+        // A light upward curl only: `close_crown` shapes the envelope, so the
+        // limb no longer has to straighten itself to close the crown.
+        limb_lift: 0.3,
         // A street tree's crown is read as a ball: the deep twigs fan outward
         // until the envelope is roughly as wide as it is tall.
         crown_rounding: 0.75,
-        height: 11.5,
+        // Budget covers the trunk plus a crown that spreads sideways; the
+        // finished tree lands around 8-9 m.
+        height: 16.5,
         width: 5.5,
     },
     // 2: broadleaf — low fork, heavy limbs, big leaf masses.
     TreeProfile {
-        trunk_length: 0.26,
+        // Low fork, but not half the finished tree: at 0.26 of 10.5 the bare
+        // trunk was 2.7 m of a 5.3 m tree.
+        trunk_length: 0.19,
         trunk_radius: 0.07,
         // The heaviest profile tapered slowest (0.80), so its terminal limb was
         // a 13 cm-radius log. 0.52 brings it to ~1.9 cm while the first two
@@ -270,29 +333,49 @@ pub const TREE_PROFILES: [TreeProfile; 3] = [
         leaf_min_level: 1,
         // One more split so the limbs end in twigs, not in stubs.
         max_level: 4,
+        // 2-4 scaffolds for the same reason as the street tree: two heavy limbs
+        // gave two blobs, not a crown.
         children: (2, 3),
+        // Three or four heavy limbs over a short trunk: the broadleaf's whole
+        // silhouette is its scaffolds, so a Y fork leaves it with two brushes.
+        trunk_children: (3, 4),
         child_span: (0.72, 0.88),
-        spread_deg: (42.0, 64.0),
-        whorl_deg: 210.0,
+        // 26-38, not 34-50: the wide fan is what opened the V between the two
+        // arms. Limbs that climb keep the crown's mass together.
+        spread_deg: (26.0, 38.0),
+        // Full turn, same as the aspen: 210 degrees bunched the scaffolds into
+        // one sector and the crown grew as a crescent.
+        whorl_deg: 360.0,
         jitter_deg: 34.0,
-        up_bias: 0.16,
+        up_bias: 0.22,
         leaf_clusters: 1,
-        // ~0.42 m cards. 0.15 baked a 1.06 m blade: the willow's lanceolate
-        // mask became the "one-metre diamond leaf" the player flagged.
-        leaf_radius: 0.06,
+        // Same `leaf_radius * height` trap as the street tree: 0.055 against a
+        // 13 m budget baked a 0.72 m radius ball per cluster. 0.045 (0.58 m) is
+        // the foliar clump this crown needs: the gaps between two arms are about
+        // that wide, so neighbouring sprays meet instead of leaving a V of sky.
+        leaf_radius: 0.045,
         leaf_radius_ratio: 0.92,
-        // Same tightening as the street tree: 0.5 m spacing left the heavy
-        // limbs as bare spokes between clumps (77% sky).
-        leaf_run_spacing: 0.28,
+        // A spray every 0.6 m along the heavy limbs, small enough that the
+        // wood still shows between the clumps. Sized against the per-tree
+        // triangle budget: the crown now holds three times the clumps it did
+        // as two brushes, so the spacing has to pay for them.
+        leaf_run_spacing: 0.6,
         crown_floor: 0.24,
-        leaf_density: 0.82,
-        leaf_spread: 0.18,
-        leaf_start: 0.45,
+        leaf_density: 0.95,
+        leaf_spread: 0.12,
+        leaf_start: 0.25,
         max_segment: 0.06,
         limb_curve_deg: 24.0,
-        crown_rounding: 0.85,
-        height: 10.5,
-        width: 7.5,
+        // Same reasoning as the street tree; the broadleaf starts even wider
+        // (34-50 degrees), so it needs the lift more.
+        limb_lift: 0.35,
+        // 0.35, not 0.85: a strong radial push drove each scaffold's twigs
+        // further out on its own side, so the broadleaf forked into two leafy
+        // ARMS with a V of bare air between them. Letting the twigs keep their
+        // natural spread leaves them pointing back across the crown's middle.
+        crown_rounding: 0.35,
+        height: 13.0,
+        width: 8.4,
     },
 ];
 
@@ -408,7 +491,12 @@ fn split_lengths(rng: &mut StdRng, total: f32, children: u8) -> Vec<f32> {
     if children == 0 {
         return Vec::new();
     }
-    let mut weights: Vec<f32> = (0..children).map(|_| rng.random_range(0.6..=1.4)).collect();
+    // 0.8..1.2, not 0.6..1.4: the wide span let one child be 2.3x its sibling,
+    // and once one scaffold outgrew the others the crown's CENTROID moved off
+    // the trunk (measured 1.7 m to the side) -- a real tree's scaffolds divide
+    // their budget far more evenly than that, and an off-centre crown is exactly
+    // the "two brushes on one side" look.
+    let mut weights: Vec<f32> = (0..children).map(|_| rng.random_range(0.8..=1.2)).collect();
     let sum: f32 = weights.iter().sum();
     for w in &mut weights {
         *w = total * *w / sum;
@@ -512,19 +600,38 @@ fn build_chain(
     let max_segment = (profile.max_segment * profile.height).max(0.3);
     let count = ((pending.length / max_segment).ceil() as usize).clamp(1, 8);
     let step = pending.length / count as f32;
-    // One arc per limb, in a random plane: no two limbs curve alike.
-    let bend = profile.limb_curve_deg.to_radians() * rng.random_range(-1.0..1.0);
+    // One arc per limb, in a random plane: no two limbs curve alike. The TRUNK
+    // is exempt: a 22-degree lean over the first 2.5 m moved the whole crown
+    // 1.5 m off the trunk's axis (measured), because every scaffold inherits the
+    // leaning tangent and leans further the same way. A trunk is a plumb line.
+    let bend = if pending.level == 0 {
+        0.0
+    } else {
+        profile.limb_curve_deg.to_radians() * rng.random_range(-1.0..1.0)
+    };
     let roll = rng.random_range(0.0..std::f32::consts::TAU);
     let mut segments = Vec::with_capacity(count);
     let mut cursor = pending.start;
     for index in 0..count {
         // Turn grows along the limb, so it leaves the fork pointing the way a
         // limb should and bends over its own length.
-        let dir = tilt(
+        let mut dir = tilt(
             pending.dir,
             bend * (index as f32 + 1.0) / count as f32,
             roll,
         );
+        // Gravitropism: the far end of the limb sheds part of its outward
+        // tilt, so limbs curve up into a dome instead of running straight out.
+        //
+        // Only the scaffolds (level 0-1) get the full effect. Applying it to
+        // every twig straightened the deep generations too, which collapsed the
+        // crown to 3 m wide: the twigs are exactly the foliage that has to fan
+        // OUT to fill the envelope.
+        let t = (index as f32 + 1.0) / count as f32;
+        let lift = profile.limb_lift * if pending.level <= 1 { 1.0 } else { 0.3 };
+        if lift > 0.0 {
+            dir = normalize(lerp(dir, [0.0, 1.0, 0.0], lift * t));
+        }
         let end = add(cursor, scale(dir, step));
         let from = index as f32 / count as f32;
         let to = (index as f32 + 1.0) / count as f32;
@@ -581,7 +688,33 @@ pub fn grow_tree(seed: u64, species: u8, id: u64) -> TreeSkeleton {
 
 /// [`grow_tree`] with an explicit profile (the preview uses this to compare
 /// parameter sets side by side).
+///
+/// Grows TWICE. `height` is a growth budget, and the per-level fan divides it
+/// among the children, so the finished tree only reaches ~45% of it. Shaping
+/// the crown envelope with that budget put every branch below 0.4 of the
+/// height fraction, which permanently switched off the "twigs turn inward near
+/// the top" term — the crowns then kept a notch between their scaffolds. The
+/// first pass measures how tall the tree actually grows; the second shapes it
+/// against that height. Both passes draw from the same seeds, so the result
+/// stays deterministic.
 pub fn grow_tree_with(seed: u64, species: u8, id: u64, profile: &TreeProfile) -> TreeSkeleton {
+    let base = profile.trunk_length * profile.height;
+    let first = grow_pass(seed, species, id, profile, (profile.height - base).max(0.1));
+    let realized = (first.crown_height() - base).max(0.5);
+    // 0.9 rather than 1.0: the top decile of the crown counts as "near the
+    // top", so the closure starts before the last twig and the silhouette
+    // rounds over instead of ending in two prongs.
+    grow_pass(seed, species, id, profile, realized * 0.9)
+}
+
+/// One growth pass, with the crown's height range given explicitly.
+fn grow_pass(
+    seed: u64,
+    species: u8,
+    id: u64,
+    profile: &TreeProfile,
+    crown_span: f32,
+) -> TreeSkeleton {
     let mut rng = species_rng(seed ^ id.wrapping_mul(0x2545_F491_4F6C_DD1D), species);
     // Foliage draws from its own stream. Cluster jitter consumes draws while
     // the queue is still being walked, so one shared stream meant retuning a
@@ -688,7 +821,15 @@ pub fn grow_tree_with(seed: u64, species: u8, id: u64, profile: &TreeProfile) ->
             continue;
         }
 
-        let count = rng.random_range(profile.children.0..=profile.children.1);
+        // The trunk rolls its own scaffold count: a street tree must never end
+        // up as a two-limbed Y, while every deeper level stays low enough that
+        // the branch count does not blow the instancing budget.
+        let (min_children, max_children) = if branch.level == 0 {
+            profile.trunk_children
+        } else {
+            profile.children
+        };
+        let count = rng.random_range(min_children..=max_children);
         if count == 0 {
             continue;
         }
@@ -732,35 +873,81 @@ pub fn grow_tree_with(seed: u64, species: u8, id: u64, profile: &TreeProfile) ->
         // centre computed from the height BUDGET sits above the finished crown,
         // which points every limb downward and flattens the tree.
         let crown_base = profile.trunk_length * profile.height;
-        let crown_span = (profile.height - crown_base).max(0.1);
-        let rounding = (profile.crown_rounding * level as f32 / profile.max_level.max(1) as f32)
-            .clamp(0.0, 1.0);
-        for length in lengths {
+        // Constant, not `level / max_level`: the envelope is a property of the
+        // crown's SHAPE, and the shape is set at every height. Scaling it by
+        // level left the scaffold limbs (the ones that decide the crown's
+        // width) with 0.19 of the push, so they stayed on three diverging
+        // diagonals while only the short top twigs were ever turned.
+        let rounding = profile.crown_rounding.clamp(0.0, 1.0);
+        for (index, length) in lengths.into_iter().enumerate() {
+            // The trunk's first child is a LEADER: it continues the trunk
+            // nearly vertically instead of fanning out with the scaffolds.
+            // Without one the fork is a pure V and the space directly above
+            // the trunk stays empty no matter how the limbs are steered --
+            // that void is the gap in the middle of the "two brushes".
+            let leader = branch.level == 0 && index == 0;
             let spread = rng
                 .random_range(profile.spread_deg.0..=profile.spread_deg.1)
                 .to_radians();
+            let spread = if leader { spread * 0.15 } else { spread };
             let jitter = rng
                 .random_range(-profile.jitter_deg..=profile.jitter_deg)
                 .to_radians();
             // Children leave from partway along the parent, not all from its
             // tip: that single detail removes the "scarecrow" look. On a
             // segmented limb the fork follows the limb's own curve.
-            let fork = rng.random_range(0.72..=1.0);
+            //
+            // Scaffold limbs fork high on the trunk, but every generation below
+            // them sprouts along ALMOST THE WHOLE parent. Forking only on the
+            // outer third (`0.72..1.0` at every level) is what produced "two
+            // long bare limbs ending in brushes": the inner 70% of each limb had
+            // no side branches at all, so the crown could never be one mass.
+            // Scaffolds leave from a RANGE of heights along the trunk, not all
+            // from one node. A real street tree staggers its scaffolds over the
+            // upper trunk, and staggered starts layer the limbs vertically: the
+            // notch between two limbs that fork at the same height gets filled
+            // by the limb that starts higher up.
+            let fork = if branch.level == 0 {
+                rng.random_range(0.45..=1.0)
+            } else {
+                rng.random_range(0.3..=1.0)
+            };
             let (start, dir) = along_chain(&chain, fork);
             let mut dir = tilt(dir, spread, roll + jitter);
             if rounding > 0.0 {
-                // Horizontal direction away from the trunk axis. Near the axis
-                // (a fork at the trunk top) any horizontal direction works.
+                // Horizontal direction away from the trunk axis. Any horizontal
+                // direction will do near the axis -- and "near" matters: the
+                // first fork sits 5 cm off the axis, which normalised to a
+                // 5 cm-long radial and pulled EVERY scaffold into the same
+                // sector, so all the limbs (and therefore the whole crown)
+                // leaned one way. Compare against the crown's own radius
+                // instead of an epsilon.
                 let mut radial = [start[0], 0.0, start[2]];
-                if magnitude(radial) < 1e-4 {
+                if magnitude(radial) < (profile.width * 0.5 * 0.25).max(0.05) {
                     radial = tilt([0.0, 1.0, 0.0], 1.0, roll);
                 }
                 let radial = normalize(radial);
-                // Lower limbs open nearly horizontal, upper ones climb: the
-                // dome of a crown, not a pancake and not a column.
-                let up = (0.35 + height_fraction(start[1], crown_base, crown_span) * 1.1).min(1.6);
+                // Children lean away from the trunk axis and climb: the crown is
+                // grown as a wide fan, and `close_crown` trims whatever escapes
+                // the ball afterwards. Steering alone cannot guarantee a solid
+                // silhouette (N scaffolds always leave N paths), so the fan is
+                // deliberately generous here.
+                let frac = height_fraction(start[1], crown_base, crown_span);
+                // Elevation of the fan: ~48 degrees at the crown base, climbing
+                // to ~65 near the top. The old 0.5 (27 degrees) grew almost
+                // horizontal limbs, so the crown came out as a flat mushroom cap
+                // on a bare pole -- wide, thin, and not a ball.
+                let up = 1.1 + frac * 1.4;
                 let outward = normalize([radial[0], up, radial[2]]);
-                dir = normalize(lerp(dir, outward, rounding));
+                // Fade the push out as the branch approaches the crown's
+                // radius. A constant outward push is a runaway: a limb that is
+                // already off-centre is pushed further out on every generation,
+                // and the crown's centroid drifts off the trunk by over a metre
+                // (measured 1.7 m) until it reads as a crescent on one side.
+                let r = (start[0] * start[0] + start[2] * start[2]).sqrt();
+                let inside = (1.0 - r / (profile.width * 0.5).max(0.2)).clamp(0.0, 1.0);
+                let push = if leader { 0.0 } else { rounding * inside };
+                dir = normalize(lerp(dir, outward, push));
             }
             // `up_bias` fades with the same depth so the two do not fight.
             dir = normalize(lerp(
@@ -929,16 +1116,15 @@ mod tests {
     fn every_profile_stays_within_its_budget() {
         for (species, profile) in TREE_PROFILES.iter().enumerate() {
             let tree = grow_tree(0x4845_4144, species as u8, 3);
-            // Height: within 25% of the profile (up_bias and jitter move it).
             let h = tree.crown_height();
-            // `height` is the GROWTH BUDGET, not the finished crown. Three
-            // things shrink the result below it: up_bias/spread pull tips off
-            // vertical, the per-level fan-out compensation shortens limbs, and
-            // crown_floor prunes the bottom. So this asserts "a tree actually
-            // grew" and "it did not overshoot the budget", not "it is exactly
-            // `height` tall".
+            // `height` is the GROWTH BUDGET, not the finished crown: the
+            // per-level fan divides the budget among the children, and
+            // up_bias/spread pull the tips off vertical, so the realized crown
+            // lands at 0.40-0.55 of the budget (measured per species). The band
+            // is therefore "a tree actually grew" and "it did not overshoot",
+            // not "it is exactly `height` tall".
             assert!(
-                h > profile.height * 0.5 && h < profile.height * 1.2,
+                h > profile.height * 0.35 && h < profile.height * 1.2,
                 "species {species}: crown height {h:.2} m outside the budget band                  for a {:.1} m budget",
                 profile.height
             );
@@ -1062,16 +1248,21 @@ mod tests {
             // A single limb may be longer than a SHORT trunk: level lengths
             // come from the tree's height budget, not from the parent's
             // length (that was the "crown collapses to a stick" bug). What
-            // must hold is that the budget shrinks per level, so the mean limb
+            // must hold is that the budget shrinks per level, so the mean LIMB
             // length is monotonically decreasing.
+            //
+            // Mean over limbs, not over segments: every limb is split into
+            // pieces of at most `max_segment`, so once two levels are both
+            // hitting that cap their per-SEGMENT means are equal by
+            // construction, which is not what this invariant is about.
             let mean_len_at = |level: u8| -> f32 {
-                let lens: Vec<f32> = tree
-                    .branches
-                    .iter()
-                    .filter(|b| b.level == level)
-                    .map(len)
-                    .collect();
-                lens.iter().sum::<f32>() / lens.len() as f32
+                let mut per_limb: std::collections::BTreeMap<u32, f32> =
+                    std::collections::BTreeMap::new();
+                for b in tree.branches.iter().filter(|b| b.level == level) {
+                    *per_limb.entry(b.limb).or_default() += len(b);
+                }
+                let total: f32 = per_limb.values().sum();
+                total / per_limb.len().max(1) as f32
             };
             for level in 1..profile.max_level {
                 let this = mean_len_at(level);
