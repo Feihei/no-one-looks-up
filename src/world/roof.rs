@@ -187,6 +187,12 @@ fn face_normal(a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> [f32; 3] {
 /// Baked once for the whole city and scaled by `(frontage, rise, depth)` per
 /// building, so the overhang is proportional to the depth -- 0.24-0.36 m on a
 /// 4-6 m shophouse, which is the eave the style calls for.
+///
+/// The shell is **closed**, including a soffit at y = 0. The eave hangs past
+/// the wall, and a walker standing under it looks straight up into the slope's
+/// back face: with back-face culling that is a hole in the roof, and through
+/// the hole, sky. The soffit is the underside the overhang was always missing
+/// (`gable_is_a_closed_shell` pins it).
 pub fn bake_gable() -> Mesh {
     let (x0, x1) = (-0.5, 0.5);
     let z_eave = 0.56;
@@ -211,6 +217,15 @@ pub fn bake_gable() -> Mesh {
     // Reaching the eave closes it and reads as a rake board.
     buf.tri([x1, 0.0, z_eave], [x1, 0.0, -z_eave], [x1, 1.0, 0.0]);
     buf.tri([x0, 0.0, -z_eave], [x0, 0.0, z_eave], [x0, 1.0, 0.0]);
+    // 檐底 soffit: shuts the triangular prism from below. Coplanar with the
+    // wall top, which costs nothing: seen from below the wall's top face is
+    // culled and seen from above this one is, so the two never both rasterise.
+    buf.quad(
+        [x0, 0.0, -z_eave],
+        [x1, 0.0, -z_eave],
+        [x1, 0.0, z_eave],
+        [x0, 0.0, z_eave],
+    );
 
     buf.build()
 }
@@ -234,6 +249,9 @@ pub fn bake_tooth() -> Mesh {
     // End triangles, CCW seen from outside (from -z and +z respectively).
     buf.tri([x0, 0.0, z0], [x1, 1.0, z0], [x1, 0.0, z0]);
     buf.tri([x1, 0.0, z1], [x1, 1.0, z1], [x0, 0.0, z1]);
+    // Underside, for the same reason as the gable's soffit: a wedge with no
+    // bottom is a hole you can see the sky through from under the wall.
+    buf.quad([x0, 0.0, z1], [x0, 0.0, z0], [x1, 0.0, z0], [x1, 0.0, z1]);
 
     buf.build()
 }
@@ -281,6 +299,50 @@ mod tests {
                 assert!(
                     dot > 1e-3,
                     "{name}: a triangle's normal points inward (dot {dot:.4}) at {a:?} {b:?} {c:?}"
+                );
+            }
+        }
+    }
+
+    /// Every roof mesh is a closed shell: a directed edge must have exactly
+    /// one partner running the other way. One missing face is a hole you look
+    /// the sky through -- the gable's soffit was missing, and from under the
+    /// overhang the only thing between the walker and the sky was a back face
+    /// the rasteriser culls.
+    #[test]
+    fn roofs_are_closed_shells() {
+        for (name, mesh) in [("gable", bake_gable()), ("tooth", bake_tooth())] {
+            let positions: Vec<[f32; 3]> = mesh
+                .attribute(Mesh::ATTRIBUTE_POSITION)
+                .expect("positions")
+                .as_float3()
+                .expect("f32")
+                .to_vec();
+            let indices = match mesh.indices().expect("indices") {
+                Indices::U32(i) => i.clone(),
+                Indices::U16(i) => i.iter().map(|&v| v as u32).collect(),
+            };
+            // Quantise so vertices shared between faces compare equal.
+            let key = |p: [f32; 3]| p.map(|v| (v * 1024.0).round() as i64);
+            let mut edges: std::collections::HashMap<([i64; 3], [i64; 3]), u32> =
+                std::collections::HashMap::new();
+            for tri in indices.as_chunks::<3>().0 {
+                let k = [
+                    key(positions[tri[0] as usize]),
+                    key(positions[tri[1] as usize]),
+                    key(positions[tri[2] as usize]),
+                ];
+                for i in 0..3 {
+                    *edges.entry((k[i], k[(i + 1) % 3])).or_default() += 1;
+                }
+            }
+            for (edge, count) in &edges {
+                assert_eq!(*count, 1, "{name}: edge {edge:?} is used {count} times");
+                let reverse = edges.get(&(edge.1, edge.0)).copied().unwrap_or(0);
+                assert_eq!(
+                    reverse, 1,
+                    "{name}: open edge {:?} -> {:?} (partner found {reverse} times): the shell has a hole",
+                    edge.0, edge.1
                 );
             }
         }
