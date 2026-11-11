@@ -9,6 +9,10 @@
 //!
 //! `YAW` is degrees clockwise from north (-Z), `PITCH` degrees above the
 //! horizon, `X`/`Z` world metres. The eye sits at 1.65 m like the walker.
+//!
+//! `PAN` (degrees per second) turns the camera at a constant rate instead of
+//! holding it still, so the frame at the capture point is a *moving* frame --
+//! the only way to see what a temporal filter does under motion.
 
 use std::time::Duration;
 
@@ -61,6 +65,7 @@ fn main() {
     let yaw = env_f32("YAW", 0.0).to_radians();
     let pitch = env_f32("PITCH", 22.55).to_radians();
     let out = std::env::var("SHOT_OUT").unwrap_or_else(|_| "target/shot.png".to_string());
+    let pan = env_f32("PAN", 0.0);
 
     let mut app = App::new();
     app.add_plugins((
@@ -128,6 +133,12 @@ fn main() {
         Bloom::NATURAL,
         Transform::from_translation(eye).looking_at(eye + dir, Vec3::Y),
     ));
+    app.insert_resource(Pose {
+        eye,
+        yaw,
+        pitch,
+        pan,
+    });
 
     app.add_systems(
         Update,
@@ -139,28 +150,58 @@ fn main() {
             .chain(),
     );
 
+    // Frame pacing. `SHOT_SLEEP=0` runs flat out, which is how the numbers in
+    // the commit messages were taken: forty frames of wall clock with and
+    // without a render feature, same pose, same seed.
+    let sleep = Duration::from_millis(env_f32("SHOT_SLEEP", 16.0) as u64);
     let mut frames = 0usize;
+    // Timing window: the 30 frames before the capture, so the one-off PNG
+    // encode and the screenshot's own readback do not land in the average.
+    let mut window: Option<std::time::Instant> = None;
+    let mut window_frames = 0usize;
+    let mut frame_ms = f64::NAN;
     loop {
         app.update();
         frames += 1;
-        std::thread::sleep(Duration::from_millis(16));
+        std::thread::sleep(sleep);
+        if frames == 60 {
+            window = Some(std::time::Instant::now());
+            window_frames = 0;
+        }
+        if let Some(at) = window {
+            window_frames += 1;
+            frame_ms = at.elapsed().as_secs_f64() * 1000.0 / window_frames as f64;
+        }
         if frames.is_multiple_of(30) {
             println!("frame {frames}");
         }
         if app.world().resource::<CapturedFrame>().0.is_some() {
             for _ in 0..30 {
                 app.update();
-                std::thread::sleep(Duration::from_millis(16));
+                std::thread::sleep(sleep);
             }
             println!(
-                "saved {out} (seed {seed:#x}, eye {eye:?}, yaw {:.1}, pitch {:.1})",
+                "saved {out} (seed {seed:#x}, eye {eye:?}, yaw {:.1}, pitch {:.1}, \
+                 {frame_ms:.2} ms/frame)",
                 yaw.to_degrees(),
-                pitch.to_degrees()
+                pitch.to_degrees(),
             );
             return;
         }
         assert!(frames < 400, "shot not captured within 400 frames");
     }
+}
+
+/// The camera's pose. Held rather than driven by the walk controller, and
+/// optionally turned at a constant rate so a moving shot can be compared with
+/// a still one -- that is the only way to see a temporal filter's ghosting.
+#[derive(Resource)]
+struct Pose {
+    eye: Vec3,
+    yaw: f32,
+    pitch: f32,
+    /// Degrees per second, clockwise (positive = to the right).
+    pan: f32,
 }
 
 fn bump_frame_counter(mut counter: ResMut<FrameCounter>) {
@@ -172,9 +213,29 @@ fn in_frame(frame: usize) -> impl FnMut(Res<FrameCounter>) -> bool + Clone {
 }
 
 /// The walk controller would move the camera from the keyboard; clear the
-/// input so the pose stays where it was put.
-fn hold_camera(mut input: ResMut<ButtonInput<KeyCode>>) {
+/// input so the pose stays where it was put, then put the pose back -- the
+/// controller integrates `Transform` every frame whether or not a key is held,
+/// so position has to be re-asserted, not just frozen.
+///
+/// With `PAN` set the yaw is a function of the frame counter, not of wall-clock
+/// time, so two runs (TAA on and off) reach frame 90 at the same pose and the
+/// images can be compared pixel for pixel.
+fn hold_camera(
+    counter: Res<FrameCounter>,
+    pose: Res<Pose>,
+    mut input: ResMut<ButtonInput<KeyCode>>,
+    mut cameras: Query<&mut Transform, With<Camera3d>>,
+) {
     input.clear();
+    let yaw = pose.yaw + pose.pan.to_radians() * (counter.0 as f32 / 60.0);
+    let dir = Vec3::new(
+        yaw.sin() * pose.pitch.cos(),
+        pose.pitch.sin(),
+        -yaw.cos() * pose.pitch.cos(),
+    );
+    for mut transform in &mut cameras {
+        *transform = Transform::from_translation(pose.eye).looking_at(pose.eye + dir, Vec3::Y);
+    }
 }
 
 fn take_screenshot(mut commands: Commands, targets: Query<&RenderTarget, With<Camera3d>>) {
