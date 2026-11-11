@@ -4,6 +4,7 @@
 //! mapping table): SkyPlugin, WorldPlugin, SeasonPlugin, SavePlugin,
 //! MenuPlugin. Each milestone fills in the corresponding plugin.
 
+pub mod anti_alias;
 pub mod cirrus;
 pub mod clouds;
 pub mod facade;
@@ -27,6 +28,7 @@ pub use sky::GoldenHourCamera;
 use bevy::app::PluginGroupBuilder;
 use bevy::prelude::*;
 
+use anti_alias::AntiAliasPlugin;
 use cirrus::CirrusPlugin;
 use clouds::CloudsPlugin;
 use facade::FacadePlugin;
@@ -52,6 +54,10 @@ impl PluginGroup for GamePlugins {
             // CloudPlugin (adr-0007); right after the sky so its depth
             // prepass observer is registered before any camera spawns.
             .add(CloudsPlugin)
+            // After the clouds: both observe `Add<ElementsCamera>`, and this
+            // one wants the depth prepass that observer requests to already be
+            // on the camera when TAA's own requirements are inserted.
+            .add(AntiAliasPlugin)
             .add(SkyPanelPlugin)
             .add(CirrusPlugin)
             .add(HillsPlugin)
