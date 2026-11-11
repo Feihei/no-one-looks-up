@@ -172,15 +172,21 @@ pub const SCAFFOLD_POST: f32 = 0.16;
 /// post's own radius plus air between the pipe and the walk lane.
 pub const SCAFFOLD_POST_MIN_OFFSET: f32 = 0.15;
 
-/// How much deeper than the utility-pole line a post may stand into the block's
-/// setback (m).
+/// Furthest a post line may stand from the curb, into the block's setback (m).
 ///
-/// This is what turns the gantry's width into a variable: the posts stand on
-/// each block's own setback strip, so a street with a 5 m setback can carry a
-/// much wider deck than an old-city lane with 1 m, and the two sides are
-/// allowed to differ. The cap keeps a factory's 10 m setback from throwing a
-/// 15 m deck over a 8 m street.
-pub const SCAFFOLD_WIDEN_MAX: f32 = 1.5;
+/// This is what turns the gantry's width into a variable: each side's posts
+/// stand somewhere in that block's own setback strip, and the two sides are
+/// allowed to differ. It is also the hard ceiling on how much sidewalk a deck
+/// may swallow -- a 防护棚 covers the road and a strip of pavement, it does not
+/// roof the lane.
+///
+/// Measured from the curb, so a deck is `street + [0.3, 2.0] + 0.3` m wide.
+/// The first version let a post go 1.95 m out (a "widen" cap plus the pole
+/// standoff) and produced a 10 m deck over a 6 m lane: standing under it, the
+/// unlit underside filled the whole upward view with black. Keeping the total
+/// widening under 3 m -- this 1.0 m per side -- is the cheap fix; the deck's
+/// underside stays unlit on purpose.
+pub const SCAFFOLD_MAX_OUTSIDE_CURB: f32 = 1.0;
 
 /// Air kept between a post and the facade behind it (m): post radius plus a
 /// hand's width, so the pipe never spears the wall.
@@ -446,9 +452,9 @@ fn place_long_brackets(
 /// The gantry's width across the street is not `2 * (curb + standoff)`: each
 /// side's posts stand somewhere in that block's own setback strip, between
 /// [`SCAFFOLD_POST_MIN_OFFSET`] outside the curb and as deep as
-/// [`SCAFFOLD_WIDEN_MAX`] (and the block's setback) allows. The two sides are
-/// drawn independently, which is what makes a 防护棚 over an old-city lane
-/// narrow and tight while the same roll over a factory frontage throws a wide,
+/// [`SCAFFOLD_MAX_OUTSIDE_CURB`] (and the block's setback) allows. The two
+/// sides are drawn independently, which is what makes a 防护棚 over an old-city
+/// lane narrow and tight while the same roll over a courtyard frontage throws a
 /// slightly skewed deck -- and it keeps every post outside the walkable street
 /// by construction, since the offset never goes below its minimum.
 #[allow(clippy::too_many_arguments)]
@@ -486,9 +492,10 @@ fn place_scaffold(
     // Width across the street, drawn after the along-street placement so the
     // existing draws keep their positions in the stream.
     let offsets = params.map(|p| {
-        let cap = (p.setback - POLE_STANDOFF - SCAFFOLD_POST_PAD).clamp(0.0, SCAFFOLD_WIDEN_MAX)
-            + POLE_STANDOFF;
-        rng.random_range(SCAFFOLD_POST_MIN_OFFSET..=cap)
+        // Never past the curb ceiling, and never so deep into the setback that
+        // the post would touch the facade behind it.
+        let cap = SCAFFOLD_MAX_OUTSIDE_CURB.min(p.setback - SCAFFOLD_POST_PAD);
+        rng.random_range(SCAFFOLD_POST_MIN_OFFSET..=cap.max(SCAFFOLD_POST_MIN_OFFSET))
     });
     let (half_left, half_right) = (curb + offsets[0], curb + offsets[1]);
 
@@ -912,7 +919,7 @@ mod tests {
             .filter(|o| o.kind == PlacedKind::Prop(PropKind::ScaffoldPost))
             .collect();
         assert_eq!(posts.len(), 4, "a gantry stands on four posts");
-        let deepest = CURB + POLE_STANDOFF + SCAFFOLD_WIDEN_MAX;
+        let deepest = CURB + SCAFFOLD_MAX_OUTSIDE_CURB;
         for post in &posts {
             let across = (post.position - MID).dot(NORMAL).abs();
             assert!(
@@ -996,7 +1003,7 @@ mod tests {
                 checked += 1;
                 // Widest possible: both posts at the far end of their strip,
                 // plus the deck's fascia overhang.
-                let widest = 2.0 * (curb + POLE_STANDOFF + SCAFFOLD_WIDEN_MAX) + 0.31;
+                let widest = 2.0 * (curb + SCAFFOLD_MAX_OUTSIDE_CURB) + 0.31;
                 assert!(
                     deck.size.z > 2.0 * curb && deck.size.z <= widest,
                     "a gantry {:.2} m wide does not fit its {curb:.1} m curb",

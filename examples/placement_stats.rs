@@ -12,6 +12,7 @@ use no_one_looks_up::world::props::PropKind;
 use std::collections::HashMap;
 
 fn main() {
+    let dump = std::env::var_os("SCAFFOLDS").is_some();
     for seed in [1u64, 7, 0x4845_4144] {
         let (_, graph) = generate_world(seed).unwrap();
         let mut counts: HashMap<&str, usize> = HashMap::new();
@@ -56,6 +57,19 @@ fn main() {
                         },
                     };
                     *counts.entry(key).or_default() += 1;
+                    // `SCAFFOLDS=1` lists every gantry deck's footprint, so a
+                    // width complaint on screen can be traced to the numbers
+                    // that made it. Diagnostic only.
+                    if dump && matches!(o.kind, PlacedKind::Prop(PropKind::ScaffoldDeck)) {
+                        println!(
+                            "  deck {seed:#x} {:.1},{:.1} span {:.1} across {:.1} yaw {:.0}",
+                            o.position.x,
+                            o.position.y,
+                            o.size.x,
+                            o.size.z,
+                            o.yaw.to_degrees()
+                        );
+                    }
                     if matches!(
                         o.kind,
                         PlacedKind::Building(_) | PlacedKind::SceneryBuilding(_)
