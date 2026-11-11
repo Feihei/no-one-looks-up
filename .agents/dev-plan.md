@@ -532,6 +532,26 @@ Feihei 验收：**「好了一些，但还是不太自然。体积云就到此�
 
 ---
 
+## 阶段 R6: 自研体积云（替换 bevy_elements CloudPlugin，2026-11-11 启动）
+
+**背景**：Feihei 验收结论——crate 体积云噪声粒度 32–64 m 太粗、团块无翻卷细节，黄昏光照发灰无银边；其面向全天候动态天气的通用设计正是观感问题根源（本作锁定黄昏 17:30 + 晴朗低云量 + 仰视相机）。计划见 `.trae/documents/self-built-volumetric-clouds.md`，决策落地后登记为 adr-0007。已确认决策：游戏侧新模块 `src/plugins/clouds/`（vendor 不动，零升级合并风险）；半分辨率 march + 时域重投影（中低端独显 30fps+）；只做黄昏积云一种模型（5 种 CloudKind 全部映射进积云参数空间）。
+
+- [x] 6.0（C0）接管与管线骨架：sky.rs disable CloudPlugin + 删 `apply_cloud_layer_override` + DepthPrepass 观察器；clouds 模块（mod/params/config/gpu.rs）注册进 GamePlugins；游戏侧 WESL import spike 通过（crate 的 `bevy_elements::noise` 可 import；游戏 crate 库名 `no_one_looks_up::plugins::clouds::*`）；自写 kernel 排队辅助（vendor 的 `pub(crate)` 不可用）；debug 均匀壳层全链（march→resolve→composite）GPU 冒烟通过；单测（params 镜像/拷贝数学 tripwire/重置触发）
+- [ ] 6.1（C1）噪声与形状：generate 256³ 8-slab + detail 64³、weather 256²/16km、密度模型（高度梯度/dome/cell gaps/erosion/wind skew）、march 接真密度（coarse/fine 双模跳步）
+- [ ] 6.2（C2）黄昏光照：transmittance LUT 太阳色 + Hillaire 三 octave 多重散射 + 双瓣 HG + Beer-powder、环境 cube 环境光（16 采样）、aerial perspective + far veil
+- [ ] 6.3（C3）时域稳健性与遮挡：重投影 clamp 硬化（reset 全触发）、深度遮挡、曝光扰动下 history 不脏、步行+转头实机验收无拖影无闪烁
+- [ ] 6.4（C4）性能与档位：`CloudsQuality::of(ElementsQuality)` 映射、RenderDiagnostics 五段 span、实机 1080p 30fps+、DX12/Vulkan 双后端核验
+- [ ] 6.5（C5）验收与文档：五 kind 参数终调（F5 逐一切换人工验收）、`tests/clouds_screenshot.rs` 断言定稿、新增 `.agents/adr-0007-clouds-rework.md`、更新 adr-0003/AGENTS 状态表
+
+### C0 技术纪要（2026-11-11）
+
+- bevy 的 WESL import 路径 = 嵌入资产路径去掉 `src/` 前缀：`src/plugins/clouds/common.wesl` 注册后即 `no_one_looks_up::plugins::clouds::common`；crate 的噪声库是 `bevy_elements::noise`（hash31 入参为 `vec3<i32>`，u32 需显式转换）
+- 历史纹理存**未曝光**辐射亮度，曝光在 composite 乘 `view.exposure`（ev100 13 → exposure ≈ 1e-4，天空辐射单位在千级——debug 壳层 luminance 6000 才是中灰，0.5 会整帧黑屏且 T=0 盖掉天空）
+- resolve 无 Bayer 槽位：每 texel 每帧全量 march → 全像素 fresh 双线性上采样 + 3×3 fresh clamp + mix 0.5；壳入点世界空间重投影（`previous.clip_from_world`）
+- GPU 冒烟 `tests/clouds_screenshot.rs`（#[ignore]）：断言全部 ratio 化（无 NaN / R>B 暖色 / p90-p10 抖动带宽上下限），相机用 `Tonemapping::None`（ACES 会把 1.67× 抖动压缩到 1.19×，统计须在 tonemap 前）
+
+---
+
 ### R0.6 bevy_elements 0.6.0 迁移 + bevy_flora 试装（2026-10-30）
 
 **背景**：Bevy 0.20 生态跟进（2026-10-30 检索）：`bevy_elements` 0.6.0（2026-10-26，Bevy 0.20，大扩张）与 `bevy_flora` 0.46（2026-10-14，Bevy 0.20，程序化树 + 季节 + LOD）均确认兼容。`bevy-volumetric-clouds`（0.2.0 仍只支持 0.18）与 `bevy_atmosphere`（停在 0.16）确认继续不可用。Feihei 选择：升 0.6.0 + bevy_flora 隔离试装对比（不动 R3.9/R3.10 自研树系统）。
@@ -559,6 +579,7 @@ R3.12 观感修复补充    [██████████] 完成（叶卡贴�
 R3.13 跨街上部元素    [██████████] 实现完成（跨街电线/悬挑灯臂/防护棚，2026-11-09，待实机验收）
 R3.14 灯头绘制距离    [██████████] 实现完成（灯头 60 m 外不绘制，2026-11-09，待实机验收）
 R5.1-5 天空调参+云    [████████░░] 面板/云种/sky_gain/dome 完成；云边缘块状属已知边界（2026-10-27 收尾）
+R6: 自研体积云        [█░░░░░░░░░] 6.0 管线骨架完成（2026-11-11；crate CloudPlugin 已停用）
 ```
 
 ### R3.11 屋顶轮廓（2026-10-31，步骤 11.3）
