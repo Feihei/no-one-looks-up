@@ -16,7 +16,9 @@
 //! without opening Blender.
 
 use no_one_looks_up::world::leaf_shape::{ATLAS_HEIGHT, AlphaMask, bake_species_atlas};
-use no_one_looks_up::world::tree_mesh::{TreeLod, TreeMeshKey, bake_tree_mesh_lod};
+use no_one_looks_up::world::tree_mesh::{
+    TreeLod, TreeMeshKey, bake_tree_mesh_lod, leaf_card_stride,
+};
 use no_one_looks_up::world::tree_shape::{Branch, TREE_PROFILES, grow_tree};
 
 /// Seed variants per species averaged.
@@ -110,9 +112,11 @@ fn main() {
             println!("species {species}: no leaf UVs");
             continue;
         };
-        let cards = positions.len() / 4;
-        let (mean_w, mean_h) = quad_sizes(&positions);
-        let opening = sky_opening(&positions, &uvs, &atlas);
+        let indices = attribute_indices(&parts.leaves);
+        let stride = leaf_card_stride(species);
+        let cards = positions.len() / stride;
+        let (mean_w, mean_h) = card_sizes(&positions, stride);
+        let opening = sky_opening(&positions, &uvs, &indices, &atlas);
         let tris = parts.wood.count_vertices() / 3 + parts.leaves.count_vertices() / 3;
         println!(
             "{:<8} {:>8} {:>10.2} {:>10.2} {:>10.3} {:>8}",
@@ -149,8 +153,19 @@ fn main() {
         );
         let positions = attribute_positions(&parts.leaves);
         let uvs = attribute_uvs(&parts.leaves).unwrap_or_default();
-        let (w, h, rgb) = silhouette(&skeleton.branches, &positions, &uvs, &atlas);
+        let indices = attribute_indices(&parts.leaves);
+        let (w, h, rgb) = silhouette(&skeleton.branches, &positions, &uvs, &indices, &atlas, 0.0);
         let path = format!("target/tree_{name}.png");
+        match write_png(&path, w, h, &rgb) {
+            Ok(()) => println!("wrote {path}"),
+            Err(err) => println!("{path}: {err}"),
+        }
+        // Same crown at the game's maximum upward tilt (60 degrees, ADR-0001):
+        // an edge-on card projects to a line and contributes nothing, so this
+        // image is the honest test of "what does the player actually see when
+        // they look up".
+        let (w, h, rgb) = silhouette(&skeleton.branches, &positions, &uvs, &indices, &atlas, 60.0);
+        let path = format!("target/tree_{name}_up.png");
         match write_png(&path, w, h, &rgb) {
             Ok(()) => println!("wrote {path}"),
             Err(err) => println!("{path}: {err}"),
@@ -160,29 +175,46 @@ fn main() {
 
 /// Side-view raster of the whole tree: wood in grey-brown, leaf cards in pale
 /// green, sky in the background colour.
+///
+/// `elevation_deg` is the camera's tilt above the horizon: 0 is the ordinary
+/// side view, 60 is the game's hard limit (ADR-0001), 90 would be straight up
+/// the crown's axis. The screen's vertical axis is `y * cos - z * sin`, so a
+/// card standing in a vertical plane loses area in exact proportion to how edge
+/// on the player sees it — 90 is *not* the useful test, because the game never
+/// looks up that far and a vertical willow shoot (柳条) then projects to almost
+/// nothing while reading perfectly at 60.
 fn silhouette(
     branches: &[Branch],
     positions: &[[f32; 3]],
     uvs: &[[f32; 2]],
+    indices: &[u32],
     atlas: &AlphaMask,
+    elevation_deg: f32,
 ) -> (u32, u32, Vec<u8>) {
-    let mut points: Vec<[f32; 3]> = positions.to_vec();
+    let (sin, cos) = elevation_deg.to_radians().sin_cos();
+    // World (x, y, z) onto screen (x, up). The camera sits on -z looking up at
+    // `elevation_deg`, so its up vector is (0, cos, -sin).
+    let flatten = |p: [f32; 3]| -> (f32, f32) { (p[0], p[1] * cos - p[2] * sin) };
+    let mut points: Vec<(f32, f32)> = positions.iter().map(|p| flatten(*p)).collect();
     for branch in branches {
-        points.push(branch.start);
-        points.push(branch.end);
+        points.push(flatten(branch.start));
+        points.push(flatten(branch.end));
     }
     let (mut x_min, mut x_max, mut y_min, mut y_max) = (f32::MAX, f32::MIN, f32::MAX, f32::MIN);
     for p in &points {
-        x_min = x_min.min(p[0]);
-        x_max = x_max.max(p[0]);
-        y_min = y_min.min(p[1]);
-        y_max = y_max.max(p[1]);
+        x_min = x_min.min(p.0);
+        x_max = x_max.max(p.0);
+        y_min = y_min.min(p.1);
+        y_max = y_max.max(p.1);
     }
     let width = (x_max - x_min).max(0.5);
     let scale = (RASTER as f32 - 20.0) / width;
     let gw = RASTER;
     let gh = (((y_max - y_min) * scale).ceil() as u32 + 20).clamp(32, 4 * RASTER);
-    let project = |p: [f32; 3]| ((p[0] - x_min) * scale + 10.0, (y_max - p[1]) * scale + 10.0);
+    let project = |p: [f32; 3]| {
+        let (u, v) = flatten(p);
+        ((u - x_min) * scale + 10.0, (y_max - v) * scale + 10.0)
+    };
     let index = |x: u32, y: u32| (y * gw + x) as usize;
     let mut leaf = vec![false; (gw * gh) as usize];
     let mut wood = vec![false; (gw * gh) as usize];
@@ -212,39 +244,40 @@ fn silhouette(
         }
     }
 
-    for (quad, quad_uv) in positions.chunks(4).zip(uvs.chunks(4)) {
-        if quad.len() < 4 || quad_uv.len() < 4 {
+    // Index buffer, not quads: a shoot is a 3-segment strip.
+    for tri in indices.chunks(3) {
+        if tri.len() < 3 {
+            break;
+        }
+        let corners: Vec<(f32, f32)> = tri
+            .iter()
+            .map(|i| project(positions[*i as usize]))
+            .collect();
+        let tri_uv = |k: usize| uvs[tri[k] as usize];
+        let (a, b, c) = (corners[0], corners[1], corners[2]);
+        let area = (b.0 - a.0) * (c.1 - a.1) - (b.1 - a.1) * (c.0 - a.0);
+        if area.abs() < 1e-6 {
             continue;
         }
-        let corners: Vec<(f32, f32)> = quad.iter().map(|p| project(*p)).collect();
-        for tri in [[0usize, 1, 2], [0, 2, 3]] {
-            let (a, b, c) = (corners[tri[0]], corners[tri[1]], corners[tri[2]]);
-            let area = (b.0 - a.0) * (c.1 - a.1) - (b.1 - a.1) * (c.0 - a.0);
-            if area.abs() < 1e-6 {
-                continue;
-            }
-            let min_x = a.0.min(b.0).min(c.0).floor().max(0.0) as u32;
-            let max_x = a.0.max(b.0).max(c.0).ceil().min(gw as f32 - 1.0) as u32;
-            let min_y = a.1.min(b.1).min(c.1).floor().max(0.0) as u32;
-            let max_y = a.1.max(b.1).max(c.1).ceil().min(gh as f32 - 1.0) as u32;
-            for py in min_y..=max_y {
-                for px in min_x..=max_x {
-                    let p = (px as f32 + 0.5, py as f32 + 0.5);
-                    let w0 = ((b.0 - a.0) * (p.1 - a.1) - (b.1 - a.1) * (p.0 - a.0)) / area;
-                    let w1 = ((c.0 - b.0) * (p.1 - b.1) - (c.1 - b.1) * (p.0 - b.0)) / area;
-                    let w2 = ((a.0 - c.0) * (p.1 - c.1) - (a.1 - c.1) * (p.0 - c.0)) / area;
-                    if w0 < 0.0 || w1 < 0.0 || w2 < 0.0 {
-                        continue;
-                    }
-                    let u =
-                        w0 * quad_uv[tri[0]][0] + w1 * quad_uv[tri[1]][0] + w2 * quad_uv[tri[2]][0];
-                    let v =
-                        w0 * quad_uv[tri[0]][1] + w1 * quad_uv[tri[1]][1] + w2 * quad_uv[tri[2]][1];
-                    let tx = (u * atlas.width as f32).clamp(0.0, atlas.width as f32 - 1.0) as u32;
-                    let ty = (v * atlas.height as f32).clamp(0.0, atlas.height as f32 - 1.0) as u32;
-                    if atlas.get(tx, ty) >= 128 {
-                        leaf[index(px, py)] = true;
-                    }
+        let min_x = a.0.min(b.0).min(c.0).floor().max(0.0) as u32;
+        let max_x = a.0.max(b.0).max(c.0).ceil().min(gw as f32 - 1.0) as u32;
+        let min_y = a.1.min(b.1).min(c.1).floor().max(0.0) as u32;
+        let max_y = a.1.max(b.1).max(c.1).ceil().min(gh as f32 - 1.0) as u32;
+        for py in min_y..=max_y {
+            for px in min_x..=max_x {
+                let p = (px as f32 + 0.5, py as f32 + 0.5);
+                let w0 = ((b.0 - a.0) * (p.1 - a.1) - (b.1 - a.1) * (p.0 - a.0)) / area;
+                let w1 = ((c.0 - b.0) * (p.1 - b.1) - (c.1 - b.1) * (p.0 - b.0)) / area;
+                let w2 = ((a.0 - c.0) * (p.1 - c.1) - (a.1 - c.1) * (p.0 - c.0)) / area;
+                if w0 < 0.0 || w1 < 0.0 || w2 < 0.0 {
+                    continue;
+                }
+                let u = w0 * tri_uv(0)[0] + w1 * tri_uv(1)[0] + w2 * tri_uv(2)[0];
+                let v = w0 * tri_uv(0)[1] + w1 * tri_uv(1)[1] + w2 * tri_uv(2)[1];
+                let tx = (u * atlas.width as f32).clamp(0.0, atlas.width as f32 - 1.0) as u32;
+                let ty = (v * atlas.height as f32).clamp(0.0, atlas.height as f32 - 1.0) as u32;
+                if atlas.get(tx, ty) >= 128 {
+                    leaf[index(px, py)] = true;
                 }
             }
         }
@@ -357,25 +390,49 @@ fn attribute_uvs(mesh: &bevy::mesh::Mesh) -> Option<Vec<[f32; 2]>> {
     }
 }
 
-/// Mean width/height of the leaf quads, in metres, straight from the corners.
-fn quad_sizes(positions: &[[f32; 3]]) -> (f32, f32) {
+fn attribute_indices(mesh: &bevy::mesh::Mesh) -> Vec<u32> {
+    use bevy::mesh::Indices;
+    match mesh.indices() {
+        Some(Indices::U32(v)) => v.clone(),
+        Some(Indices::U16(v)) => v.iter().map(|i| *i as u32).collect(),
+        None => Vec::new(),
+    }
+}
+
+/// Mean width/length of the leaf cards, in metres.
+///
+/// `stride` is one card's vertex count: 4 for a leaf quad, `2 * (STRAND_SEGMENTS
+/// + 1)` for a shoot strip, whose length runs from the first row to the last.
+fn card_sizes(positions: &[[f32; 3]], stride: usize) -> (f32, f32) {
     let mut sum = (0.0f32, 0.0f32);
     let mut n = 0usize;
-    for quad in positions.chunks(4) {
-        if quad.len() < 4 {
+    if stride < 4 {
+        return (0.0, 0.0);
+    }
+    let mid = |a: [f32; 3], b: [f32; 3]| {
+        [
+            (a[0] + b[0]) * 0.5,
+            (a[1] + b[1]) * 0.5,
+            (a[2] + b[2]) * 0.5,
+        ]
+    };
+    let d = |a: [f32; 3], b: [f32; 3]| {
+        ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt()
+    };
+    for card in positions.chunks(stride) {
+        if card.len() < stride {
             continue;
         }
-        let d = |a: [f32; 3], b: [f32; 3]| {
-            ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt()
-        };
-        sum.0 += d(quad[0], quad[1]);
-        sum.1 += d(quad[0], quad[3]);
+        let start = mid(card[0], card[1]);
+        let end = mid(card[stride - 2], card[stride - 1]);
+        sum.0 += d(card[0], card[1]);
+        sum.1 += d(start, end);
         n += 1;
     }
     if n == 0 {
         return (0.0, 0.0);
     }
-    (sum.0 / n.max(1) as f32, sum.1 / n.max(1) as f32)
+    (sum.0 / n as f32, sum.1 / n as f32)
 }
 
 /// Rasterises the leaf quads from the side (+Z, slight yaw like the gallery)
@@ -383,6 +440,7 @@ fn quad_sizes(positions: &[[f32; 3]]) -> (f32, f32) {
 fn sky_opening(
     positions: &[[f32; 3]],
     uvs: &[[f32; 2]],
+    indices: &[u32],
     atlas: &no_one_looks_up::world::leaf_shape::AlphaMask,
 ) -> f32 {
     if positions.is_empty() || uvs.len() != positions.len() {
@@ -406,40 +464,43 @@ fn sky_opening(
     let gh = ((h * scale).ceil() as u32).clamp(8, 4 * RASTER);
     let mut covered = vec![false; (gw * gh) as usize];
 
-    for (quad, quad_uv) in positions.chunks(4).zip(uvs.chunks(4)) {
-        if quad.len() < 4 || quad_uv.len() < 4 {
+    let project = |p: [f32; 3]| ((p[0] - x_min) * scale, (y_max - p[1]) * scale);
+
+    // Walk the index buffer instead of assuming quads: a shoot card is a
+    // 3-segment strip, and only the mesh knows how many vertices that is.
+    for tri in indices.chunks(3) {
+        if tri.len() < 3 {
+            break;
+        }
+        let corners: Vec<(f32, f32)> = tri
+            .iter()
+            .map(|i| project(positions[*i as usize]))
+            .collect();
+        let tri_uv = |k: usize| uvs[tri[k] as usize];
+        let (a, b, c) = (corners[0], corners[1], corners[2]);
+        let area = (b.0 - a.0) * (c.1 - a.1) - (b.1 - a.1) * (c.0 - a.0);
+        if area.abs() < 1e-6 {
             continue;
         }
-        let project = |p: [f32; 3]| ((p[0] - x_min) * scale, (y_max - p[1]) * scale);
-        let corners: Vec<(f32, f32)> = quad.iter().map(|p| project(*p)).collect();
-        for tri in [[0usize, 1, 2], [0, 2, 3]] {
-            let (a, b, c) = (corners[tri[0]], corners[tri[1]], corners[tri[2]]);
-            let area = (b.0 - a.0) * (c.1 - a.1) - (b.1 - a.1) * (c.0 - a.0);
-            if area.abs() < 1e-6 {
-                continue;
-            }
-            let min_x = a.0.min(b.0).min(c.0).floor().max(0.0) as u32;
-            let max_x = a.0.max(b.0).max(c.0).ceil().min(gw as f32 - 1.0) as u32;
-            let min_y = a.1.min(b.1).min(c.1).floor().max(0.0) as u32;
-            let max_y = a.1.max(b.1).max(c.1).ceil().min(gh as f32 - 1.0) as u32;
-            for py in min_y..=max_y {
-                for px in min_x..=max_x {
-                    let p = (px as f32 + 0.5, py as f32 + 0.5);
-                    let w0 = ((b.0 - a.0) * (p.1 - a.1) - (b.1 - a.1) * (p.0 - a.0)) / area;
-                    let w1 = ((c.0 - b.0) * (p.1 - b.1) - (c.1 - b.1) * (p.0 - b.0)) / area;
-                    let w2 = ((a.0 - c.0) * (p.1 - c.1) - (a.1 - c.1) * (p.0 - c.0)) / area;
-                    if w0 < 0.0 || w1 < 0.0 || w2 < 0.0 {
-                        continue;
-                    }
-                    let u =
-                        w0 * quad_uv[tri[0]][0] + w1 * quad_uv[tri[1]][0] + w2 * quad_uv[tri[2]][0];
-                    let v =
-                        w0 * quad_uv[tri[0]][1] + w1 * quad_uv[tri[1]][1] + w2 * quad_uv[tri[2]][1];
-                    let tx = (u * atlas.width as f32).clamp(0.0, atlas.width as f32 - 1.0) as u32;
-                    let ty = (v * atlas.height as f32).clamp(0.0, atlas.height as f32 - 1.0) as u32;
-                    if atlas.get(tx, ty) >= 128 {
-                        covered[(py * gw + px) as usize] = true;
-                    }
+        let min_x = a.0.min(b.0).min(c.0).floor().max(0.0) as u32;
+        let max_x = a.0.max(b.0).max(c.0).ceil().min(gw as f32 - 1.0) as u32;
+        let min_y = a.1.min(b.1).min(c.1).floor().max(0.0) as u32;
+        let max_y = a.1.max(b.1).max(c.1).ceil().min(gh as f32 - 1.0) as u32;
+        for py in min_y..=max_y {
+            for px in min_x..=max_x {
+                let p = (px as f32 + 0.5, py as f32 + 0.5);
+                let w0 = ((b.0 - a.0) * (p.1 - a.1) - (b.1 - a.1) * (p.0 - a.0)) / area;
+                let w1 = ((c.0 - b.0) * (p.1 - b.1) - (c.1 - b.1) * (p.0 - b.0)) / area;
+                let w2 = ((a.0 - c.0) * (p.1 - c.1) - (a.1 - c.1) * (p.0 - c.0)) / area;
+                if w0 < 0.0 || w1 < 0.0 || w2 < 0.0 {
+                    continue;
+                }
+                let u = w0 * tri_uv(0)[0] + w1 * tri_uv(1)[0] + w2 * tri_uv(2)[0];
+                let v = w0 * tri_uv(0)[1] + w1 * tri_uv(1)[1] + w2 * tri_uv(2)[1];
+                let tx = (u * atlas.width as f32).clamp(0.0, atlas.width as f32 - 1.0) as u32;
+                let ty = (v * atlas.height as f32).clamp(0.0, atlas.height as f32 - 1.0) as u32;
+                if atlas.get(tx, ty) >= 128 {
+                    covered[(py * gw + px) as usize] = true;
                 }
             }
         }

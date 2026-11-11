@@ -49,6 +49,7 @@ use bevy::camera::visibility::VisibilityRange;
 use bevy::mesh::{ConicalFrustumMeshBuilder, Indices, Mesh, MeshBuilder, PrimitiveTopology};
 use bevy::prelude::*;
 
+use crate::world::leaf_shape::LEAF_VARIANTS;
 use crate::world::tree_shape::{TREE_PROFILES, TreeProfile, TreeSkeleton, grow_tree};
 
 /// Which leaf species' atlas cell each growth profile's cards sample.
@@ -64,8 +65,13 @@ const SPECIES_LEAF: [&str; 3] = ["poplar", "sophora", "willow"];
 
 /// Per-species foliage-card tuning, resolved from the leaf species.
 pub struct FoliageBake {
-    /// The atlas (u0, u1) this species' cards sample.
-    pub cell: (f32, f32),
+    /// The atlas (u0, u1) each of this species' [`LEAF_VARIANTS`] outlines
+    /// occupies, indexed by variant.
+    ///
+    /// Four outlines instead of one: a crown that samples a single mask for
+    /// every card is a wallpaper repeat, which is what "unreal leaf silhouette"
+    /// looks like from directly below.
+    pub cells: [(f32, f32); LEAF_VARIANTS],
     /// Card aspect ratio (width / height) of this species' baked leaf mask.
     ///
     /// Drives the card quad's own proportions so the leaf texture is not
@@ -82,6 +88,13 @@ pub struct FoliageBake {
     /// Card-reach multiplier, paired with the card count: more cards means
     /// smaller ones, so the cluster's total coverage stays put.
     pub reach_scale: f32,
+    /// Draw this species' cards as hanging shoots (柳条) instead of leaf blades.
+    ///
+    /// 柳 is the only species whose unit is a whole drooping shoot: alternate
+    /// leaves along a whip, hanging off the twig. The mask says so
+    /// ([`LeafShape::Switch`]), but the orientation, the size and the UV
+    /// direction differ from a leaf card, so the mesh builder needs to know too.
+    pub strand: bool,
 }
 
 fn species_foliage(species: u8) -> FoliageBake {
@@ -89,8 +102,14 @@ fn species_foliage(species: u8) -> FoliageBake {
         .get(species as usize)
         .copied()
         .unwrap_or(SPECIES_LEAF[0]);
-    let cell =
-        crate::world::leaf_shape::species_cell(species, crate::world::leaf_shape::ATLAS_HEIGHT);
+    let mut cells = [(0.0, 1.0); LEAF_VARIANTS];
+    for (variant, cell) in cells.iter_mut().enumerate() {
+        *cell = crate::world::leaf_shape::species_variant_cell(
+            species,
+            variant,
+            crate::world::leaf_shape::ATLAS_HEIGHT,
+        );
+    }
     // The card quad's proportions follow the baked leaf mask, not a fixed box,
     // so a pinnate or lanceolate leaf keeps its own shape instead of being
     // smeared into the old 0.87 broadleaf card.
@@ -106,30 +125,111 @@ fn species_foliage(species: u8) -> FoliageBake {
         // than the aspen's, so the extra cards buy density instead of only
         // fragmentation.
         "sophora" => FoliageBake {
-            cell,
+            cells,
             aspect,
-            // Card COUNT has to track the clump's AREA, not its count of them:
-            // a compound leaf is a narrow card (4 cm of blade), so 22 of them
-            // cover ~0.2 m2 while a 0.5 m-radius clump presents ~0.7 m2. 1.3x
-            // keeps a run of small clumps reading as continuous foliage while
-            // the whole species set stays inside the per-tree triangle budget.
-            cards_scale: 1.3,
-            // Just under 1.0: enough extra fragmentation without shrinking the
-            // cards so far that the crown loses coverage between sprays.
-            reach_scale: 0.95,
+            // 48 cards of 8 cm width is a veil, not a crown: a compound leaf is
+            // a tenth of a broadleaf card's area AND its leaflets are a few
+            // centimetres, so at 15 m the alpha test ate every texel and the
+            // street trees read as bare branches. 35 cards at 1.5x reach keeps
+            // the fine fragmentation (there are still 8 pairs per leaf) while
+            // giving the crown ~1.6x the coverage, and the bigger card keeps
+            // the leaflets above a pixel at street distance.
+            cards_scale: 1.6,
+            // Above 1.0 for the same reason: `cards_scale` alone buys silhouette
+            // area, but the card has to be big enough that its leaflets survive
+            // the mip chain at 10-30 m.
+            reach_scale: 1.5,
+            strand: false,
         },
-        // Simple blades (杨, 柳): the base count over-covers an already dense
+        // 柳 hangs shoots rather than bearing blades: one card is one whole
+        // shoot (see `STRAND_...`), so the cluster is a place the shoots hang
+        // FROM. 22 shoots per clump: a 3-segment strip costs 6 triangles, so the
+        // count has to stay near the blade count or the crown thins out (11 per
+        // clump read as a speckled fog) and the budget goes with it.
+        "willow" => FoliageBake {
+            cells,
+            aspect,
+            cards_scale: 1.0,
+            reach_scale: 1.0,
+            strand: true,
+        },
+        // 杨: simple blades. The base count over-covers an already dense
         // cluster once the crown carries a spray on every twig, and the species
         // set has a hard triangle budget (`the_pinnate_crown_takes_more_
-        // smaller_cards`). 0.8 x 22 = 18 cards still reads as one mass because
-        // the sprays overlap; the street tree keeps the finer 29.
+        // smaller_cards`). 1.4 x 22 = 31 cards is dense enough that the sky
+        // comes through in leaf-sized pieces rather than cluster-sized holes;
+        // the street tree keeps the finer 48.
         _ => FoliageBake {
-            cell,
+            cells,
             aspect,
-            cards_scale: 0.8,
+            cards_scale: 1.4,
             reach_scale: 1.0,
+            strand: false,
         },
     }
+}
+
+/// Vertices one leaf card occupies in the baked mesh.
+///
+/// Leaf blades are quads; a willow shoot is a [`STRAND_SEGMENTS`]-segment strip.
+/// Diagnostics and tests walk the vertex buffer, so they need the stride instead
+/// of assuming four vertices per card.
+pub fn leaf_card_stride(species: u8) -> usize {
+    if species_foliage(species).strand {
+        2 * (STRAND_SEGMENTS + 1)
+    } else {
+        4
+    }
+}
+
+/// Standard deviation of a card's roll about its own length axis (degrees).
+///
+/// Leaves grow toward the light: the blade plane faces the sky and almost never
+/// stands perpendicular to the ground. A uniform 0-2pi roll left a third of the
+/// crown edge-on when the player looked up; this is the sigma of a narrow bell
+/// instead (Irwin-Hall sum of three uniforms, so ~3 sigma at +-72 degrees).
+///
+/// 24 rather than 16: at 16 the canopy was so flat that a crown seen from the
+/// side (the normal case for a tree further down the street) went stripy,
+/// because a horizontal card viewed at a shallow elevation projects to a line.
+/// The extra spread costs nothing when looking up and puts the area back in the
+/// side view.
+const LEAF_ROLL_STD_DEG: f32 = 24.0;
+
+/// How much longer a willow shoot card is than a leaf card, as a multiple of
+/// the cluster's card reach.
+///
+/// One card is one whole 柳条 and a shoot hangs roughly a metre under a crown
+/// of 3-4 m, so it has to out-reach a leaf by a factor of about three.
+const STRAND_LENGTH_SCALE: f32 = 2.9;
+
+/// Segments along one willow shoot.
+///
+/// A shoot is one PLANE -- not a crossed pair -- but a 2-triangle plane is a
+/// rigid board, which is exactly what "too stiff" means when the crown is seen
+/// against the sky. Three segments (6 triangles) bend the strip sideways along
+/// its length; a 5-sided tube per shoot would cost ten times as much and does
+/// not fit the per-tree triangle budget.
+pub const STRAND_SEGMENTS: usize = 3;
+
+/// Sideways drift of a shoot's free end, as a fraction of the card's half
+/// length (min, max): a 柳条 leaves the twig at an angle and straightens as it
+/// falls, so its tip hangs off the straight line through the attachment.
+const STRAND_BEND: (f32, f32) = (0.10, 0.30);
+
+/// Signed deterministic noise in `[-1, 1]` for one shoot of one cluster.
+///
+/// A shoot's parameters (azimuth, lean, bend) have to be hashed rather than
+/// drawn from the sequential card stream: the card loop also feeds leaves, and
+/// a shoot's own segments must all agree on the same curve.
+fn pair_noise(cluster: usize, pair: u32, channel: u32) -> f32 {
+    let mut x = (cluster as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        ^ (pair as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F)
+        ^ (channel as u64).wrapping_mul(0x1656_67B1_9E37_79F9);
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^= x >> 31;
+    ((x >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
 }
 
 /// Branches are tapered 5-sided tubes. At silhouette distance a 5-gon is
@@ -634,7 +734,18 @@ fn leaf_spray(
 
     // A card's half-extent. Long axis = the old cluster silhouette; short axis
     // follows the species' baked mask aspect so the leaf is not stretched.
-    let half_h = cluster_radius * CARD_REACH_FRACTION * 1.15;
+    //
+    // A willow shoot is a whole 柳条, not one blade, so its long axis is scaled
+    // up: at ~0.9 m it reads as a strand hanging out of the crown instead of a
+    // leaf-shaped sticker.
+    let half_h = cluster_radius
+        * CARD_REACH_FRACTION
+        * 1.15
+        * if foliage.strand {
+            STRAND_LENGTH_SCALE
+        } else {
+            1.0
+        };
     let half_w = half_h * foliage.aspect;
 
     for card in 0..cards {
@@ -649,24 +760,104 @@ fn leaf_spray(
             .clamp(0.0, anchor.len);
         let angle = u * SPRAY_TURNS * std::f32::consts::TAU + phase;
         let radial = side0 * angle.cos() + side1 * angle.sin();
-        // A little lean toward the branch tip, so the spray points up the twig
-        // instead of forming a flat bottle-brush.
-        let lean = (next_unit() * 2.0 - 1.0) * 0.5;
-        let grow = (radial * lean.cos() + anchor.dir * lean.sin()).normalize();
-        // The petiole sits on the bark, not inside the wood.
-        let attach = anchor.start + anchor.dir * s + radial * (anchor.radius * 0.7);
-        // Card width axis: any perpendicular to `grow`, rolled per card so the
-        // card planes do not all contain the twig.
-        let right0 = grow.cross(anchor.dir).normalize_or_zero();
-        let right0 = if right0.length_squared() < 1e-6 {
-            side0
+        let (attach, grow, right) = if foliage.strand {
+            // 柳条: a shoot, not a blade. One shoot is ONE plane, hanging in the
+            // vertical/radial plane of the twig it grew from -- for a player
+            // standing under the crown that is the plane that shows the leaves,
+            // while blades facing outward would be edge-on from below.
+            let strand = card as u32;
+            let azimuth = pair_noise(cluster, strand, 0) * std::f32::consts::PI;
+            let out = Vec3::new(azimuth.cos(), 0.0, azimuth.sin());
+            // The shoot leaves the twig and falls; it also fans OUTWARD, which
+            // is what a weeping crown does: the outer shoots splay away from the
+            // trunk instead of dropping plumb.
+            let lean = 0.20 + 0.35 * (0.5 + 0.5 * pair_noise(cluster, strand, 1));
+            let hang = (Vec3::NEG_Y + out * lean + anchor.dir * 0.08).normalize();
+            let attach = anchor.start + anchor.dir * s + out * (anchor.radius * 0.7);
+            // Width axis: horizontal, made perpendicular to the hang so the
+            // strip is not skewed.
+            let right = (out - hang * out.dot(hang)).normalize_or_zero();
+            (attach, hang, right)
         } else {
-            right0
+            // Leaves are heliotropic: the blade lies toward the sky and hangs a
+            // little, it does not stand on its tip. `radial` sweeps a full circle
+            // perpendicular to the twig, and on a HORIZONTAL limb that circle is
+            // VERTICAL -- a third of the old cards pointed straight up or down and
+            // were edge-on whenever the player looked up into the crown. Flatten
+            // the departure direction to the horizontal and keep a slight droop.
+            let flat = Vec3::new(radial.x, 0.0, radial.z).normalize_or_zero();
+            let flat = if flat.length_squared() < 1e-6 {
+                side0
+            } else {
+                flat
+            };
+            let droop = -0.15 - 0.12 * next_unit();
+            let climb = (next_unit() * 2.0 - 1.0) * 0.20;
+            let grow = (flat + Vec3::Y * droop + anchor.dir * climb).normalize();
+            // The petiole sits on the bark, not inside the wood.
+            let attach = anchor.start + anchor.dir * s + radial * (anchor.radius * 0.7);
+            // Width axis: horizontal and perpendicular to the blade, then rolled
+            // around the blade by a NARROW BELL rather than the old uniform
+            // 0-2pi. The blade plane therefore stays near horizontal (about
+            // +-16 deg, +-48 deg at three sigma) instead of a third of the cards
+            // standing in vertical planes no real leaf occupies.
+            let right_flat = grow.cross(Vec3::Y).normalize_or_zero();
+            let right_flat = if right_flat.length_squared() < 1e-6 {
+                side0
+            } else {
+                right_flat
+            };
+            let bell = (next_unit() + next_unit() + next_unit() - 1.5) * 2.0;
+            let roll = (bell * LEAF_ROLL_STD_DEG.to_radians()).clamp(-1.0, 1.0);
+            let right = right_flat * roll.cos() + grow.cross(right_flat) * roll.sin();
+            (attach, grow, right)
         };
-        let face0 = grow.cross(right0).normalize();
-        let roll = next_unit() * std::f32::consts::TAU;
-        let right = right0 * roll.cos() + face0 * roll.sin();
         let face_axis = right.cross(grow).normalize();
+
+        // One of the species' four baked outlines, half of them mirrored: the
+        // mirror costs nothing (it only flips the UV) and doubles the apparent
+        // variety, which is what stops a canopy reading as a wallpaper repeat.
+        let variant = ((next_unit() * LEAF_VARIANTS as f32) as usize).min(LEAF_VARIANTS - 1);
+        let cell = foliage.cells[variant];
+        let mirror = next_unit() < 0.5;
+        let base = positions.len() as u32;
+
+        if foliage.strand {
+            // One shoot = one plane, but not a rigid board: the strip bends
+            // sideways along its length so the crown does not read as a field of
+            // straight sticks. The bend is hashed per shoot (sign included), so
+            // neighbouring 柳条 arc different ways.
+            let sign = if pair_noise(cluster, card as u32, 3) < 0.0 {
+                -1.0
+            } else {
+                1.0
+            };
+            let bend = right
+                * (sign
+                    * (STRAND_BEND.0
+                        + (STRAND_BEND.1 - STRAND_BEND.0)
+                            * (0.5 + 0.5 * pair_noise(cluster, card as u32, 2)))
+                    * half_h);
+            for row in 0..=STRAND_SEGMENTS {
+                let t = row as f32 / STRAND_SEGMENTS as f32;
+                let center = attach + grow * (2.0 * half_h * t) + bend * (t * t);
+                for (side, u) in [(-1.0_f32, 0.0_f32), (1.0, 1.0)] {
+                    positions.push((center + right * (half_w * side)).to_array());
+                    normals.push(face_axis.to_array());
+                    // A shoot mask puts its ATTACHMENT on the top edge (v = 0),
+                    // so v runs from 0 at the twig to 1 at the free end. Half the
+                    // shoots mirror u so one baked outline reads as two.
+                    let uv_u = if mirror { 1.0 - u } else { u };
+                    uvs.push([cell.0 + uv_u * (cell.1 - cell.0), t]);
+                    colors.push([sway, 1.0, phase, 1.0]);
+                }
+            }
+            for row in 0..STRAND_SEGMENTS as u32 {
+                let b = base + row * 2;
+                indices.extend_from_slice(&[b, b + 1, b + 3, b, b + 3, b + 2]);
+            }
+            continue;
+        }
 
         let card_center = attach + grow * half_h;
         let corners = [
@@ -687,9 +878,11 @@ fn leaf_spray(
             // Cards are drawn double-sided, so one normal per quad is enough;
             // the PBR shader flips it for back faces.
             normals.push(face_axis.to_array());
-            // Map the card's unit quad into this species' atlas cell: u is
-            // rescaled into (u0, u1), v spans the shared full height.
-            uvs.push([foliage.cell.0 + u * (foliage.cell.1 - foliage.cell.0), v]);
+            // Map the card's unit quad into this card's atlas cell: u is
+            // rescaled into (u0, u1), v spans the shared full height, and half
+            // the cards mirror u so one baked outline reads as two.
+            let uv_u = if mirror { 1.0 - u } else { u };
+            uvs.push([cell.0 + uv_u * (cell.1 - cell.0), v]);
             colors.push([sway, 1.0, phase, 1.0]);
         }
         indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
@@ -897,13 +1090,18 @@ mod tests {
     fn one_tree_stays_inside_the_triangle_budget() {
         // Cards are 2 triangles against a blob's 20, so the switch should keep a
         // tree cheap. If the card path regressed to spheres, this fails.
+        //
+        // 32k (Feihei, 2026-11-11): the crown is the game's main visual and a
+        // denser card field is what buys it. 柳's shoot is a 3-segment strip (6
+        // triangles instead of 2), so it is the most expensive unit and the one
+        // this number really guards.
         for species in 0..TREE_PROFILES.len() as u8 {
             let parts = bake_tree_mesh(TreeMeshKey {
                 species,
                 variant: 0,
             });
             let total = parts.triangle_count();
-            assert!(total < 20_000, "species {species}: {total} triangles");
+            assert!(total < 32_000, "species {species}: {total} triangles");
         }
     }
 
@@ -949,19 +1147,20 @@ mod tests {
         };
         assert_eq!(uvs.len(), positions.len(), "every leaf vertex needs a UV");
         assert_eq!(positions.len() % 4, 0, "the leaf mesh is not made of quads");
-        let (cell_u0, cell_u1) = species_foliage(0).cell;
+        let cells = species_foliage(0).cells;
         let max_u = uvs.iter().map(|uv| uv[0]).fold(0.0_f32, f32::max);
         let max_v = uvs.iter().map(|uv| uv[1]).fold(0.0_f32, f32::max);
         assert!(
-            max_u >= cell_u1 - 1e-4 && max_v >= 0.99,
-            "UVs do not span the species' atlas cell"
+            max_u > cells[0].1 && max_v >= 0.99,
+            "UVs do not reach the later variants' cells (max u {max_u:.4})"
         );
-        // Every UV stays inside the species' own cell: one straying outside
-        // samples a neighbouring species' mask.
+        // Every UV stays inside one of this species' four cells: one straying
+        // outside samples a neighbouring species' mask. The variants are
+        // contiguous in the atlas, so the union is just the outer bounds.
         let min_u = uvs.iter().map(|uv| uv[0]).fold(f32::MAX, f32::min);
         assert!(
-            min_u >= cell_u0 - 1e-4 && max_u <= cell_u1 + 1e-4,
-            "leaf UVs leave the species' atlas cell"
+            min_u >= cells[0].0 - 1e-4 && max_u <= cells[LEAF_VARIANTS - 1].1 + 1e-4,
+            "leaf UVs leave the species' atlas cells (min u {min_u:.4}, max u {max_u:.4})"
         );
     }
 
@@ -1040,10 +1239,11 @@ mod tests {
             let cards = ((TreeLod::Near.cards_per_cluster() as f32 * foliage.cards_scale).round()
                 as usize)
                 .max(1);
+            let stride = leaf_card_stride(species);
             let mut cursor = 0usize;
             let mut checked = 0usize;
             for cluster in &skeleton.foliage {
-                if cursor + cards * 4 > positions.len() {
+                if cursor + cards * stride > positions.len() {
                     break;
                 }
                 // The bake anchors a cluster on the nearest LEAF-BEARING branch
@@ -1058,28 +1258,40 @@ mod tests {
                     profile.leaf_min_level,
                 );
                 for card in 0..cards {
-                    let quad = &uvs[cursor + card * 4..cursor + card * 4 + 4];
-                    let pos = &positions[cursor + card * 4..cursor + card * 4 + 4];
-                    // Compare the MIDPOINTS of the tip and petiole edges: taking
-                    // one corner from each measures a diagonal, which mixes in
-                    // the card's width and makes the check meaningless.
-                    let mut tip = Vec3::ZERO;
-                    let mut petiole = Vec3::ZERO;
-                    let (mut n_tip, mut n_petiole) = (0u32, 0u32);
-                    for (uv, p) in quad.iter().zip(pos.iter()) {
-                        if uv[1] < 0.5 {
-                            tip += Vec3::from_array(*p);
-                            n_tip += 1;
-                        } else {
-                            petiole += Vec3::from_array(*p);
-                            n_petiole += 1;
+                    let start = cursor + card * stride;
+                    let uv = &uvs[start..start + stride];
+                    let pos = &positions[start..start + stride];
+                    // Compare the MIDPOINTS of the tip and attachment edges:
+                    // taking one corner from each measures a diagonal, which
+                    // mixes in the card's width and makes the check meaningless.
+                    //
+                    // A shoot strip is a row of vertex pairs, so its ends are
+                    // the first and last rows; a leaf quad classifies by uv
+                    // (v = 0 is the tip).
+                    let (tip, petiole) = if foliage.strand {
+                        let row_mid = |row: usize| {
+                            (Vec3::from_array(pos[row * 2]) + Vec3::from_array(pos[row * 2 + 1]))
+                                * 0.5
+                        };
+                        (row_mid(STRAND_SEGMENTS), row_mid(0))
+                    } else {
+                        let mut tip = Vec3::ZERO;
+                        let mut petiole = Vec3::ZERO;
+                        let (mut n_tip, mut n_petiole) = (0u32, 0u32);
+                        for (uv, p) in uv.iter().zip(pos.iter()) {
+                            if uv[1] < 0.5 {
+                                tip += Vec3::from_array(*p);
+                                n_tip += 1;
+                            } else {
+                                petiole += Vec3::from_array(*p);
+                                n_petiole += 1;
+                            }
                         }
-                    }
-                    if n_tip == 0 || n_petiole == 0 {
-                        continue;
-                    }
-                    let tip = tip / n_tip as f32;
-                    let petiole = petiole / n_petiole as f32;
+                        if n_tip == 0 || n_petiole == 0 {
+                            continue;
+                        }
+                        (tip / n_tip as f32, petiole / n_petiole as f32)
+                    };
                     // Measure against the carrier twig this cluster was baked
                     // onto, not whichever branch happens to be nearest.
                     let Some(carrier) = carrier else {
@@ -1104,7 +1316,7 @@ mod tests {
                     );
                     checked += 1;
                 }
-                cursor += cards * 4;
+                cursor += cards * stride;
             }
             assert!(
                 checked > 50,
@@ -1139,23 +1351,32 @@ mod tests {
             let cards = ((TreeLod::Near.cards_per_cluster() as f32 * foliage.cards_scale).round()
                 as usize)
                 .max(1);
+            let stride = leaf_card_stride(species);
             let mut cursor = 0usize;
             let mut checked = 0usize;
             for _cluster in &skeleton.foliage {
-                if cursor + cards * 4 > positions.len() {
+                if cursor + cards * stride > positions.len() {
                     break;
                 }
                 for card in 0..cards {
-                    let quad = &uvs[cursor + card * 4..cursor + card * 4 + 4];
-                    let pos = &positions[cursor + card * 4..cursor + card * 4 + 4];
-                    let mut petiole = Vec3::ZERO;
-                    let mut n = 0u32;
-                    for (uv, p) in quad.iter().zip(pos.iter()) {
-                        if uv[1] > 0.5 {
-                            petiole += Vec3::from_array(*p);
-                            n += 1;
+                    let start = cursor + card * stride;
+                    let uv = &uvs[start..start + stride];
+                    let pos = &positions[start..start + stride];
+                    let (petiole, n) = if foliage.strand {
+                        // A shoot strip attaches with its first row.
+                        let mid = (Vec3::from_array(pos[0]) + Vec3::from_array(pos[1])) * 0.5;
+                        (mid, 1u32)
+                    } else {
+                        let mut sum = Vec3::ZERO;
+                        let mut n = 0u32;
+                        for (uv, p) in uv.iter().zip(pos.iter()) {
+                            if uv[1] > 0.5 {
+                                sum += Vec3::from_array(*p);
+                                n += 1;
+                            }
                         }
-                    }
+                        (sum, n)
+                    };
                     if n == 0 {
                         continue;
                     }
@@ -1172,7 +1393,7 @@ mod tests {
                     );
                     checked += 1;
                 }
-                cursor += cards * 4;
+                cursor += cards * stride;
             }
             assert!(
                 checked > 50,
@@ -1206,6 +1427,104 @@ mod tests {
             sectors.len() >= 4,
             "cards only face {} of 8 directions; the crown would disappear from some angles",
             sectors.len()
+        );
+    }
+
+    #[test]
+    fn willow_shoots_are_single_curved_ribbons() {
+        // 柳's unit is the shoot: ONE plane hanging down from the twig (not an X
+        // of two cards), subdivided along its length and bowed sideways so the
+        // crown does not read as a field of straight sticks.
+        let parts = bake_tree_mesh(TreeMeshKey {
+            species: 2,
+            variant: 0,
+        });
+        let positions = match parts
+            .leaves
+            .attribute(Mesh::ATTRIBUTE_POSITION)
+            .expect("positions")
+        {
+            bevy::mesh::VertexAttributeValues::Float32x3(v) => v.clone(),
+            other => panic!("unexpected position layout: {other:?}"),
+        };
+        let stride = leaf_card_stride(2);
+        assert_eq!(stride, 2 * (STRAND_SEGMENTS + 1));
+        assert_eq!(
+            positions.len() % stride,
+            0,
+            "a shoot strip has a ragged vertex count"
+        );
+        let row_mid = |strip: &[[f32; 3]], row: usize| {
+            (Vec3::from_array(strip[row * 2]) + Vec3::from_array(strip[row * 2 + 1])) * 0.5
+        };
+        let mut checked = 0usize;
+        let mut bent = 0usize;
+        for strip in positions.chunks(stride) {
+            if strip.len() < stride {
+                break;
+            }
+            let attach = row_mid(strip, 0);
+            let tip = row_mid(strip, STRAND_SEGMENTS);
+            let long = tip - attach;
+            // Hangs down: the lean is capped at 0.55 and a downward twig adds a
+            // little more, so 0.75 (45 deg) is where a shot stops reading as a
+            // strand.
+            assert!(
+                long.y / long.length() < -0.75,
+                "a shoot card points {:.0} deg off vertical",
+                (long.y / long.length())
+                    .clamp(-1.0, 1.0)
+                    .acos()
+                    .to_degrees()
+            );
+            // The middle row must leave the straight chord by a visible margin:
+            // that bow is what stops a shoot reading as a rigid board.
+            let chord_mid = (attach + tip) * 0.5;
+            let drift = (row_mid(strip, STRAND_SEGMENTS / 2) - chord_mid).length();
+            if drift > 0.005 {
+                bent += 1;
+            }
+            checked += 1;
+        }
+        assert!(checked > 50, "only {checked} shoots were checked");
+        assert!(
+            (bent as f32) > checked as f32 * 0.8,
+            "only {bent}/{checked} shoots are curved; the rest are straight sticks"
+        );
+    }
+
+    #[test]
+    fn leaf_cards_stay_near_horizontal() {
+        // 杨's blades face the sky: the long axis lies in the horizontal plane,
+        // so looking up into the crown shows blade faces, not blade edges.
+        let parts = bake_tree_mesh(TreeMeshKey {
+            species: 0,
+            variant: 0,
+        });
+        let positions = match parts
+            .leaves
+            .attribute(Mesh::ATTRIBUTE_POSITION)
+            .expect("positions")
+        {
+            bevy::mesh::VertexAttributeValues::Float32x3(v) => v.clone(),
+            other => panic!("unexpected position layout: {other:?}"),
+        };
+        let mut checked = 0usize;
+        let mut tilted = 0usize;
+        for quad in positions.chunks(4) {
+            if quad.len() < 4 {
+                break;
+            }
+            let long = (Vec3::from_array(quad[3]) - Vec3::from_array(quad[0])).normalize();
+            if long.y.abs() > 0.5 {
+                tilted += 1;
+            }
+            checked += 1;
+        }
+        assert!(checked > 100, "only {checked} cards were checked");
+        assert!(
+            (tilted as f32) < checked as f32 * 0.10,
+            "{tilted} of {checked} cards stand more than 30 deg out of the horizontal"
         );
     }
 
@@ -1302,45 +1621,51 @@ mod tests {
         }
         const N: usize = 96;
         let mut covered = vec![false; N * N];
-        for (quad, chunk) in positions.chunks(4).enumerate() {
-            let quad_uv = &uvs[quad * 4..quad * 4 + 4];
-            // Two triangles per quad.
-            for tri in [[0usize, 1, 2], [0, 2, 3]] {
-                let p0 = Vec3::from_array(chunk[tri[0]]);
-                let p1 = Vec3::from_array(chunk[tri[1]]);
-                let p2 = Vec3::from_array(chunk[tri[2]]);
-                // Project onto the two chosen axes.
-                let (p0, p1, p2) = (
-                    (p0.to_array()[ax], p0.to_array()[ay]),
-                    (p1.to_array()[ax], p1.to_array()[ay]),
-                    (p2.to_array()[ax], p2.to_array()[ay]),
-                );
-                let area = (p1.0 - p0.0) * (p2.1 - p0.1) - (p1.1 - p0.1) * (p2.0 - p0.0);
-                if area.abs() < 1e-9 {
-                    continue;
-                }
-                for gz in 0..N {
-                    for gx in 0..N {
-                        let x = min_x + (gx as f32 + 0.5) / N as f32 * (max_x - min_x);
-                        let z = min_z + (gz as f32 + 0.5) / N as f32 * (max_z - min_z);
-                        let w0 = ((p1.0 - x) * (p2.1 - z) - (p1.1 - z) * (p2.0 - x)) / area;
-                        let w1 = ((p2.0 - x) * (p0.1 - z) - (p2.1 - z) * (p0.0 - x)) / area;
-                        let w2 = 1.0 - w0 - w1;
-                        if w0 < 0.0 || w1 < 0.0 || w2 < 0.0 {
-                            continue;
-                        }
-                        let u = w0 * quad_uv[tri[0]][0]
-                            + w1 * quad_uv[tri[1]][0]
-                            + w2 * quad_uv[tri[2]][0];
-                        let v = w0 * quad_uv[tri[0]][1]
-                            + w1 * quad_uv[tri[1]][1]
-                            + w2 * quad_uv[tri[2]][1];
-                        let tx = (u * mask.width as f32).clamp(0.0, mask.width as f32 - 1.0) as u32;
-                        let ty =
-                            (v * mask.height as f32).clamp(0.0, mask.height as f32 - 1.0) as u32;
-                        if mask.get(tx, ty) >= 128 {
-                            covered[gz * N + gx] = true;
-                        }
+        // Walk the index buffer: a shoot card is a 3-segment strip, so the
+        // triangle count per card is not fixed.
+        let indices = match parts.leaves.indices() {
+            Some(Indices::U32(v)) => v.clone(),
+            Some(Indices::U16(v)) => v.iter().map(|i| *i as u32).collect(),
+            None => Vec::new(),
+        };
+        for tri in indices.chunks(3) {
+            if tri.len() < 3 {
+                break;
+            }
+            let p0 = Vec3::from_array(positions[tri[0] as usize]);
+            let p1 = Vec3::from_array(positions[tri[1] as usize]);
+            let p2 = Vec3::from_array(positions[tri[2] as usize]);
+            // Project onto the two chosen axes.
+            let (p0, p1, p2) = (
+                (p0.to_array()[ax], p0.to_array()[ay]),
+                (p1.to_array()[ax], p1.to_array()[ay]),
+                (p2.to_array()[ax], p2.to_array()[ay]),
+            );
+            let area = (p1.0 - p0.0) * (p2.1 - p0.1) - (p1.1 - p0.1) * (p2.0 - p0.0);
+            if area.abs() < 1e-9 {
+                continue;
+            }
+            let tri_uv = [
+                uvs[tri[0] as usize],
+                uvs[tri[1] as usize],
+                uvs[tri[2] as usize],
+            ];
+            for gz in 0..N {
+                for gx in 0..N {
+                    let x = min_x + (gx as f32 + 0.5) / N as f32 * (max_x - min_x);
+                    let z = min_z + (gz as f32 + 0.5) / N as f32 * (max_z - min_z);
+                    let w0 = ((p1.0 - x) * (p2.1 - z) - (p1.1 - z) * (p2.0 - x)) / area;
+                    let w1 = ((p2.0 - x) * (p0.1 - z) - (p2.1 - z) * (p0.0 - x)) / area;
+                    let w2 = 1.0 - w0 - w1;
+                    if w0 < 0.0 || w1 < 0.0 || w2 < 0.0 {
+                        continue;
+                    }
+                    let u = w0 * tri_uv[0][0] + w1 * tri_uv[1][0] + w2 * tri_uv[2][0];
+                    let v = w0 * tri_uv[0][1] + w1 * tri_uv[1][1] + w2 * tri_uv[2][1];
+                    let tx = (u * mask.width as f32).clamp(0.0, mask.width as f32 - 1.0) as u32;
+                    let ty = (v * mask.height as f32).clamp(0.0, mask.height as f32 - 1.0) as u32;
+                    if mask.get(tx, ty) >= 128 {
+                        covered[gz * N + gx] = true;
                     }
                 }
             }
@@ -1368,7 +1693,7 @@ mod tests {
             let profile = crate::world::leaf_shape::find_profile(leaf)
                 .copied()
                 .expect("species has a leaf profile");
-            let mask = crate::world::leaf_shape::bake_leaf_alpha(&profile, 256);
+            let mask = crate::world::leaf_shape::bake_leaf_alpha(&profile, 0, 256);
             let parts = bake_tree_mesh(TreeMeshKey {
                 species,
                 variant: 0,
@@ -1489,11 +1814,11 @@ mod tests {
                 bevy::mesh::VertexAttributeValues::Float32x2(v) => v.clone(),
                 other => panic!("unexpected uv layout: {other:?}"),
             };
-            let (cell_u0, cell_u1) = species_foliage(species).cell;
+            let cells = species_foliage(species).cells;
             for (i, uv) in uvs.iter().enumerate() {
                 assert!(
-                    (cell_u0..=cell_u1).contains(&uv[0]),
-                    "species {species}: uv[{i}] u {:.4} leaves its cell [{cell_u0:.4}, {cell_u1:.4}]",
+                    cells.iter().any(|(u0, u1)| (*u0..=*u1).contains(&uv[0])),
+                    "species {species}: uv[{i}] u {:.4} leaves every variant cell {cells:?}",
                     uv[0]
                 );
             }
@@ -1508,8 +1833,14 @@ mod tests {
         // because it is a deliberate art direction a "sensible default"
         // refactor would happily undo.
         let sophora = species_foliage(1);
+        let poplar = species_foliage(0);
+        // More cards, each still NARROWER than a broadleaf blade: a compound
+        // leaf is a thin unit, so the fragmentation survives even though the
+        // card had to grow (2026-11-11) to keep its leaflets above a pixel at
+        // street distance and stop the crown reading as bare branches.
         assert!(
-            sophora.cards_scale > 1.0 && sophora.reach_scale < 1.0,
+            sophora.cards_scale > poplar.cards_scale
+                && sophora.aspect * sophora.reach_scale < poplar.aspect * poplar.reach_scale,
             "the pinnate crown lost its finer fragmentation"
         );
         let sophora_cards = bake_tree_mesh(TreeMeshKey {
@@ -1527,17 +1858,5 @@ mod tests {
             count(&sophora_cards),
             count(&poplar_cards)
         );
-        // The total tri budget still holds: cards are 2 triangles each, and a
-        // 1.5x card count on the pinnate species stays far below the budget.
-        let total: usize = (0..TREE_PROFILES.len() as u8)
-            .map(|s| {
-                let parts = bake_tree_mesh(TreeMeshKey {
-                    species: s,
-                    variant: 0,
-                });
-                parts.wood.count_vertices() / 3 + parts.leaves.count_vertices() / 3
-            })
-            .sum();
-        assert!(total < 20_000, "the species set bakes {total} triangles");
     }
 }

@@ -18,7 +18,8 @@
 //! the same approach `tree_gallery` uses, extended with an alpha channel.
 
 use no_one_looks_up::world::leaf_shape::{
-    ALPHA_CUTOFF, AlphaMask, bake_leaf_alpha, build_mip_chain, default_mip_radius, leaf_profiles,
+    ALPHA_CUTOFF, AlphaMask, LEAF_VARIANTS, bake_leaf_alpha, build_mip_chain, default_mip_radius,
+    leaf_profiles,
 };
 
 /// Vertical resolution of each per-species mask.
@@ -39,67 +40,73 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(out_dir)?;
 
     let mut baked: Vec<(
+        usize,
         &'static no_one_looks_up::world::leaf_shape::LeafProfile,
         AlphaMask,
     )> = Vec::new();
     let mut chains: Vec<Vec<AlphaMask>> = Vec::new();
 
-    for profile in leaf_profiles() {
-        // Level 0 stays the exact shape; per-level dilation only kicks in down
-        // the mip chain (see `build_mip_chain`).
-        let raw = bake_leaf_alpha(profile, MASK_HEIGHT);
-        let chain = build_mip_chain(&raw, CHAIN_LEVELS, default_mip_radius);
+    for (species_index, profile) in leaf_profiles().iter().enumerate() {
+        for variant in 0..LEAF_VARIANTS {
+            // Level 0 stays the exact shape; per-level dilation only kicks in
+            // down the mip chain (see `build_mip_chain`).
+            let raw = bake_leaf_alpha(profile, variant, MASK_HEIGHT);
+            let chain = build_mip_chain(&raw, CHAIN_LEVELS, default_mip_radius);
 
-        println!(
-            "{:<10} {:>4}x{:<4} opaque {:>5.1}%  visible {:>5.2}%",
-            profile.species,
-            raw.width,
-            raw.height,
-            raw.opaque_fraction() * 100.0,
-            raw.visible_fraction() * 100.0,
-        );
-        for (level, m) in chain.iter().enumerate().skip(1) {
             println!(
-                "  mip{level}: {:>3}x{:<3} visible {:>6.3}%  (undilated {:>6.3}%)",
-                m.width,
-                m.height,
-                m.visible_fraction() * 100.0,
-                visible_after(&raw, level as u32) * 100.0,
+                "{:<10} v{variant} {:>4}x{:<4} opaque {:>5.1}%  visible {:>5.2}%",
+                profile.species,
+                raw.width,
+                raw.height,
+                raw.opaque_fraction() * 100.0,
+                raw.visible_fraction() * 100.0,
             );
+            if variant == 0 {
+                for (level, m) in chain.iter().enumerate().skip(1) {
+                    println!(
+                        "  mip{level}: {:>3}x{:<3} visible {:>6.3}%  (undilated {:>6.3}%)",
+                        m.width,
+                        m.height,
+                        m.visible_fraction() * 100.0,
+                        visible_after(&raw, level as u32) * 100.0,
+                    );
+                }
+            }
+
+            // Per-variant file: the level the player actually sees.
+            let single = render_mask(&raw, BG, LEAF_RGB);
+            write_png_rgba(
+                &out_dir.join(format!("leaf_{}_v{variant}.png", profile.species)),
+                raw.width,
+                raw.height,
+                &single,
+            )?;
+
+            baked.push((species_index, profile, raw));
+            chains.push(chain);
         }
-
-        // Per-species file: the level the player actually sees.
-        let single = render_mask(&raw, BG, LEAF_RGB);
-        write_png_rgba(
-            &out_dir.join(format!("leaf_{}.png", profile.species)),
-            raw.width,
-            raw.height,
-            &single,
-        )?;
-
-        baked.push((profile, raw));
-        chains.push(chain);
     }
 
     // Equal-height contact sheet so shapes are directly comparable.
     let total_h = MASK_HEIGHT + CAPTION_H + MARGIN * 2;
     let total_w = MARGIN * 2
-        + baked.iter().map(|(_, m)| m.width).sum::<u32>()
+        + baked.iter().map(|(_, _, m)| m.width).sum::<u32>()
         + GAP * (baked.len().saturating_sub(1) as u32);
     let mut sheet = vec![0u8; (total_w * total_h * 4) as usize];
     fill(&mut sheet, total_w, total_h, BG);
 
     let mut x = MARGIN;
-    for (index, (_, mask)) in baked.iter().enumerate() {
+    for (species_index, _, mask) in baked.iter() {
         // Centre each mask in a MASK_HEIGHT-tall slot.
         let y = MARGIN + CAPTION_H + (MASK_HEIGHT - mask.height) / 2;
         blit(&mut sheet, total_w, total_h, mask, x, y, BG, LEAF_RGB);
 
-        // Species key: N filled bars above the leaf, N = table index + 1. A
-        // pixel font is not worth writing for three labels; the names go to
-        // stdout in the same order.
+        // Species key: N filled bars above the leaf, N = table index + 1, so all
+        // four variants of one species share their bars. A pixel font is not
+        // worth writing for three labels; the names go to stdout in the same
+        // order.
         let bar = 7;
-        for i in 0..=index {
+        for i in 0..=*species_index {
             let bx = x + (i as u32) * (bar + 3);
             if bx + bar < total_w {
                 for yy in MARGIN + 6..MARGIN + CAPTION_H - 6 {
@@ -124,7 +131,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut x = MARGIN;
     for (index, chain) in chains.iter().enumerate() {
-        let base_w = baked[index].1.width;
+        let base_w = baked[index].2.width;
         for (row, level) in mip_levels.iter().enumerate() {
             let m = &chain[*level];
             let scale = 1u32 << *level as u32;
@@ -164,10 +171,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "\nwrote {}/leaf_sheet.png and leaf_sheet_mips.png",
         out_dir.display()
     );
-    println!("species order (left to right):");
-    for (i, (profile, _)) in baked.iter().enumerate() {
+    println!("columns (left to right): four variants per species, in table order");
+    for (i, (_, profile, _)) in baked.iter().enumerate() {
         println!(
-            "  {} bar(s) -> {} ({})",
+            "  column {} -> {} ({})",
             i + 1,
             profile.label,
             profile.species
