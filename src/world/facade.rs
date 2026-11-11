@@ -670,11 +670,27 @@ pub fn texture_image(rgba: &[u8], size: u32, srgb: bool) -> Image {
     image
 }
 
+/// Repeat addressing, trilinear mips, 8x anisotropy.
+///
+/// The filters are not the defaults: `ImageSamplerDescriptor::default()` is
+/// **nearest** for mag, min and mipmap, with `anisotropy_clamp: 1`. The mip
+/// chain in [`upload_layer`] was added precisely because a high-frequency
+/// facade shimmers on a grazing wall, and then sampled with a nearest mip --
+/// which snaps between levels instead of blending them, and minifies without
+/// filtering. Every window frame and every wall/plinth border crawled while the
+/// camera walked. Linear + anisotropy keeps the wall calm at a distance and is
+/// softer only where the texels are already magnified ~3x at arm's length
+/// (1024 px across a ~10 m tile is 76 px/m; a 1080p frame at 2 m shows 240
+/// px/m).
 fn repeat_sampler() -> bevy::image::ImageSamplerDescriptor {
     bevy::image::ImageSamplerDescriptor {
         address_mode_u: bevy::image::ImageAddressMode::Repeat,
         address_mode_v: bevy::image::ImageAddressMode::Repeat,
         address_mode_w: bevy::image::ImageAddressMode::Repeat,
+        mag_filter: bevy::image::ImageFilterMode::Linear,
+        min_filter: bevy::image::ImageFilterMode::Linear,
+        mipmap_filter: bevy::image::ImageFilterMode::Linear,
+        anisotropy_clamp: 8,
         ..Default::default()
     }
 }
