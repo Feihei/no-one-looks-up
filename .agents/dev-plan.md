@@ -578,6 +578,7 @@ R3.11 建筑立面        [██████░░░░] 11.1-11.3 完成（�
 R3.12 观感修复补充    [██████████] 完成（叶卡贴枝/屋顶漏缝/屋顶重复/远山/横担/LOD dither，2026-11-05，待实机验收）
 R3.13 跨街上部元素    [██████████] 实现完成（跨街电线/悬挑灯臂/防护棚，2026-11-09，待实机验收）
 R3.14 灯头绘制距离    [██████████] 实现完成（灯头 60 m 外不绘制，2026-11-09，待实机验收）
+R3.15 环路外景物带    [██████████] 实现完成（带内建筑行+角树丛/檐底封闭/长灯臂两段/棚架宽度随机，2026-11-11，待实机验收）
 R5.1-5 天空调参+云    [████████░░] 面板/云种/sky_gain/dome 完成；云边缘块状属已知边界（2026-10-27 收尾）
 R6: 自研体积云        [█░░░░░░░░░] 6.0 管线骨架完成（2026-11-11；crate CloudPlugin 已停用）
 ```
@@ -662,6 +663,23 @@ R6: 自研体积云        [█░░░░░░░░░] 6.0 管线骨架完�
 - [x] **验证**：`cargo fmt --check`、`clippy --all-targets -D warnings`、`cargo test`（227 lib + 4 集成）全绿；限时 40 s 实跑，世界生成 / placement assets / autosave 正常，零 panic
 - **待实机确认**：60 m 的截止距离是否合适。调大会带回 50–60 m 段的闪烁；调小街道远端的暖点会明显减少。若以后想"既远又稳"，正确解法是 fixed-angular-size 的 billboard，不是把薄片放大
 - **已知限制**：全量测试里 `plugins::save::tests::autosave_writes_only_after_the_interval` 偶发失败（依赖真实帧间隔），单跑必过，与本改动无关
+
+### R3.15 环路外侧景物带 + 屋顶封闭 + 灯臂形状 + 棚架宽度（2026-11-11）
+
+**背景**：Feihei 实机列出的四项观察，两项是"缺了一块"（景物带、檐底），两项是"形状不对"（长灯臂折点、棚架宽度恒定）。前两项要新增几何，后两项只改已烘焙的零件。
+
+- [x] **最外圈环路外侧空无一物**（新 `world/band.rs`）：根因是外圈 cell 标成景物带（`SCENERY_BAND_CELL`）后**不分配 Block**，而 `plan_chunk` 只对 `edge.left_block/right_block` 有值的边放东西——带内天生无物，往外看就是空地接远山。改为新增一层**纯几何布景**（`BAND_SALT = 9000`），不复用 block 逻辑：四条边 `plan_row` 沿环路面排建筑（`SETBACK` 0.4–1.6 m、`FRONTAGE` 5–13 m、`DEPTH` 7–14 m，13% 换成 2.5–5 m 宽 9 m 深的巷道），四个角 `plan_corner_grove` 摆 3×3 抖动网格树。风格配比 `roll_style` 取 0.72 老城 / 0.88 公寓 / 其余厂房，高度上限压到公寓 21 m——"这排是从 3-5 m 外的路面看的，24 m 板楼在那个距离像悬崖而不是天际线"。建筑走 `PlacedKind::SceneryBuilding(kind)`，直接复用既有立面 / `snap_to_bay` / 屋顶烘焙，`chunks.rs` 只是把两个变体并到同一个 spawn 分支。`tree_instance` 无论有无资源都消耗三次抽样，保证有无 `tree_assets` 时行布局一致
+- [x] **景物带与碰撞环内边界不一致**（`collision.rs`）：碰撞环从 `OUTER_BAND_CELLS*CELL_SIZE`（50 m）起算，而环路外缘在其外侧 `STREET_WIDTH/2`＝4 m，所以玩家其实能往带里走 4 m 撞进建筑。统一为 `band::BAND_INNER = 50 - 4 = 46`，`collision.rs` 用同一算式
+- [x] **角落棱柱缺口**（`collision.rs`）：`scenery_ring_prism` 裁剪出多个矩形却**只取面积最大的一个**，四个角各留 4×46 m 的开口。改为 `scenery_ring_prisms -> Vec<SolidPrism>`，每个裁剪矩形各自成柱（允许重叠）
+- [x] **坡屋顶没有底面**（`roof.rs`）：山墙棱柱与锯齿楔形都只有侧面和顶面，从下往上是背剔的内部，望天。`bake_gable` 补檐底 soffit 四边形、`bake_tooth` 补楔形底面，与墙顶共面——共面不花代价：从下看墙顶面被剔除、从上看看 soffit 被剔除，两者永不同时栅格化。新增 `roofs_are_closed_shells()`：量化 1/1024 后做有向边配对，断言每条边恰好被反向使用一次（比逐个补面更能防回归）
+- [x] **长灯臂中间"折了一下"**（`overhead.rs` / `props.rs`）：旧臂是单根斜杆从 `LONG_LAMP_MOUNT` 直接落到灯头，一路下坡到悬挑末端，看起来像折断。改为「安装底托 → 斜段（`LONG_LAMP_RISER` 1.15 m 沿路爬升 `LONG_LAMP_RISE` 0.55 m，约 26°）→ 水平直段 → 灯头外壳」，斜段用新增的 `props::push_box_rot_z`（绕局部 +Z 旋转且保持绕序）烘焙。`overhead_lowest` 跟着改成按 `LONG_LAMP_RUN_UNDER` / `LONG_LAMP_LENS_BOTTOM` 逐段推导，净空仍只有一个真源
+- [x] **棚架宽度恒定**（`overhead.rs`）：旧宽度死等于 `2*curb`。改为两侧**独立**随机外扩：`cap = (setback - POLE_STANDOFF - SCAFFOLD_POST_PAD).clamp(0.0, SCAFFOLD_WIDEN_MAX) + POLE_STANDOFF`，立柱落 `curb + offset`，两侧不对称时横梁/顶板按 `width = half_left + half_right`、`centre_across = (half_left - half_right) * 0.5` 跟着偏。`place_scaffold` 因此多收一个 `params: [BuildingParams; 2]`；`place_overhead_furniture` 里 `sides` 解构成 `[Some(left), Some(right)]` 后直接取值（不再 `map_or` 兜底，棚架本来只在两侧都有的街上建）
+- [x] **测试（净增 6，总数 243）**：`every_side_of_the_ring_gets_a_row`、`the_row_stands_in_the_sealed_band`、`the_row_leaves_the_band_empty_behind_it`、`band_objects_are_placed_once`（band）；`roofs_are_closed_shells`（roof）；`long_bracket_rises_then_runs_level`（按三角形法线分类：恰 1 个上倾斜面 + 水平段不低于 `LONG_LAMP_RUN_UNDER`）、`gantry_width_varies_with_its_street`（宽度 > `2*curb`、≤ `2*(curb+POLE_STANDOFF+SCAFFOLD_WIDEN_MAX)+0.31`，且不同宽度 >10 种）
+- [x] **实测（seed 0x48454144 全图）**：`band/old` 191 座（6–12 m）、`band/apt` 50 座（12–21 m）、`band/fac` 39 座（12 m）、`tree/band` 103 棵；`long_arm`/`long_head` 各 130、`scaf_deck` 17，与前一轮 `R3.13` 计数一致（说明新增景物层没有扰动既有流）
+- [x] **验证**：`cargo fmt --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test --lib`（243）全绿
+- **新增开发工具** `examples/view_shot.rs`：按 `X Z YAW PITCH SEED SHOT_OUT` 环境变量渲染单帧第一人称截图（`save_to_disk`）。既有 `examples/top_view.rs` 的相机在运行中被游戏系统接管，定不住视角，所以另建一个只做拍摄的
+- **验证缺口**：景物带的**观感**（黄昏色、老城占比、21 m 上限是否还压得住天际线）、檐底在 45° 仰角下的暗度、长灯臂 26° 斜段的比例、棚架最宽 1.5 m 外扩后是否有"顶板悬在没柱子的地方"的错觉——全部来自数值与截图，**待 Feihei 实机确认**。首调参数集中在 `world/band.rs` 常量区与 `world/overhead.rs` 常量区
+- **已知限制**：景物带建筑只做正立面朝向环路（背面朝外不可达，也就不补配件）；带内不生成电线杆与街道家具，"带是一个布景幕布，不是第二个城市"
 
 ## 风险与依赖
 
