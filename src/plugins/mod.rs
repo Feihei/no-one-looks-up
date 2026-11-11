@@ -5,6 +5,7 @@
 //! MenuPlugin. Each milestone fills in the corresponding plugin.
 
 pub mod cirrus;
+pub mod clouds;
 pub mod facade;
 pub mod hills;
 pub mod menu;
@@ -27,6 +28,7 @@ use bevy::app::PluginGroupBuilder;
 use bevy::prelude::*;
 
 use cirrus::CirrusPlugin;
+use clouds::CloudsPlugin;
 use facade::FacadePlugin;
 use hills::HillsPlugin;
 use menu::MenuPlugin;
@@ -46,6 +48,10 @@ impl PluginGroup for GamePlugins {
     fn build(self) -> PluginGroupBuilder {
         PluginGroupBuilder::start::<Self>()
             .add(SkyPlugin)
+            // The game's volumetric clouds replace the crate's disabled
+            // CloudPlugin (adr-0007); right after the sky so its depth
+            // prepass observer is registered before any camera spawns.
+            .add(CloudsPlugin)
             .add(SkyPanelPlugin)
             .add(CirrusPlugin)
             .add(HillsPlugin)

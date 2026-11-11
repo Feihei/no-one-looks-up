@@ -18,7 +18,7 @@ use bevy::post_process::bloom::Bloom;
 use bevy::prelude::*;
 
 use bevy_elements::{
-    CivilDate, Climate, CloudLayer, DustPlugin, ElementsCamera, ElementsPlugins, ElementsSystems,
+    CivilDate, Climate, CloudPlugin, DustPlugin, ElementsCamera, ElementsPlugins, ElementsSystems,
     GeoLocation, GroundCoverPlugin, HydrologyPlugin, LightningPlugin, PathsPlugin,
     PrecipitationPlugin, RocksPlugin, TerrainPlugin, TrailsPlugin, WaterPlugin, WavesPlugin,
     WeatherDirector, WeatherPreset, WeatheredPlugin, WindPlugin, WorldClock,
@@ -252,9 +252,14 @@ impl Plugin for SkyPlugin {
                 ElementsPlugins
                     .build()
                     // R1.4: the game has no weather changes — drop everything
-                    // outside climate/celestial/fog/cloud (ADR-0001). 0.6.0
+                    // outside climate/celestial/fog (ADR-0001). 0.6.0
                     // added Trails/Paths/Waves/Rocks to the default group; the
-                    // game uses none of them.
+                    // game uses none of them. R6: the crate's own volumetric
+                    // layer is replaced by the game's CloudsPlugin (adr-0007);
+                    // with CloudPlugin off the crate's celestial/fog estimate
+                    // the cloud dimming from `Weather` (`1 − cover^3.4`),
+                    // which apply_weather_overrides keeps in step.
+                    .disable::<CloudPlugin>()
                     .disable::<WindPlugin>()
                     .disable::<PrecipitationPlugin>()
                     .disable::<LightningPlugin>()
@@ -279,11 +284,6 @@ impl Plugin for SkyPlugin {
                     apply_weather_overrides
                         .after(ElementsSystems::Weather)
                         .before(ElementsSystems::Celestial),
-                    // `update_layer` (in `Simulation`) re-derives the layer
-                    // from `Weather` every frame; rewriting the resource after
-                    // the set means the GPU pass consumes the override on the
-                    // next frame — indistinguishable with a paused clock.
-                    apply_cloud_layer_override.after(ElementsSystems::Simulation),
                     perturb_exposure,
                     apply_bloom_intensity,
                 ),
@@ -350,18 +350,6 @@ fn apply_weather_overrides(sky: Res<DuskSky>, mut weather: ResMut<bevy_elements:
             weather.wind_speed_ms = 2.0;
         }
     }
-}
-
-fn apply_cloud_layer_override(sky: Res<DuskSky>, mut layer: ResMut<CloudLayer>) {
-    // A clear sky still needs a valid layer: the crate derives one every frame
-    // from `Weather`, and leaving a stale one would make the next kind switch
-    // pop.
-    let Some(clouds) = resolve_clouds(&sky) else {
-        return;
-    };
-    let (base_m, top_m) = clouds.layer;
-    layer.base_m = base_m;
-    layer.top_m = top_m.max(base_m + 200.0);
 }
 
 /// R1.5: subtle exposure drift driven by a deterministic function of the
