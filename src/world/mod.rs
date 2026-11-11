@@ -9,6 +9,7 @@
 //! player position -> chunks::ChunkManager -> spawn/despawn chunk groups
 //! ```
 
+pub mod band;
 pub mod chunks;
 pub mod collision;
 pub mod debug_viz;

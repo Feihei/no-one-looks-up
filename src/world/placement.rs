@@ -129,12 +129,22 @@ impl Default for StylePalette {
 pub enum PlacedKind {
     /// Box placeholder in place of a Blender module (R3.6 adds wear).
     Building(BlockType),
+    /// A building mass in the scenery band behind the ring road
+    /// (`world::band`): the same cube, facade and roof as a [`Self::Building`],
+    /// but it stands outside every block, on ground the collision ring has
+    /// already sealed. Kept as its own kind because it is the one building
+    /// that legitimately stands inside a street corridor -- the ring road's
+    /// outer half, where nobody can walk.
+    SceneryBuilding(BlockType),
     /// Street tree inside a block's setback strip.
     StreetTree,
     /// Tree inside a FOREST block.
     ForestTree,
     /// Tree on a PLAZA block.
     PlazaTree,
+    /// Tree in the scenery band: the alleys between the ring road's facades,
+    /// and the grove in each map corner.
+    SceneryTree,
     /// The plaza's paved pad.
     PlazaPad,
     /// A facade, roof or street prop (R3.11 steps 11.4-11.5).
@@ -378,6 +388,12 @@ pub fn plan_chunk(graph: &LayoutGraph, seed: u64, chunk: (i32, i32), tree_assets
             _ => {}
         }
     }
+
+    // The scenery band behind the ring road (`world::band`): the buildings and
+    // trees the walker sees across the ring and can never reach. It is planned
+    // from pure geometry rather than from the graph -- the band owns no block,
+    // no edge and no street, only the view.
+    crate::world::band::plan(&mut plan, seed, chunk, tree_assets);
 
     plan
 }

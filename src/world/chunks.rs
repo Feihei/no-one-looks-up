@@ -745,7 +745,9 @@ fn spawn_roof(
     object: &placement::PlacedObject,
 ) {
     let style = match object.kind {
-        placement::PlacedKind::Building(kind) => FacadeStyle::of(kind).expect("roof of a building"),
+        placement::PlacedKind::Building(kind) | placement::PlacedKind::SceneryBuilding(kind) => {
+            FacadeStyle::of(kind).expect("roof of a building")
+        }
         _ => return,
     };
     let profile = RoofProfile::of(style);
@@ -1020,7 +1022,11 @@ fn spawn_chunk_content(
 ) {
     for object in &plan.objects {
         match object.kind {
-            placement::PlacedKind::Building(kind) => {
+            // Band masses are ordinary buildings: same cube, same facade
+            // materials, same roofs, so the ring road's outer side reads as
+            // the city continuing rather than as a backdrop.
+            placement::PlacedKind::Building(kind)
+            | placement::PlacedKind::SceneryBuilding(kind) => {
                 let style = match kind {
                     BlockType::OldCity => 0,
                     BlockType::Apartment => 1,
@@ -1033,10 +1039,14 @@ fn spawn_chunk_content(
                 let mesh = assets.unit_cube.clone();
                 let position = Vec3::new(object.position.x, object.size.y * 0.5, object.position.y);
                 let rotation = Quat::from_rotation_y(object.yaw);
+                let label = match object.kind {
+                    placement::PlacedKind::SceneryBuilding(_) => "BandBuilding",
+                    _ => "Building",
+                };
                 commands.entity(root).with_children(|parent| {
                     parent.spawn((
                         Name::new(format!(
-                            "Building@{:?} wear={:.2}",
+                            "{label}@{:?} wear={:.2}",
                             object.position, object.wear
                         )),
                         Mesh3d(mesh),

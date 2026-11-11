@@ -25,9 +25,13 @@ fn main() {
                         PlacedKind::Building(BlockType::Apartment) => "building/apt",
                         PlacedKind::Building(BlockType::Factory) => "building/fac",
                         PlacedKind::Building(_) => "building/other",
+                        PlacedKind::SceneryBuilding(BlockType::OldCity) => "band/old",
+                        PlacedKind::SceneryBuilding(BlockType::Apartment) => "band/apt",
+                        PlacedKind::SceneryBuilding(_) => "band/fac",
                         PlacedKind::StreetTree => "tree/street",
                         PlacedKind::ForestTree => "tree/forest",
                         PlacedKind::PlazaTree => "tree/plaza",
+                        PlacedKind::SceneryTree => "tree/band",
                         PlacedKind::PlazaPad => "plaza/pad",
                         PlacedKind::Prop(kind) => match kind {
                             PropKind::Awning => "prop/awning",
@@ -52,7 +56,10 @@ fn main() {
                         },
                     };
                     *counts.entry(key).or_default() += 1;
-                    if matches!(o.kind, PlacedKind::Building(_)) {
+                    if matches!(
+                        o.kind,
+                        PlacedKind::Building(_) | PlacedKind::SceneryBuilding(_)
+                    ) {
                         let e = heights.entry(key).or_insert((f32::MAX, 0.0));
                         e.0 = e.0.min(o.size.y);
                         e.1 = e.1.max(o.size.y);

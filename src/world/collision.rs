@@ -25,7 +25,9 @@ use bevy::prelude::*;
 
 use crate::world::geometry::{convex_hull, point_in_convex_polygon};
 use crate::world::layout_graph::{BlockType, LayoutGraph};
-use crate::world::{BLOCK_SOLID_HEIGHT, CELL_SIZE, CHUNK_SIZE, GRID_CELLS, OUTER_BAND_CELLS};
+use crate::world::{
+    BLOCK_SOLID_HEIGHT, CELL_SIZE, CHUNK_SIZE, GRID_CELLS, OUTER_BAND_CELLS, STREET_WIDTH,
+};
 
 /// Player collision radius (m). A corridor narrower than `2 * radius` would be
 /// impassable, so this must stay well under half the minimum street width
@@ -136,9 +138,7 @@ impl CollisionIndex {
             }
         }
         // The scenery band is closed by a ring wall rather than by blocks.
-        if let Some(ring) = scenery_ring_prism(key) {
-            prisms.push(ring);
-        }
+        prisms.extend(scenery_ring_prisms(key));
         self.buckets.insert(key, prisms);
         self.populated.insert(key);
     }
@@ -236,11 +236,17 @@ fn prism_touches_chunk(prism: &SolidPrism, key: (i32, i32)) -> bool {
 /// The solid ring closing the scenery band, clipped to chunk `key`.
 ///
 /// The scenery band is one cell deep around the map. Rather than one huge
-/// prism, each chunk only registers the ring segment that crosses it: a
-/// 50 m-wide band along each map edge.
-fn scenery_ring_prism(key: (i32, i32)) -> Option<SolidPrism> {
+/// prism, each chunk only registers the ring segments that cross it.
+///
+/// The ring stops at the **ring road's outer curb**, not at the cell line: the
+/// loop's centerline is the band's inner boundary and the road is
+/// [`STREET_WIDTH`] wide about it, so its outer half is walkable street and the
+/// solid band starts half a road further out. That is also where the band's
+/// buildings stand (`world::band`), so the wall the walker stops at is the wall
+/// they see.
+fn scenery_ring_prisms(key: (i32, i32)) -> Vec<SolidPrism> {
     let world = GRID_CELLS as f32 * CELL_SIZE;
-    let band = OUTER_BAND_CELLS as f32 * CELL_SIZE;
+    let band = OUTER_BAND_CELLS as f32 * CELL_SIZE - STREET_WIDTH * 0.5;
     let (x0, z0) = (key.0 as f32 * CHUNK_SIZE, key.1 as f32 * CHUNK_SIZE);
     let (x1, z1) = (x0 + CHUNK_SIZE, z0 + CHUNK_SIZE);
 
@@ -273,34 +279,26 @@ fn scenery_ring_prism(key: (i32, i32)) -> Option<SolidPrism> {
         ));
     }
     clipped.retain(|&(ax0, az0, ax1, az1)| ax1 - ax0 > 0.01 && az1 - az0 > 0.01);
-    if clipped.is_empty() {
-        return None;
-    }
 
-    // Union of the clipped rectangles is not convex in the corners, so emit
-    // the largest one; corner chunks are covered by their neighbours' strips
-    // plus the block ring, which is enough to seal the map.
-    let (ax0, az0, ax1, az1) = clipped
+    // Every clipped strip is its own prism, and they may overlap: the union is
+    // an L (or a square) in the corners, and dropping one of the two strips
+    // there would open the band to the walker -- measured at a 4 x 46 m gap
+    // along every map corner. Overlapping convex prisms are harmless;
+    // `resolve` merely pushes out of each in turn.
+    clipped
         .into_iter()
-        .max_by(|a, b| {
-            let area_a = (a.2 - a.0) * (a.3 - a.1);
-            let area_b = (b.2 - b.0) * (b.3 - b.1);
-            area_a
-                .partial_cmp(&area_b)
-                .unwrap_or(std::cmp::Ordering::Equal)
+        .map(|(ax0, az0, ax1, az1)| SolidPrism {
+            block_id: u32::MAX,
+            polygon: vec![
+                Vec2::new(ax0, az0),
+                Vec2::new(ax1, az0),
+                Vec2::new(ax1, az1),
+                Vec2::new(ax0, az1),
+            ],
+            height: BLOCK_SOLID_HEIGHT,
+            kind: PrismKind::SceneryRing,
         })
-        .expect("clipped is non-empty");
-    Some(SolidPrism {
-        block_id: u32::MAX,
-        polygon: vec![
-            Vec2::new(ax0, az0),
-            Vec2::new(ax1, az0),
-            Vec2::new(ax1, az1),
-            Vec2::new(ax0, az1),
-        ],
-        height: BLOCK_SOLID_HEIGHT,
-        kind: PrismKind::SceneryRing,
-    })
+        .collect()
 }
 
 /// Minimum translation pushing a circle out of a convex polygon.
