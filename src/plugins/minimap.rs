@@ -1,11 +1,14 @@
-//! Minimap HUD (R4.x): a small top-right map showing the street network the
+//! Minimap HUD (R4.x): a small top-left map showing the street network the
 //! player has explored, plus the player's position and facing.
 //!
 //! Rendered as plain `bevy_ui` nodes so it shares the existing HUD stack and
 //! needs no extra camera or render layer. Streets are single-line segments
-//! taken from the [`LayoutGraph`] edges; a segment is drawn only when its
-//! midpoint chunk appears in the [`ExploredBitmap`], so unexplored parts of
-//! the city stay blank (the discovery feedback ADR-0001 asks for).
+//! taken from the [`LayoutGraph`] edges; each edge is sampled every half
+//! chunk and only the sub-segments falling inside explored chunks are drawn,
+//! so the map grows street by street as the player walks (the discovery
+//! feedback ADR-0001 asks for). No panel chrome: the lines overlay the
+//! viewport directly, tucked under the exploration text in the top-left
+//! corner.
 //!
 //! Toggled with `M` while walking (see [`crate::core::input::MINIMAP_TOGGLE`]);
 //! shown by default while playing, hidden in every non-playing phase.
@@ -30,11 +33,14 @@ const PIXELS_PER_METER: f32 = MAP_SIZE / WORLD_SIZE;
 const ROAD_THICKNESS: f32 = 1.5;
 /// Player marker line thickness, in pixels.
 const MARKER_THICKNESS: f32 = 2.0;
+/// Sampling step along an edge when deciding which parts are explored
+/// (half a chunk: 50 m streets split into two 25 m probes).
+const SAMPLE_STEP: f32 = 25.0;
 
-const MAP_BACKGROUND: Color = Color::srgba(0.03, 0.04, 0.06, 0.62);
-const MAP_BORDER: Color = Color::srgba(0.85, 0.78, 0.62, 0.55);
-const ROAD_COLOR: Color = Color::srgb(0.80, 0.77, 0.67);
-const PLAYER_COLOR: Color = Color::srgb(1.0, 0.72, 0.25);
+/// Roads stay quiet against the dusk sky: dim grey, slightly translucent.
+const ROAD_COLOR: Color = Color::srgba(0.55, 0.55, 0.55, 0.60);
+/// The player marker is a plain grey-white arrow, brighter than the roads.
+const PLAYER_COLOR: Color = Color::srgb(0.85, 0.85, 0.87);
 
 /// Player arrow in local map pixels: a shaft and two barbs pointing up (-y).
 /// Local up maps to the body's facing when the arrow is rotated by `-yaw`
@@ -122,36 +128,27 @@ fn sync_minimap_root(
     if wanted && root.entity.is_none() {
         let mut layer = None;
         let entity = commands
-            .spawn((
-                Node {
-                    position_type: PositionType::Absolute,
-                    top: Val::Px(12.0),
-                    right: Val::Px(14.0),
-                    width: Val::Px(MAP_SIZE),
-                    height: Val::Px(MAP_SIZE),
-                    ..default()
-                },
-                BackgroundColor(MAP_BACKGROUND),
-                Outline {
-                    width: Val::Px(1.0),
-                    offset: Val::Px(0.0),
-                    color: MAP_BORDER,
-                },
-                GlobalZIndex(1),
-            ))
+            .spawn((Node {
+                position_type: PositionType::Absolute,
+                // Under the "Explored: ..." status line, same corner,
+                // same show/hide rhythm -- no panel chrome of its own so
+                // the dusk sky stays visible behind the street lines.
+                top: Val::Px(40.0),
+                left: Val::Px(14.0),
+                width: Val::Px(MAP_SIZE),
+                height: Val::Px(MAP_SIZE),
+                ..default()
+            },))
             .with_children(|parent| {
                 let roads = parent
-                    .spawn((
-                        Node {
-                            position_type: PositionType::Absolute,
-                            left: Val::Px(0.0),
-                            top: Val::Px(0.0),
-                            width: Val::Percent(100.0),
-                            height: Val::Percent(100.0),
-                            ..default()
-                        },
-                        BackgroundColor(Color::NONE),
-                    ))
+                    .spawn(Node {
+                        position_type: PositionType::Absolute,
+                        left: Val::Px(0.0),
+                        top: Val::Px(0.0),
+                        width: Val::Percent(100.0),
+                        height: Val::Percent(100.0),
+                        ..default()
+                    })
                     .id();
                 layer = Some(roads);
                 for (from, to) in PLAYER_ARROW {
@@ -182,9 +179,11 @@ fn sync_minimap_root(
 
 /// Rebuilds the street lines whenever the explored set grows.
 ///
-/// Roads are filtered by chunk: only edges whose midpoint chunk has been
-/// explored appear. Rebuilding wholesale is cheap enough (a few hundred
-/// nodes) and happens only when a new chunk is discovered.
+/// Each edge is sampled every [`SAMPLE_STEP`] metres and only the
+/// sub-segments inside explored chunks are drawn, so partially walked
+/// streets appear as far as the player actually went. Rebuilding wholesale
+/// is cheap enough (a few hundred nodes) and happens only when a new chunk
+/// is discovered.
 fn rebuild_roads(
     phase: Res<GamePhase>,
     visible: Res<MinimapVisible>,
@@ -254,20 +253,45 @@ fn update_player_marker(
     }
 }
 
-/// Street segments whose midpoint chunk has been explored.
+/// Street sub-segments (sampled every [`SAMPLE_STEP`]) that fall inside
+/// explored chunks.
 fn explored_segments(graph: &LayoutGraph, bitmap: &ExploredBitmap) -> Vec<(Vec2, Vec2)> {
-    graph
-        .edges
-        .iter()
-        .filter_map(|edge| {
-            let from = graph.nodes.get(edge.from as usize)?;
-            let to = graph.nodes.get(edge.to as usize)?;
-            let mid = (from.pos + to.pos) * 0.5;
-            bitmap
-                .is_explored(chunk_key(mid))
-                .then_some((from.pos, to.pos))
-        })
-        .collect()
+    let mut out = Vec::new();
+    for edge in &graph.edges {
+        let Some(from) = graph.nodes.get(edge.from as usize) else {
+            continue;
+        };
+        let Some(to) = graph.nodes.get(edge.to as usize) else {
+            continue;
+        };
+        let start = from.pos;
+        let end = to.pos;
+        let length = start.distance(end);
+        if length <= f32::EPSILON {
+            continue;
+        }
+        // Walk the edge in SAMPLE_STEP probes; every probe pair whose
+        // midpoint chunk is explored becomes a drawn segment. This is what
+        // lets a half-walked street show only its walked half.
+        let mut prev = start;
+        let mut t = SAMPLE_STEP;
+        while t < length {
+            let next = start.lerp(end, t / length);
+            emit_if_explored(prev, next, bitmap, &mut out);
+            prev = next;
+            t += SAMPLE_STEP;
+        }
+        emit_if_explored(prev, end, bitmap, &mut out);
+    }
+    out
+}
+
+/// Appends `(a, b)` when the chunk containing its midpoint is explored.
+fn emit_if_explored(a: Vec2, b: Vec2, bitmap: &ExploredBitmap, out: &mut Vec<(Vec2, Vec2)>) {
+    let mid = (a + b) * 0.5;
+    if bitmap.is_explored(chunk_key(mid)) {
+        out.push((a, b));
+    }
 }
 
 /// World XZ metres to minimap pixels (top-left origin, +Z down like the map).
@@ -391,14 +415,15 @@ mod tests {
 
     #[test]
     fn roads_only_appear_on_explored_chunks() {
+        // A 100 m street crossing the chunk boundary at x = 450.
         let graph = LayoutGraph {
             nodes: vec![
                 LayoutNode {
-                    pos: Vec2::new(100.0, 100.0),
+                    pos: Vec2::new(400.0, 425.0),
                     kind: NodeKind::Junction,
                 },
                 LayoutNode {
-                    pos: Vec2::new(150.0, 100.0),
+                    pos: Vec2::new(500.0, 425.0),
                     kind: NodeKind::Junction,
                 },
             ],
@@ -415,12 +440,24 @@ mod tests {
         let blank = ExploredBitmap::default();
         assert!(explored_segments(&graph, &blank).is_empty());
 
+        // Only the eastern chunk explored: the drawn line must stop at the
+        // boundary instead of showing the whole street (the old midpoint
+        // rule hid or showed the entire edge).
         let mut explored = ExploredBitmap::default();
-        explored.mark(chunk_key(Vec2::new(125.0, 100.0)));
+        explored.mark(chunk_key(Vec2::new(475.0, 425.0)));
         let segments = explored_segments(&graph, &explored);
-        assert_eq!(segments.len(), 1, "the explored street must be drawn");
-        assert_eq!(segments[0].0, Vec2::new(100.0, 100.0));
-        assert_eq!(segments[0].1, Vec2::new(150.0, 100.0));
+        assert_eq!(segments.len(), 2, "the eastern half is two probes");
+        assert_eq!(segments[0].0, Vec2::new(450.0, 425.0));
+        assert_eq!(segments[0].1, Vec2::new(475.0, 425.0));
+        assert_eq!(segments[1].0, Vec2::new(475.0, 425.0));
+        assert_eq!(segments[1].1, Vec2::new(500.0, 425.0));
+
+        // Walking both chunks joins the probes back into a full line.
+        explored.mark(chunk_key(Vec2::new(425.0, 425.0)));
+        let segments = explored_segments(&graph, &explored);
+        assert_eq!(segments.len(), 4);
+        assert_eq!(segments[0].0, Vec2::new(400.0, 425.0));
+        assert_eq!(segments[3].1, Vec2::new(500.0, 425.0));
     }
 
     #[test]
