@@ -107,12 +107,40 @@ pub const LONG_LAMP_REACH: f32 = 4.2;
 /// Share of poles *without* a short bracket that get a long one.
 pub const LONG_LAMP_CHANCE: f32 = 0.3;
 
-/// How far the long bracket's head housing hangs below its mount (m).
-pub const LONG_LAMP_DROP: f32 = 0.32;
+/// How far the bracket's riser climbs off the pole before the arm levels off
+/// (m).
+///
+/// The bracket is a **riser plus a level run**, not two horizontal boxes: a
+/// long cantilever that steps down halfway reads as a bent stick (the two
+/// boxes met at a 6 cm vertical kink). Climbing first also lifts the head off
+/// the wire run instead of dropping it towards it.
+pub const LONG_LAMP_RISE: f32 = 0.55;
 
-/// How far the glowing lens hangs below the mount (m): 1.5 cm proud of the
-/// housing, so it is actually visible from the street.
-pub const LONG_LAMP_LENS_DROP: f32 = 0.335;
+/// Riser length along the road (m). ~26 degrees over [`LONG_LAMP_RISE`].
+pub const LONG_LAMP_RISER: f32 = 1.15;
+
+/// Beam section height (m); the arm is 9 cm wide (half 0.045).
+pub const LONG_LAMP_BEAM: f32 = 0.09;
+
+/// How far the head housing hangs below the level run's underside (m).
+pub const LONG_LAMP_HEAD_DROP: f32 = 0.36;
+
+/// How far the glowing lens sits below the housing's underside (m): proud by
+/// 1.5 cm less than the housing, so it stays visible from the street.
+pub const LONG_LAMP_LENS_GAP: f32 = 0.02;
+
+/// Half height of the mount plate (m) -- the lowest point of the bracket once
+/// the arm climbs.
+pub const LONG_LAMP_PLATE: f32 = 0.11;
+
+/// Underside of the level run, above the mount (m).
+const LONG_LAMP_RUN_UNDER: f32 = LONG_LAMP_RISE - LONG_LAMP_BEAM;
+
+/// Bottom of the head housing, above the mount (m).
+const LONG_LAMP_HOUSING_BOTTOM: f32 = LONG_LAMP_RUN_UNDER - LONG_LAMP_HEAD_DROP;
+
+/// Lowest point of the glowing lens, above the mount (m).
+const LONG_LAMP_LENS_BOTTOM: f32 = LONG_LAMP_HOUSING_BOTTOM - LONG_LAMP_LENS_GAP;
 
 /// Share of streets that get a 防护棚.
 ///
@@ -136,6 +164,27 @@ pub const SCAFFOLD_DECK: f32 = 0.12;
 
 /// Upright post diameter (m).
 pub const SCAFFOLD_POST: f32 = 0.16;
+
+/// Innermost a scaffold post may stand from the curb (m).
+///
+/// The curb is where the walkable street ends: a post has to stay outside it
+/// (the whole cross-street layer's ground rule), and 0.15 m still leaves the
+/// post's own radius plus air between the pipe and the walk lane.
+pub const SCAFFOLD_POST_MIN_OFFSET: f32 = 0.15;
+
+/// How much deeper than the utility-pole line a post may stand into the block's
+/// setback (m).
+///
+/// This is what turns the gantry's width into a variable: the posts stand on
+/// each block's own setback strip, so a street with a 5 m setback can carry a
+/// much wider deck than an old-city lane with 1 m, and the two sides are
+/// allowed to differ. The cap keeps a factory's 10 m setback from throwing a
+/// 15 m deck over a 8 m street.
+pub const SCAFFOLD_WIDEN_MAX: f32 = 1.5;
+
+/// Air kept between a post and the facade behind it (m): post radius plus a
+/// hand's width, so the pipe never spears the wall.
+pub const SCAFFOLD_POST_PAD: f32 = 0.35;
 
 /// Shortest / longest gantry along the street (m).
 pub const SCAFFOLD_MIN_LEN: f32 = 6.0;
@@ -182,8 +231,10 @@ pub fn overhead_lowest(kind: PropKind, base: f32, size: Vec3) -> Option<f32> {
         // The span's sag scales with `size.y` (see `bake_cross_wire`), so the
         // lowest point moves with the actual street width.
         PropKind::CrossWire => Some(base - CROSS_WIRE_SAG * size.y - CROSS_WIRE_RADIUS),
-        PropKind::LongLampArm => Some(base - LONG_LAMP_DROP),
-        PropKind::LongLampHead => Some(base - LONG_LAMP_LENS_DROP),
+        // The bracket climbs: its lowest point is the mount plate, and the
+        // head hangs from the level run well above the mount.
+        PropKind::LongLampArm => Some(base - LONG_LAMP_PLATE),
+        PropKind::LongLampHead => Some(base + LONG_LAMP_LENS_BOTTOM),
         PropKind::ScaffoldBeam | PropKind::ScaffoldDeck => Some(base),
         _ => None,
     }
@@ -245,16 +296,17 @@ pub fn place_overhead_furniture(
     // Both curbs must be building frontage: a plaza or forest side has no pole
     // line to hang from, and its block polygon is not solid, so a post there
     // would stand in walkable space.
-    let mut params: [Option<BuildingParams>; 2] = [None; 2];
+    let mut sides: [Option<BuildingParams>; 2] = [None; 2];
     for (i, block_id) in [edge.left_block, edge.right_block].into_iter().enumerate() {
         let Some(block) = block_id.and_then(|id| graph.blocks.get(id as usize)) else {
             continue;
         };
-        params[i] = BuildingParams::of(block.kind);
+        sides[i] = BuildingParams::of(block.kind);
     }
-    if params[0].is_none() || params[1].is_none() {
+    let [Some(left), Some(right)] = sides else {
         return;
-    }
+    };
+    let params = [left, right];
 
     let side_normals = [normal, -normal];
     let poles: [Vec<props::PoleSlot>; 2] = [
@@ -269,7 +321,7 @@ pub fn place_overhead_furniture(
             seed,
             edge_index as u32,
             0,
-            params[0].map_or(0.0, |p| p.street_tree_probability),
+            params[0].street_tree_probability,
             length,
             tree_assets,
         ),
@@ -277,7 +329,7 @@ pub fn place_overhead_furniture(
             seed,
             edge_index as u32,
             1,
-            params[1].map_or(0.0, |p| p.street_tree_probability),
+            params[1].street_tree_probability,
             length,
             tree_assets,
         ),
@@ -288,7 +340,7 @@ pub fn place_overhead_furniture(
     place_cross_wires(plan, &mut rng, mid, dir, normal, stand, &poles);
     place_long_brackets(plan, &mut rng, mid, dir, side_normals, stand, &poles);
     place_scaffold(
-        plan, &mut rng, mid, dir, normal, stand, length, &poles, &trees,
+        plan, &mut rng, mid, dir, normal, curb, length, &poles, &trees, params,
     );
 }
 
@@ -388,6 +440,17 @@ fn place_long_brackets(
 /// stream-chosen starting slot until a clear bay is found. When the edge is too
 /// crowded for its own length, no gantry appears -- the roll is still spent, so
 /// the rest of the edge's stream is unaffected.
+///
+/// # Width is drawn, not derived
+///
+/// The gantry's width across the street is not `2 * (curb + standoff)`: each
+/// side's posts stand somewhere in that block's own setback strip, between
+/// [`SCAFFOLD_POST_MIN_OFFSET`] outside the curb and as deep as
+/// [`SCAFFOLD_WIDEN_MAX`] (and the block's setback) allows. The two sides are
+/// drawn independently, which is what makes a 防护棚 over an old-city lane
+/// narrow and tight while the same roll over a factory frontage throws a wide,
+/// slightly skewed deck -- and it keeps every post outside the walkable street
+/// by construction, since the offset never goes below its minimum.
 #[allow(clippy::too_many_arguments)]
 fn place_scaffold(
     plan: &mut ChunkPlan,
@@ -395,10 +458,11 @@ fn place_scaffold(
     mid: Vec2,
     dir: Vec2,
     normal: Vec2,
-    stand: f32,
+    curb: f32,
     length: f32,
     poles: &[Vec<props::PoleSlot>; 2],
     trees: &[Vec<f32>; 2],
+    params: [BuildingParams; 2],
 ) {
     let roll: f32 = rng.random();
     if roll >= SCAFFOLD_CHANCE {
@@ -418,6 +482,15 @@ fn place_scaffold(
     }
     let steps = (((hi - lo) / SCAFFOLD_STEP).floor() as usize + 1).max(1);
     let first = ((rng.random::<f32>() * steps as f32) as usize).min(steps - 1);
+
+    // Width across the street, drawn after the along-street placement so the
+    // existing draws keep their positions in the stream.
+    let offsets = params.map(|p| {
+        let cap = (p.setback - POLE_STANDOFF - SCAFFOLD_POST_PAD).clamp(0.0, SCAFFOLD_WIDEN_MAX)
+            + POLE_STANDOFF;
+        rng.random_range(SCAFFOLD_POST_MIN_OFFSET..=cap)
+    });
+    let (half_left, half_right) = (curb + offsets[0], curb + offsets[1]);
 
     let pole_alongs: Vec<f32> = poles.iter().flatten().map(|slot| slot.along).collect();
     let tree_alongs: Vec<f32> = trees.iter().flatten().copied().collect();
@@ -449,10 +522,13 @@ fn place_scaffold(
     let beam_line = SCAFFOLD_CLEAR;
     let cross_line = SCAFFOLD_CLEAR + SCAFFOLD_BEAM;
     let deck_line = SCAFFOLD_CLEAR + 2.0 * SCAFFOLD_BEAM;
-    let half_width = stand;
+    // The two post lines need not be equidistant from the road centre: the
+    // cross beams and the deck span between them and sit on their midpoint.
+    let width = half_left + half_right;
+    let centre_across = (half_left - half_right) * 0.5;
 
     for lx in [-half, half] {
-        for lz in [-half_width, half_width] {
+        for lz in [-half_right, half_left] {
             push_overhead(
                 plan,
                 PropKind::ScaffoldPost,
@@ -465,7 +541,7 @@ fn place_scaffold(
         }
     }
     // Longitudinal beams over each post line.
-    for lz in [-half_width, half_width] {
+    for lz in [-half_right, half_left] {
         push_overhead(
             plan,
             PropKind::ScaffoldBeam,
@@ -486,9 +562,9 @@ fn place_scaffold(
         push_overhead(
             plan,
             PropKind::ScaffoldBeam,
-            at(lx, 0.0),
+            at(lx, centre_across),
             yaw,
-            Vec3::new(SCAFFOLD_BEAM_WIDTH, SCAFFOLD_BEAM, 2.0 * stand + 0.3),
+            Vec3::new(SCAFFOLD_BEAM_WIDTH, SCAFFOLD_BEAM, width + 0.3),
             cross_line,
             1,
         );
@@ -496,9 +572,9 @@ fn place_scaffold(
     push_overhead(
         plan,
         PropKind::ScaffoldDeck,
-        at(0.0, 0.0),
+        at(0.0, centre_across),
         yaw,
-        Vec3::new(span + 0.5, SCAFFOLD_DECK, 2.0 * stand + 0.3),
+        Vec3::new(span + 0.5, SCAFFOLD_DECK, width + 0.3),
         deck_line,
         0,
     );
@@ -520,28 +596,45 @@ pub fn bake_cross_wire() -> Mesh {
     props::bake_catenary(CROSS_WIRE_SAG, CROSS_WIRE_RADIUS)
 }
 
-/// The long bracket: mount plate against the pole, a straight inner arm, a
-/// drooping outer arm, and a head housing at the far end.
+/// The long bracket: mount plate against the pole, a diagonal riser, a level
+/// run out over the road, and a head housing hanging from its end.
 ///
-/// Baked at real size (the taper and the droop are the shape) with the mount at
-/// the origin and the reach along local +x, like the short bracket.
+/// Baked at real size (the climb and the droop are the shape) with the mount
+/// at the origin and the reach along local +x, like the short bracket.
+///
+/// The two-segment shape is the point: the riser leaves the pole face at ~26
+/// degrees, the run is dead level, and they meet at the run's own height. The
+/// previous version was two horizontal boxes at different heights, which met
+/// in a 6 cm step a third of the way out -- a bracket that had been folded.
 pub fn bake_long_lamp_arm() -> Mesh {
     let mut buf = MeshBuf::new();
     // Mount plate bolted to the pole face.
-    props::push_box(&mut buf, [-0.10, -0.11, -0.07], [0.10, 0.11, 0.07]);
-    // Inner arm: horizontal off the pole.
-    props::push_box(&mut buf, [0.0, -0.05, -0.05], [2.6, 0.03, 0.05]);
-    // Outer arm: sags half a hand's width over the last stretch.
     props::push_box(
         &mut buf,
-        [2.6, -0.11, -0.045],
-        [LONG_LAMP_REACH - 0.34, -0.03, 0.045],
+        [-0.10, -LONG_LAMP_PLATE, -0.07],
+        [0.10, LONG_LAMP_PLATE, 0.07],
     );
-    // Head housing, hanging under the outer arm's end.
+    // Riser: a diagonal strut from the plate up to the level run.
+    let rise_run = (LONG_LAMP_RISE / LONG_LAMP_RISER).atan();
+    let length = (LONG_LAMP_RISER * LONG_LAMP_RISER + LONG_LAMP_RISE * LONG_LAMP_RISE).sqrt();
+    props::push_box_rot_z(
+        &mut buf,
+        [0.02, -0.05, -0.05],
+        [length, 0.05, 0.05],
+        [0.02, 0.0],
+        rise_run,
+    );
+    // Level run from the riser's top out to the head.
     props::push_box(
         &mut buf,
-        [LONG_LAMP_REACH - 0.34, -LONG_LAMP_DROP, -0.13],
-        [LONG_LAMP_REACH, -0.06, 0.13],
+        [LONG_LAMP_RISER - 0.06, LONG_LAMP_RUN_UNDER, -0.045],
+        [LONG_LAMP_REACH - 0.36, LONG_LAMP_RISE, 0.045],
+    );
+    // Head housing, hanging under the run's end.
+    props::push_box(
+        &mut buf,
+        [LONG_LAMP_REACH - 0.36, LONG_LAMP_HOUSING_BOTTOM, -0.13],
+        [LONG_LAMP_REACH, LONG_LAMP_RUN_UNDER + 0.02, 0.13],
     );
     buf.build()
 }
@@ -552,11 +645,15 @@ pub fn bake_long_lamp_arm() -> Mesh {
 /// a glowing box enclosed by a closed housing is invisible.
 pub fn bake_long_lamp_head() -> Mesh {
     let mut buf = MeshBuf::new();
-    let low = -LONG_LAMP_LENS_DROP;
+    let low = LONG_LAMP_LENS_BOTTOM;
     props::push_box(
         &mut buf,
-        [LONG_LAMP_REACH - 0.30, low, -0.10],
-        [LONG_LAMP_REACH - 0.04, low + 0.02, 0.10],
+        [LONG_LAMP_REACH - 0.32, low, -0.10],
+        [
+            LONG_LAMP_REACH - 0.06,
+            LONG_LAMP_HOUSING_BOTTOM + 0.01,
+            0.10,
+        ],
     );
     buf.build()
 }
@@ -652,7 +749,20 @@ mod tests {
     const MID: Vec2 = Vec2::new(500.0, 500.0);
     const DIR: Vec2 = Vec2::new(1.0, 0.0);
     const NORMAL: Vec2 = Vec2::new(0.0, 1.0);
-    const STAND: f32 = 4.0 + POLE_STANDOFF;
+    const CURB: f32 = 4.0;
+    const STAND: f32 = CURB + POLE_STANDOFF;
+
+    /// The two sides of the synthetic edge: an old-city lane (1 m setback)
+    /// across from an apartment slab (5 m). Deliberately asymmetric -- that is
+    /// what the gantry's width has to cope with.
+    fn sides() -> [BuildingParams; 2] {
+        [
+            BuildingParams::of(crate::world::layout_graph::BlockType::OldCity)
+                .expect("old city is built"),
+            BuildingParams::of(crate::world::layout_graph::BlockType::Apartment)
+                .expect("apartment is built"),
+        ]
+    }
 
     #[test]
     fn cross_wires_join_poles_on_both_curbs() {
@@ -779,7 +889,16 @@ mod tests {
             let mut plan = ChunkPlan::default();
             let mut rng = overhead_rng(5, edge);
             place_scaffold(
-                &mut plan, &mut rng, MID, DIR, NORMAL, STAND, 50.0, &empty, &no_trees,
+                &mut plan,
+                &mut rng,
+                MID,
+                DIR,
+                NORMAL,
+                CURB,
+                50.0,
+                &empty,
+                &no_trees,
+                sides(),
             );
             if !plan.objects.is_empty() {
                 found = Some(plan.objects);
@@ -793,19 +912,40 @@ mod tests {
             .filter(|o| o.kind == PlacedKind::Prop(PropKind::ScaffoldPost))
             .collect();
         assert_eq!(posts.len(), 4, "a gantry stands on four posts");
+        let deepest = CURB + POLE_STANDOFF + SCAFFOLD_WIDEN_MAX;
         for post in &posts {
+            let across = (post.position - MID).dot(NORMAL).abs();
             assert!(
-                ((post.position - MID).dot(NORMAL).abs() - STAND).abs() < 1e-3,
-                "posts stand on the curb line"
+                (CURB + SCAFFOLD_POST_MIN_OFFSET - 1e-3..=deepest + 1e-3).contains(&across),
+                "a post stands {across:.2} m from the centreline, outside its setback strip"
             );
         }
         let deck = objects
             .iter()
             .find(|o| o.kind == PlacedKind::Prop(PropKind::ScaffoldDeck))
             .expect("a gantry carries a deck");
+        // The deck spans the two post lines: sum of their offsets plus the
+        // fascia overhang on both sides.
+        let lines: Vec<f32> = {
+            let mut v: Vec<f32> = posts
+                .iter()
+                .map(|p| (p.position - MID).dot(NORMAL))
+                .collect();
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            v.dedup_by(|a, b| (*a - *b).abs() < 1e-3);
+            v
+        };
+        assert_eq!(lines.len(), 2, "a gantry has two post lines");
+        let span = lines[1] - lines[0];
         assert!(
-            (deck.size.z - (2.0 * STAND + 0.3)).abs() < 1e-3,
-            "the deck spans curb to curb"
+            (deck.size.z - (span + 0.3)).abs() < 1e-3,
+            "the deck ({:.2} m) does not span its posts ({span:.2} m)",
+            deck.size.z
+        );
+        // And it covers the road, not just the middle of it.
+        assert!(
+            deck.size.z >= 2.0 * CURB,
+            "a deck narrower than the street would leave the curb line open"
         );
         assert!(
             deck.base >= SCAFFOLD_CLEAR + 2.0 * SCAFFOLD_BEAM - 1e-3,
@@ -818,10 +958,58 @@ mod tests {
         {
             assert!(beam.base >= SCAFFOLD_CLEAR - 1e-4);
         }
-        // The deck must cover the street, not just the middle of it.
+    }
+
+    /// The gantry's width across the street is drawn per side, so it varies
+    /// with the street and the setbacks instead of being one fixed number.
+    #[test]
+    fn gantry_width_varies_with_its_street() {
+        let empty: [Vec<props::PoleSlot>; 2] = [Vec::new(), Vec::new()];
+        let no_trees: [Vec<f32>; 2] = [Vec::new(), Vec::new()];
+        let mut widths = std::collections::HashSet::new();
+        let mut checked = 0usize;
+        for edge in 0..256u32 {
+            for (curb, params) in [
+                (CURB, sides()),
+                (
+                    5.0,
+                    [
+                        BuildingParams::of(crate::world::layout_graph::BlockType::Factory)
+                            .expect("factory is built"),
+                        BuildingParams::of(crate::world::layout_graph::BlockType::Factory)
+                            .expect("factory is built"),
+                    ],
+                ),
+            ] {
+                let mut plan = ChunkPlan::default();
+                let mut rng = overhead_rng(11, edge);
+                place_scaffold(
+                    &mut plan, &mut rng, MID, DIR, NORMAL, curb, 50.0, &empty, &no_trees, params,
+                );
+                let Some(deck) = plan
+                    .objects
+                    .iter()
+                    .find(|o| o.kind == PlacedKind::Prop(PropKind::ScaffoldDeck))
+                else {
+                    continue;
+                };
+                checked += 1;
+                // Widest possible: both posts at the far end of their strip,
+                // plus the deck's fascia overhang.
+                let widest = 2.0 * (curb + POLE_STANDOFF + SCAFFOLD_WIDEN_MAX) + 0.31;
+                assert!(
+                    deck.size.z > 2.0 * curb && deck.size.z <= widest,
+                    "a gantry {:.2} m wide does not fit its {curb:.1} m curb",
+                    deck.size.z
+                );
+                widths.insert((deck.size.z * 100.0) as i32);
+            }
+        }
+        assert!(checked > 20, "only {checked} gantries planned");
         assert!(
-            deck.size.z >= 2.0 * STAND,
-            "a deck narrower than the street would leave the curb line open"
+            widths.len() > 10,
+            "the gantry's width never changes ({} distinct widths)",
+            widths.len()
         );
     }
 
@@ -842,7 +1030,16 @@ mod tests {
             let mut plan = ChunkPlan::default();
             let mut rng = overhead_rng(3, edge);
             place_scaffold(
-                &mut plan, &mut rng, MID, DIR, NORMAL, STAND, 50.0, &poles, &trees,
+                &mut plan,
+                &mut rng,
+                MID,
+                DIR,
+                NORMAL,
+                CURB,
+                50.0,
+                &poles,
+                &trees,
+                sides(),
             );
             let posts: Vec<&PlacedObject> = plan
                 .objects
@@ -964,8 +1161,8 @@ mod tests {
                 "{name} overshoots the reach"
             );
             assert!(
-                min_y >= -LONG_LAMP_LENS_DROP - 1e-4,
-                "{name} hangs below its lens"
+                min_y >= -LONG_LAMP_PLATE - 1e-4,
+                "{name} hangs below the mount plate"
             );
         }
         // The lens must be proud of the housing, or it is occluded.
@@ -979,8 +1176,76 @@ mod tests {
             .map(|p| p[1])
             .fold(f32::MAX, f32::min);
         assert!(
-            -LONG_LAMP_LENS_DROP < arm_min,
+            LONG_LAMP_HOUSING_BOTTOM > arm_min,
             "the lens must hang below the housing ({arm_min})"
         );
+    }
+
+    /// The bracket climbs off the pole and then runs level.
+    ///
+    /// The old mesh was two horizontal boxes at different heights, so the arm
+    /// had no tilted face at all and its outer half sat 6 cm *lower* than its
+    /// inner half -- a cantilever with a fold in the middle, which is exactly
+    /// what it looked like.
+    #[test]
+    fn long_bracket_rises_then_runs_level() {
+        let mesh = bake_long_lamp_arm();
+        let positions: Vec<[f32; 3]> = mesh
+            .attribute(Mesh::ATTRIBUTE_POSITION)
+            .expect("positions")
+            .as_float3()
+            .expect("f32")
+            .to_vec();
+        let indices = match mesh.indices().expect("indices") {
+            bevy::mesh::Indices::U32(i) => i.clone(),
+            bevy::mesh::Indices::U16(i) => i.iter().map(|&v| v as u32).collect(),
+        };
+
+        let mut sloped = 0usize;
+        let mut level = 0usize;
+        for tri in indices.as_chunks::<3>().0 {
+            let (a, b, c) = (
+                positions[tri[0] as usize],
+                positions[tri[1] as usize],
+                positions[tri[2] as usize],
+            );
+            // Right-hand-rule normal of a CCW triangle.
+            let (ab, ac) = (
+                [b[0] - a[0], b[1] - a[1], b[2] - a[2]],
+                [c[0] - a[0], c[1] - a[1], c[2] - a[2]],
+            );
+            let n = [
+                ab[1] * ac[2] - ab[2] * ac[1],
+                ab[2] * ac[0] - ab[0] * ac[2],
+                ab[0] * ac[1] - ab[1] * ac[0],
+            ];
+            // `MeshBuf` stores unnormalised normals; compare directions.
+            let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt().max(1e-9);
+            let n = [n[0] / len, n[1] / len, n[2] / len];
+            let centre_x = (a[0] + b[0] + c[0]) / 3.0;
+            if centre_x < 0.5 {
+                continue; // The mount plate, at the pole face.
+            }
+            if n[1] > 0.5 {
+                // A face pointing up: the riser's slope, or the level run.
+                if n[0].abs() > 0.15 {
+                    sloped += 1;
+                    continue;
+                }
+                level += 1;
+                let top = [a, b, c].iter().map(|p| p[1]).fold(f32::MIN, f32::max);
+                assert!(
+                    top >= LONG_LAMP_RUN_UNDER - 1e-3,
+                    "a level face of the arm sits at {top:.3} m, below the run's \
+                     underside ({} m): the arm steps down instead of running level",
+                    LONG_LAMP_RUN_UNDER
+                );
+            }
+        }
+        assert_eq!(
+            sloped, 1,
+            "the riser's top is the arm's only up-facing tilted face"
+        );
+        assert!(level > 0, "the arm has no level run");
     }
 }

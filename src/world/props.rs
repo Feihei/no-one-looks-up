@@ -667,14 +667,75 @@ fn edge_salt_rng(seed: u64, edge: u32, side: u32) -> StdRng {
 
 /// One axis-aligned box, six quads wound CCW seen from outside.
 pub(crate) fn push_box(buf: &mut MeshBuf, min: [f32; 3], max: [f32; 3]) {
+    push_box_mapped(buf, min, max, |p| p);
+}
+
+/// [`push_box`], rotated about the local +Z axis by `angle` around `pivot`.
+///
+/// Every prop so far is a stack of axis-aligned boxes; a diagonal strut is the
+/// one part that is not, and stretching a unit box cannot make one (the
+/// section would shear). Rotating the eight corners keeps `push_box`'s
+/// winding: a rotation about +Z is orientation preserving, so each face still
+/// points outward.
+pub(crate) fn push_box_rot_z(
+    buf: &mut MeshBuf,
+    min: [f32; 3],
+    max: [f32; 3],
+    pivot: [f32; 2],
+    angle: f32,
+) {
+    let (s, c) = angle.sin_cos();
+    push_box_mapped(buf, min, max, |p| {
+        let (dx, dy) = (p[0] - pivot[0], p[1] - pivot[1]);
+        [pivot[0] + dx * c - dy * s, pivot[1] + dx * s + dy * c, p[2]]
+    });
+}
+
+/// The six faces of `min..max` passed through `map` (a rigid motion).
+fn push_box_mapped(
+    buf: &mut MeshBuf,
+    min: [f32; 3],
+    max: [f32; 3],
+    map: impl Fn([f32; 3]) -> [f32; 3],
+) {
     let [x0, y0, z0] = min;
     let [x1, y1, z1] = max;
-    buf.quad([x1, y0, z1], [x1, y0, z0], [x1, y1, z0], [x1, y1, z1]);
-    buf.quad([x0, y0, z0], [x0, y0, z1], [x0, y1, z1], [x0, y1, z0]);
-    buf.quad([x0, y1, z1], [x1, y1, z1], [x1, y1, z0], [x0, y1, z0]);
-    buf.quad([x0, y0, z0], [x1, y0, z0], [x1, y0, z1], [x0, y0, z1]);
-    buf.quad([x0, y0, z1], [x1, y0, z1], [x1, y1, z1], [x0, y1, z1]);
-    buf.quad([x1, y0, z0], [x0, y0, z0], [x0, y1, z0], [x1, y1, z0]);
+    buf.quad(
+        map([x1, y0, z1]),
+        map([x1, y0, z0]),
+        map([x1, y1, z0]),
+        map([x1, y1, z1]),
+    );
+    buf.quad(
+        map([x0, y0, z0]),
+        map([x0, y0, z1]),
+        map([x0, y1, z1]),
+        map([x0, y1, z0]),
+    );
+    buf.quad(
+        map([x0, y1, z1]),
+        map([x1, y1, z1]),
+        map([x1, y1, z0]),
+        map([x0, y1, z0]),
+    );
+    buf.quad(
+        map([x0, y0, z0]),
+        map([x1, y0, z0]),
+        map([x1, y0, z1]),
+        map([x0, y0, z1]),
+    );
+    buf.quad(
+        map([x0, y0, z1]),
+        map([x1, y0, z1]),
+        map([x1, y1, z1]),
+        map([x0, y1, z1]),
+    );
+    buf.quad(
+        map([x1, y0, z0]),
+        map([x0, y0, z0]),
+        map([x0, y1, z0]),
+        map([x1, y1, z0]),
+    );
 }
 
 /// The 雨棚: a tilted canvas slab, wall edge at z = 0, outer edge toward
