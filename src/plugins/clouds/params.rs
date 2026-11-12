@@ -1,7 +1,8 @@
 //! GPU uniform of every cloud kernel (`common.wesl`, `CloudParams`).
 //!
 //! Every field is a vec4 so the Rust and WESL layouts agree without padding
-//! logic. `params_mirror` in [`crate::plugins::clouds`] pins the mirror.
+//! logic. `params_mirror_wesl_struct` in [`crate::plugins::clouds`] pins the
+//! mirror.
 
 use bevy::math::{UVec4, Vec4};
 use bevy::render::render_resource::ShaderType;
@@ -18,15 +19,16 @@ pub struct CloudsParams {
     pub layer: Vec4,
     /// xyz: unit direction toward the sun. w: unused.
     pub light: Vec4,
-    /// xyz: the sun's illuminance outside the atmosphere, lx. w: ambient source, cd/m².
+    /// xyz: the sun's illuminance outside the atmosphere, lx. w: unused (C2's ambient source).
     pub light_e: Vec4,
-    /// xy: drift of the weather field, m (C1). zw: drift of the base noise, m (C1).
+    /// xy: drift of the weather field, m (wrapped to its tile). zw: drift of the base noise, m.
     pub drift: Vec4,
-    /// xy: drift of the detail noise, m (C1). zw: unit wind direction (C1).
+    /// xy: drift of the detail noise, m. zw: unit wind direction (XZ).
     pub drift_detail: Vec4,
-    /// xy: weather map origin, m (C1). z: weather map extent, m (C1). w: unused.
+    /// xy: weather map origin, m. z: weather map extent, m. w: unused.
     pub weather: Vec4,
-    /// x: frame counter. y: primary march steps. z: light samples. w: unused.
+    /// x: frame counter. y: primary march steps. z: light samples. w: first z slice of this
+    /// frame's noise slab.
     pub counts: UVec4,
     /// xy: full resolution. zw: march resolution.
     pub sizes: UVec4,
@@ -36,6 +38,14 @@ pub struct CloudsParams {
     /// x: world units per metre ([`bevy_elements::ElementsUnits`]). The shaders divide what
     /// they take from the view matrices and depth by this and multiply what they hand back.
     pub units: Vec4,
+    /// The height gradient quadruple (a0, a1, a2, a3) of the selected kind.
+    pub grad: Vec4,
+    /// x: peak extinction, m⁻¹. y: cloud-side erosion strength. z: weight of the dome shaping
+    /// (0 a flat deck, 1 cumulus). w: unused.
+    pub shape: Vec4,
+    /// x: base noise tile, m. y: detail noise tile, m. z: wind skew per unit height, m.
+    /// w: unused.
+    pub noise: Vec4,
 }
 
 #[cfg(test)]
@@ -46,6 +56,6 @@ mod tests {
     fn every_field_is_one_vec4_of_the_same_width() {
         // The WESL mirror relies on every field being 16 bytes: all-vec4
         // structs need no alignment or padding logic, in either language.
-        assert_eq!(size_of::<CloudsParams>(), 16 * 12);
+        assert_eq!(size_of::<CloudsParams>(), 16 * 15);
     }
 }

@@ -1,15 +1,18 @@
 // no_one_looks_up::plugins::clouds::common — the cloud model shared by every
-// cloud kernel: the uniform, shell geometry and the atmosphere lookups.
-// No bindings: each kernel declares its own and passes the textures in.
+// cloud kernel: the uniform, shell geometry, the density model and the
+// atmosphere lookups. No bindings: each kernel declares its own and passes the
+// textures in.
 //
 // Adapted for the game's ONE golden-hour cumulus layer (adr-0007). The shell
 // geometry and the Bevy-atmosphere lookups (transmittance_uv,
-// sample_transmittance, planet_visibility, light_at, view_ray,
-// scene_distance, sphere_roots, shell_range, ground_before_layer,
-// is_orthographic, altitude) are a copy of the vendored
-// bevy_elements::clouds::common (they are `pub(crate)` there); the tripwire
-// test `common_wesl_carries_the_copied_math` pins them. The density and
-// lighting models are the game's own (C1/C2).
+// sample_transmittance, planet_visibility, light_at, view_ray, scene_distance,
+// sphere_roots, shell_range, ground_before_layer, is_orthographic, altitude)
+// are a copy of the vendored bevy_elements::clouds::common (they are
+// `pub(crate)` there); the tripwire test `common_wesl_carries_the_copied_math`
+// pins them. The density model is the game's own: one cumulus family whose
+// kinds differ in gradient, extinction, dome weight and erosion, with the
+// vendored layer's validated dome shaping (0.62 exponent, ±35 % per-cell
+// jitter, DOME_WIDTH 0.30 in the weather map).
 //
 // Geometry: one spherical shell about a planet centre straight below the
 // camera. A point is described by its horizontal offset `rel_xz` from the
@@ -28,18 +31,16 @@ struct CloudParams {
     layer: vec4<f32>,
     /// xyz: unit direction toward the sun. w: unused.
     light: vec4<f32>,
-    /// xyz: illuminance of the sun outside the atmosphere per channel, lx. w: ambient source
-    /// term E_d / 2π, cd/m² (C2).
+    /// xyz: the sun's illuminance outside the atmosphere, lx. w: unused (C2's ambient source).
     light_e: vec4<f32>,
-    /// xy: cloud drift for the weather field (wrapped to its tile period), m (C1). zw: for the
-    /// base noise (wrapped to its tile period), m (C1).
+    /// xy: drift of the weather field, m (wrapped to its tile). zw: drift of the base noise, m.
     drift: vec4<f32>,
-    /// xy: cloud drift for the detail noise (wrapped to its tile period), m (C1). zw: unit wind
-    /// direction (XZ) (C1).
+    /// xy: drift of the detail noise, m. zw: unit wind direction (XZ).
     drift_detail: vec4<f32>,
-    /// xy: world XZ of the weather map's minimum corner, m (C1). z: its extent, m (C1). w: unused.
+    /// xy: weather map origin, m. z: its extent, m. w: unused.
     weather: vec4<f32>,
-    /// x: frame counter. y: primary march steps Q. z: light samples. w: unused.
+    /// x: frame counter. y: primary march steps Q. z: light samples. w: first z slice of this
+    /// frame's noise slab.
     counts: vec4<u32>,
     /// xy: full resolution. zw: march resolution.
     sizes: vec4<u32>,
@@ -50,15 +51,229 @@ struct CloudParams {
     /// matrices and depth are in world units, so the shaders divide what they take from them by
     /// this and multiply what they hand back.
     units: vec4<f32>,
+    /// The height gradient quadruple (a0, a1, a2, a3) of the selected kind.
+    grad: vec4<f32>,
+    /// x: peak extinction, m⁻¹. y: cloud-side erosion strength. z: weight of the dome shaping
+    /// (0 a flat deck, 1 cumulus). w: unused.
+    shape: vec4<f32>,
+    /// x: base noise tile, m. y: detail noise tile, m. z: wind skew per unit height, m.
+    /// w: unused.
+    noise: vec4<f32>,
 }
 
 const PI: f32 = 3.14159265358979;
 /// Farthest distance the march goes, m. The camera looks up 22.55–60° into a
 /// shell at 0.8–3.2 km, so visible cloud is within ~10 km; 16 km leaves slack
-/// for the far veil (C2) without sampling the full aerial LUT range.
+/// for the far veil (C2) without sampling the whole aerial LUT range.
 const MAX_MARCH_M: f32 = 16000.0;
 /// Large number standing for "no surface": the sky.
 const NO_SURFACE: f32 = 1.0e30;
+
+// ---------------------------------------------------------------------------
+// Density model (cumulus, one family).
+// ---------------------------------------------------------------------------
+
+/// The dome profile's exponent. 0.62 rather than sqrt: a flatter shoulder,
+/// closer to a cumulus pile than to a half-ellipse.
+const DOME_EXPONENT: f32 = 0.62;
+/// Per-cell spread of the dome profile, ±35 %: blobs are not identical copies.
+const DOME_JITTER: f32 = 0.35;
+/// Flat base of a cumuliform cloud: density rises over this fraction of the
+/// layer, so the condensation level is a plane.
+const CUMULUS_BASE_RISE: f32 = 0.06;
+/// The top rounds off over the upper part of the blob's height, from this
+/// fraction of it.
+const CUMULUS_TOP_ROUND: f32 = 0.25;
+/// Height of a cumuliform cloud at the edge of its blob, as a fraction of the
+/// layer.
+const CUMULUS_EDGE_HEIGHT: f32 = 0.45;
+/// Share of the cumuliform profile the cloud's core keeps, so the noise's lows
+/// still open gaps inside a coverage blob and it breaks into separate clouds.
+const CORE_PROFILE: f32 = 0.75;
+
+/// Height gradient quadruple: density ramps in between `q.x` and `q.y` and out
+/// between `q.z` and `q.w`.
+fn height_gradient(f: f32, q: vec4<f32>) -> f32 {
+    let up = clamp((f - q.x) / max(q.y - q.x, 1e-4), 0.0, 1.0);
+    let down = 1.0 - clamp((f - q.z) / max(q.w - q.z, 1e-4), 0.0, 1.0);
+    return up * down;
+}
+
+/// The rounded top of a cumuliform cloud at height fraction `f` with the dome
+/// factor `dome` (the weather map's A channel, 0 at the edge of a blob, 1 deep
+/// inside): full up to the upper part of the blob's height `s`, rounding off
+/// toward it. C¹, so neither the corners of the gradient nor the dome texels'
+/// kinks crease the cloud.
+///
+/// `weight` is the kind's dome weight: 0 makes `s` the layer top, so a deck is
+/// a slab of constant thickness instead of a field of domes. `cell` (the base
+/// noise's Worley channel) jitters the profile per cell, ±35 %.
+fn cumulus_envelope(f: f32, dome: f32, cell: f32, weight: f32) -> f32 {
+    let profile = pow(dome, DOME_EXPONENT) * mix(1.0 - DOME_JITTER, 1.0 + DOME_JITTER, cell);
+    let shaped = mix(CUMULUS_EDGE_HEIGHT, 1.0, clamp(profile, 0.0, 1.0));
+    let s = mix(1.0, shaped, clamp(weight, 0.0, 1.0));
+    return 1.0 - smoothstep(s * CUMULUS_TOP_ROUND, s, f);
+}
+
+/// The flat base of a cumuliform cloud: a factor on the eroded density, not on
+/// the profile the noise erodes, so no billow hangs below the condensation
+/// level.
+fn cumulus_base(f: f32) -> f32 {
+    return smoothstep(0.0, CUMULUS_BASE_RISE, f);
+}
+
+/// Weight of the billowy composite: wispy at the base, billowy above it (Nubis
+/// Evolved's `noise_height_blend`).
+fn billow_weight(f: f32) -> f32 {
+    return smoothstep(0.05, 0.25, f);
+}
+
+/// Nubis' value erosion `saturate(noise − (1 − d))`, normalised to reach 1 where
+/// the noise is 1 and raised to the edge exponent ½: 0 wherever the noise is
+/// below `1 − d`, and a cloud's core is as dense as its kind allows however
+/// thin the profile that carved it.
+fn value_erosion(noise: f32, d: f32) -> f32 {
+    if d <= 0.0 {
+        return 0.0;
+    }
+    return sqrt(clamp((noise - (1.0 - d)) / d, 0.0, 1.0));
+}
+
+/// The dimensional profile of a cumuliform cloud: the rounded envelope times the
+/// kind's height gradient times the coverage `r` times the convective cells
+/// `cell` (a coverage blob is a field of separate thermals, not one mass). The
+/// gaps close as the cover reaches 1 (`cover⁴`): an overcast sky has no holes,
+/// its billows pack into a deck.
+fn cumulus_profile(f: f32, dome: f32, r: f32, cell: f32, cover: f32, grad: vec4<f32>, dome_weight: f32) -> f32 {
+    let c2 = clamp(cover, 0.0, 1.0) * clamp(cover, 0.0, 1.0);
+    let closed = c2 * c2;
+    let gaps = mix(CORE_PROFILE * smoothstep(0.25, 0.65, cell), 1.0, closed);
+    let envelope = cumulus_envelope(f, dome, cell, dome_weight);
+    return envelope * height_gradient(f, grad) * r * gaps;
+}
+
+/// The noise composite of a cumuliform cloud from the base Perlin-Worley
+/// `shape`, the base Worley octaves `lf` and the detail Worley octaves `hf`:
+/// wispy toward the base, billowy above.
+fn noise_composite(f: f32, shape: f32, lf: f32, hf: f32) -> f32 {
+    let wispy = 0.6 * shape + 0.4 * (1.0 - hf);
+    let billowy = 0.5 * shape + 0.3 * lf + 0.2 * hf;
+    return mix(wispy, billowy, billow_weight(f));
+}
+
+/// The largest `noise_composite` any detail value gives: the coarse march's
+/// bound, so it never steps over a cloud the fine one would draw.
+fn noise_bound(f: f32, shape: f32, lf: f32) -> f32 {
+    return mix(0.6 * shape + 0.4, 0.5 * shape + 0.3 * lf + 0.2, billow_weight(f));
+}
+
+/// Base-noise coordinate of a (wind-leaned) point: the world XZ minus the drift
+/// over the tile, and the absolute altitude over the tile.
+fn base_uvw(lean: vec2<f32>, h: f32, p: CloudParams) -> vec3<f32> {
+    return vec3<f32>(
+        (lean.x - p.drift.z) / p.noise.x,
+        h / p.noise.x,
+        (lean.y - p.drift.w) / p.noise.x,
+    );
+}
+
+/// Detail-noise coordinate of a (wind-leaned) point.
+fn detail_uvw(lean: vec2<f32>, h: f32, p: CloudParams) -> vec3<f32> {
+    return vec3<f32>(
+        (lean.x - p.drift_detail.x) / p.noise.y,
+        h / p.noise.y,
+        (lean.y - p.drift_detail.y) / p.noise.y,
+    );
+}
+
+/// How much of the detail noise a fine step of `dt` metres resolves: all of it
+/// up to an eighth of the detail tile (its finest cells are a sixteenth), none
+/// past a quarter.
+fn detail_weight(dt: f32, tile: f32) -> f32 {
+    return 1.0 - smoothstep(tile / 8.0, tile / 4.0, dt);
+}
+
+/// The base-shape term, 0 outside cloud: what the coarse march samples. It is
+/// the value erosion of the largest composite the detail could give, so the
+/// coarse march never steps over a cloud the fine one would draw.
+fn coarse_shape(
+    h: f32,
+    xz: vec2<f32>,
+    p: CloudParams,
+    base_tex: texture_3d<f32>,
+    weather_tex: texture_2d<f32>,
+    smp: sampler,
+) -> f32 {
+    let h_b = p.layer.x;
+    let f = (h - h_b) / (p.layer.y - h_b);
+    if f < 0.0 || f > 1.0 {
+        return 0.0;
+    }
+    let w = textureSampleLevel(weather_tex, smp, (xz - p.weather.xy) / p.weather.z, 0.0);
+    if w.r <= 0.0 {
+        return 0.0;
+    }
+    let lean = xz - f * p.drift_detail.zw * p.noise.z;
+    let b4 = textureSampleLevel(base_tex, smp, base_uvw(lean, h, p), 0.0);
+    let lf = 0.625 * b4.g + 0.25 * b4.b + 0.125 * b4.a;
+    let shape = clamp((b4.r + 1.0 - lf) / (2.0 - lf), 0.0, 1.0);
+    let d = cumulus_profile(f, w.a, w.r, b4.g, p.layer.w, p.grad, p.shape.z);
+    // Only the sign matters to the coarse march: no division or power.
+    return max(noise_bound(f, shape, lf) - (1.0 - d), 0.0);
+}
+
+/// The extinction at a point of altitude `h` above world XZ `xz`, m⁻¹. `detail`
+/// (0–1) is how much of the detail noise the sample can resolve: 0 skips the tap
+/// (the light march), and the primary march lowers it as its step outgrows the
+/// billows, so a long step sees their mean instead of aliasing them.
+fn cloud_sigma(
+    h: f32,
+    xz: vec2<f32>,
+    detail: f32,
+    p: CloudParams,
+    base_tex: texture_3d<f32>,
+    detail_tex: texture_3d<f32>,
+    weather_tex: texture_2d<f32>,
+    smp: sampler,
+) -> f32 {
+    let h_b = p.layer.x;
+    let f = (h - h_b) / (p.layer.y - h_b);
+    if f < 0.0 || f > 1.0 {
+        return 0.0;
+    }
+    let w = textureSampleLevel(weather_tex, smp, (xz - p.weather.xy) / p.weather.z, 0.0);
+    if w.r <= 0.0 {
+        return 0.0;
+    }
+    let lean = xz - f * p.drift_detail.zw * p.noise.z;
+    let b4 = textureSampleLevel(base_tex, smp, base_uvw(lean, h, p), 0.0);
+    let lf = 0.625 * b4.g + 0.25 * b4.b + 0.125 * b4.a;
+    let base_shape = clamp((b4.r + 1.0 - lf) / (2.0 - lf), 0.0, 1.0);
+    // Without the detail tap the detail octaves take their mean.
+    var raw_hf = 0.5;
+    if detail > 0.0 {
+        let d4 = textureSampleLevel(detail_tex, smp, detail_uvw(lean, h, p), 0.0);
+        // Weighted toward the fine channels: `generate.wesl` put the 16 m cells
+        // in detail.b, and a frayed edge needs them to reach the erosion.
+        raw_hf = 0.45 * d4.r + 0.30 * d4.g + 0.25 * d4.b;
+    }
+    let hf = mix(0.5, raw_hf, detail);
+    let d = cumulus_profile(f, w.a, w.r, b4.g, p.layer.w, p.grad, p.shape.z);
+    var density = value_erosion(noise_composite(f, base_shape, lf, hf), d) * cumulus_base(f);
+    // Cloud-side erosion: the detail noise eats the edges, which is what makes
+    // a silhouette frayed instead of smooth. The wispy term is stronger at the
+    // base, where a cumulus trails.
+    if detail > 0.0 && density > 0.0 {
+        let wispy = mix(raw_hf, 1.0 - raw_hf, clamp(10.0 * f, 0.0, 1.0));
+        let lo = p.shape.y * wispy;
+        density = clamp((density - lo) / (1.0 - max(lo, 1e-4)), 0.0, 1.0);
+    }
+    return p.shape.x * density;
+}
+
+// ---------------------------------------------------------------------------
+// Shell geometry and view rays (copied from the vendored crate).
+// ---------------------------------------------------------------------------
 
 /// Altitude above the surface of the point `rel_xz` away from the camera horizontally at world
 /// height `y`, m: (r² − R²) / (r + R) with r² − R² built from small terms.
@@ -175,14 +390,18 @@ fn scene_distance(
     return dot(p.xyz / p.w / units - ray.origin, ray.dir);
 }
 
-/// Henyey–Greenstein phase function, sr⁻¹ (used by the lighting model, C2).
+// ---------------------------------------------------------------------------
+// Phase and the atmosphere lookups (copied from the vendored crate).
+// ---------------------------------------------------------------------------
+
+/// Henyey–Greenstein phase function, sr⁻¹.
 fn hg(cos_t: f32, g: f32) -> f32 {
     let g2 = g * g;
     return (1.0 - g2) / (4.0 * PI * pow(1.0 + g2 - 2.0 * g * cos_t, 1.5));
 }
 
 /// The single-scattering dual lobe: forward lobe (g = 0.8) weighted 0.7, backward lobe
-/// (g = −0.5) weighted 0.3. The backward lobe is what turns a backlit cumulus rim silver.
+/// (g = −0.5) weighted 0.3. The backward lobe is what turns a backlit rim silver.
 fn phase(cos_t: f32) -> f32 {
     return 0.7 * hg(cos_t, 0.8) + 0.3 * hg(cos_t, -0.5);
 }
@@ -219,7 +438,7 @@ fn sample_transmittance(
 /// Illuminance of the light at altitude `h` where the light makes cosine `mu` with the local
 /// vertical: outside-atmosphere illuminance × atmospheric transmittance × planet visibility.
 /// The golden hour locks the sun at ~2.6°, so this carries the dusk tint: a constant white
-/// illuminance through the LUT comes out amber (C2).
+/// illuminance through the LUT comes out amber.
 fn light_at(
     lut: texture_2d<f32>,
     smp: sampler,

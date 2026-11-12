@@ -5,6 +5,7 @@
 //! resolutions, which no parameter fixes. This plugin renders ONE golden-hour
 //! cumulus layer with its own noise and lighting model:
 //!
+//! - 8 m-per-texel noise volumes (the vendored ones are 32 m);
 //! - half-resolution march, every texel every frame (no Bayer slots);
 //! - temporal resolve by world-space shell-entry reprojection with a fresh
 //!   3×3 clamp;
@@ -22,7 +23,7 @@ mod params;
 use bevy::core_pipeline::prepass::DepthPrepass;
 use bevy::light::Atmosphere;
 use bevy::light::light_consts::lux;
-use bevy::math::{UVec2, UVec4};
+use bevy::math::{DVec2, UVec2, UVec4, Vec2, Vec4};
 use bevy::prelude::*;
 use bevy::render::RenderApp;
 use bevy::render::extract_component::ExtractComponent;
@@ -34,7 +35,7 @@ use bevy_elements::{ElementsCamera, ElementsQuality, ElementsSystems, ElementsUn
 
 use crate::plugins::sky::{CloudKind, DuskSky, resolve_clouds};
 
-use config::CloudsQuality;
+use config::{BASE_TILE_M, CloudShape, CloudsQuality, DETAIL_TILE_M, WEATHER_EXTENT_M};
 use params::CloudsParams;
 
 /// Debug overrides for the kernels, inserted by tests and manual tuning
@@ -58,9 +59,16 @@ impl CloudsDebug {
     }
 }
 
+/// The wind the cloud field drifts on: mostly along X with a little Z, at the
+/// `DuskSky`'s wind speed. [0.94, 0.34] is its unit direction.
+const WIND_DIR: DVec2 = DVec2::new(0.94, 0.34);
+
 /// Main-world state of the cloud simulation.
 #[derive(Resource, Default)]
 pub(crate) struct CloudsRuntime {
+    /// How far the field has drifted, m (f64 so a long session keeps its
+    /// precision; wrapped onto the tile before it reaches the shader).
+    drift: DVec2,
     /// Frame counter; parity selects the history ping-pong target.
     frame: u32,
     /// Frames left on which the history is flagged invalid.
@@ -70,12 +78,10 @@ pub(crate) struct CloudsRuntime {
 }
 
 /// A resolved cloud shape: the kind, its amount and any explicit layer.
-/// `drift` joins in C1 when the wind moves the field.
 type ShapeKey = (Option<CloudKind>, f32, Option<(f32, f32)>);
 
 /// The per-view images: this frame's march result and the two history
-/// textures. Created main-world, consumed render-world through the extracted
-/// [`CloudsGpu`].
+/// textures.
 #[derive(Clone, Debug)]
 pub(crate) struct CloudsViewImages {
     pub size: UVec2,
@@ -83,10 +89,20 @@ pub(crate) struct CloudsViewImages {
     pub history: [Handle<Image>; 2],
 }
 
+/// The view-independent volumes: the two noise textures. (The weather map is a
+/// render-world target — the weather kernels write it and the march reads it —
+/// so it is not a main-world asset.)
+#[derive(Clone, Debug)]
+pub(crate) struct CloudsTextures {
+    pub base: Handle<Image>,
+    pub detail: Handle<Image>,
+}
+
 /// Everything the render world needs, extracted every frame.
 #[derive(Resource, Clone, Default)]
 pub(crate) struct CloudsGpu {
     pub view: Option<CloudsViewImages>,
+    pub textures: Option<CloudsTextures>,
     pub params: CloudsParams,
     /// A followed camera with clouds (or a debug shell) present.
     pub active: bool,
@@ -115,6 +131,8 @@ pub struct CloudsPlugin;
 impl Plugin for CloudsPlugin {
     fn build(&self, app: &mut App) {
         load_shader_library!(app, "common.wesl");
+        load_shader_library!(app, "generate.wesl");
+        load_shader_library!(app, "weather.wesl");
         load_shader_library!(app, "march.wesl");
         load_shader_library!(app, "resolve.wesl");
         load_shader_library!(app, "composite.wesl");
@@ -155,9 +173,8 @@ fn mark_view(
 /// Half-precision 1.0, little-endian.
 const HALF_ONE: [u8; 2] = [0x00, 0x3C];
 
-/// A storage texture the kernels write and shaders sample with a linear
-/// sampler.
-fn texture(
+/// An RGBA8 texture the kernels write and shaders sample with a repeat sampler.
+fn volume(
     images: &mut Assets<Image>,
     size: Extent3d,
     dimension: TextureDimension,
@@ -173,10 +190,12 @@ fn texture(
     );
     image.texture_descriptor.usage =
         TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_SRC;
+    // The noise tiles wrap in every axis; the weather map wraps in XZ (the
+    // field is periodic over the window) and its third axis is unused.
     image.sampler = bevy::image::ImageSampler::Descriptor(bevy::image::ImageSamplerDescriptor {
-        address_mode_u: bevy::image::ImageAddressMode::ClampToEdge,
-        address_mode_v: bevy::image::ImageAddressMode::ClampToEdge,
-        address_mode_w: bevy::image::ImageAddressMode::ClampToEdge,
+        address_mode_u: bevy::image::ImageAddressMode::Repeat,
+        address_mode_v: bevy::image::ImageAddressMode::Repeat,
+        address_mode_w: bevy::image::ImageAddressMode::Repeat,
         mag_filter: bevy::image::ImageFilterMode::Linear,
         min_filter: bevy::image::ImageFilterMode::Linear,
         mipmap_filter: bevy::image::ImageFilterMode::Linear,
@@ -215,7 +234,7 @@ fn update_views(
     // Clear sky until the first resolve: no radiance, full transmittance.
     let clear = [0, 0, 0, 0, 0, 0, HALF_ONE[0], HALF_ONE[1]];
     let mut make = |s: UVec2| {
-        texture(
+        volume(
             &mut images,
             plane(s),
             TextureDimension::D2,
@@ -233,8 +252,37 @@ fn update_views(
     runtime.reset_frames = 2;
 }
 
+/// The volumes, created on first use so a clear sky costs no VRAM.
+fn ensure_textures(images: &mut Assets<Image>, gpu: &mut CloudsGpu) {
+    if gpu.textures.is_some() {
+        return;
+    }
+    let cube = |n: u32| Extent3d {
+        width: n,
+        height: n,
+        depth_or_array_layers: n,
+    };
+    gpu.textures = Some(CloudsTextures {
+        base: volume(
+            images,
+            cube(config::NOISE_BASE_TEXELS),
+            TextureDimension::D3,
+            TextureFormat::Rgba8Unorm,
+            &[0; 4],
+        ),
+        detail: volume(
+            images,
+            cube(config::NOISE_DETAIL_TEXELS),
+            TextureDimension::D3,
+            TextureFormat::Rgba8Unorm,
+            &[0; 4],
+        ),
+    });
+}
+
 #[allow(clippy::too_many_arguments)]
 fn update_gpu(
+    time: Res<Time>,
     sky: Res<DuskSky>,
     debug: Option<Res<CloudsDebug>>,
     sun: Option<Res<SunState>>,
@@ -242,6 +290,7 @@ fn update_gpu(
     quality: Res<ElementsQuality>,
     atmospheres: Query<&Atmosphere>,
     cameras: Query<&GlobalTransform, With<ElementsCamera>>,
+    mut images: ResMut<Assets<Image>>,
     mut runtime: ResMut<CloudsRuntime>,
     mut gpu: ResMut<CloudsGpu>,
 ) {
@@ -266,6 +315,34 @@ fn update_gpu(
         gpu.active = false;
         return;
     };
+    let active = clouds.is_some() || debug.mode > 0.0;
+    gpu.active = active;
+    if !active {
+        return;
+    }
+    ensure_textures(&mut images, &mut gpu);
+
+    // The field drifts with the wind. Wrapped onto each tile so the shader
+    // keeps its f32 precision however long the session runs.
+    if let Some(clouds) = &clouds {
+        runtime.drift += WIND_DIR * (clouds.wind * time.delta_secs()) as f64;
+    }
+    let weather_drift = DVec2::new(
+        config::wrap_drift(runtime.drift.x, WEATHER_EXTENT_M as f64) as f64,
+        config::wrap_drift(runtime.drift.y, WEATHER_EXTENT_M as f64) as f64,
+    );
+    let base_drift = DVec2::new(
+        config::wrap_drift(runtime.drift.x, BASE_TILE_M as f64) as f64,
+        config::wrap_drift(runtime.drift.y, BASE_TILE_M as f64) as f64,
+    );
+    let detail_drift = DVec2::new(
+        config::wrap_drift(runtime.drift.x, DETAIL_TILE_M as f64) as f64,
+        config::wrap_drift(runtime.drift.y, DETAIL_TILE_M as f64) as f64,
+    );
+
+    let per_metre = units.as_ref().map_or(1.0, |u| u.per_metre());
+    // The view matrices are in world units; the model is in metres.
+    let cam_m = cam / per_metre;
     let (inner, outer) = atmospheres
         .iter()
         .next()
@@ -273,16 +350,21 @@ fn update_gpu(
             (a.inner_radius, a.outer_radius)
         });
     // The sun through clear air; the golden hour locks it at ~2.6°, so the
-    // LUT tint (C2) does the dusk colouring, not this illuminance.
+    // LUT tint does the dusk colouring, not this illuminance.
     let (light, light_e) = sun.map_or((Vec3::Y, Vec3::splat(lux::RAW_SUNLIGHT)), |s| {
         (s.direction, Vec3::splat(lux::RAW_SUNLIGHT))
     });
     let (base_m, top_m) = clouds.as_ref().map_or((1500.0, 3300.0), |c| c.layer);
+    let cloud_shape = sky
+        .cloud_kind
+        .map(CloudShape::of)
+        .unwrap_or_else(|| CloudShape::of(CloudKind::ScatteredCumulus));
     let q = CloudsQuality::of(*quality);
     let low = (size + UVec2::splat(1)) / 2;
+    let origin = cam_m.xz() - Vec2::splat(0.5 * WEATHER_EXTENT_M);
 
-    gpu.active = debug.mode > 0.0 || clouds.is_some();
     gpu.params = CloudsParams {
+        // World units: `view_ray` divides by `units` itself.
         camera: cam.extend(inner),
         atmo: Vec4::new(outer, 32_000.0, 32.0, 0.0),
         layer: Vec4::new(
@@ -293,10 +375,19 @@ fn update_gpu(
         ),
         light: light.extend(0.0),
         light_e: light_e.extend(0.0),
-        // C1 wires the wind; C0 keeps the field at the camera's origin.
-        drift: Vec4::new(0.0, 0.0, 0.0, 0.0),
-        drift_detail: Vec4::new(0.0, 0.0, 0.0, 0.0),
-        weather: Vec4::new(0.0, 0.0, 16_000.0, 0.0),
+        drift: Vec4::new(
+            weather_drift.x as f32,
+            weather_drift.y as f32,
+            base_drift.x as f32,
+            base_drift.y as f32,
+        ),
+        drift_detail: Vec4::new(
+            detail_drift.x as f32,
+            detail_drift.y as f32,
+            WIND_DIR.x as f32,
+            WIND_DIR.y as f32,
+        ),
+        weather: Vec4::new(origin.x, origin.y, WEATHER_EXTENT_M, 0.0),
         counts: UVec4::new(runtime.frame, q.steps(), q.light_samples(), 0),
         sizes: UVec4::new(size.x, size.y, low.x, low.y),
         misc: Vec4::new(
@@ -305,7 +396,15 @@ fn update_gpu(
             0.0,
             if reset { 1.0 } else { 0.0 },
         ),
-        units: Vec4::new(units.as_ref().map_or(1.0, |u| u.per_metre()), 0.0, 0.0, 0.0),
+        units: Vec4::new(per_metre, 0.0, 0.0, 0.0),
+        grad: cloud_shape.gradient_vec(),
+        shape: Vec4::new(
+            cloud_shape.sigma,
+            cloud_shape.erosion,
+            cloud_shape.dome,
+            0.0,
+        ),
+        noise: Vec4::new(BASE_TILE_M, DETAIL_TILE_M, config::WIND_SKEW_M, 0.0),
     };
 }
 
@@ -313,14 +412,18 @@ fn update_gpu(
 mod tests {
     use super::*;
 
-    /// The uniform the shaders read must mirror [`params::CloudsParams`].
-    #[test]
-    fn params_mirror_wesl_struct() {
-        let common = std::fs::read_to_string(concat!(
+    fn common_wesl() -> String {
+        std::fs::read_to_string(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/src/plugins/clouds/common.wesl"
         ))
-        .expect("common.wesl");
+        .expect("common.wesl")
+    }
+
+    /// The uniform the shaders read must mirror [`params::CloudsParams`].
+    #[test]
+    fn params_mirror_wesl_struct() {
+        let common = common_wesl();
         for field in [
             "camera",
             "atmo",
@@ -334,6 +437,9 @@ mod tests {
             "sizes",
             "misc",
             "units",
+            "grad",
+            "shape",
+            "noise",
         ] {
             assert!(
                 common.contains(&format!("    {field}: ")),
@@ -349,11 +455,7 @@ mod tests {
     /// is the tripwire that catches silent drift early.
     #[test]
     fn common_wesl_carries_the_copied_math() {
-        let common = std::fs::read_to_string(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/plugins/clouds/common.wesl"
-        ))
-        .expect("common.wesl");
+        let common = common_wesl();
         for symbol in [
             "fn transmittance_uv",
             "fn light_at",
@@ -368,6 +470,30 @@ mod tests {
         }
     }
 
+    /// The WESL kernels hard-code the volume sizes the Rust side allocates;
+    /// a mismatch would read outside the texture or leave it half generated.
+    #[test]
+    fn kernel_texel_counts_match_the_allocations() {
+        let read = |name: &str| {
+            std::fs::read_to_string(format!(
+                "{}/src/plugins/clouds/{name}",
+                env!("CARGO_MANIFEST_DIR")
+            ))
+            .expect(name)
+        };
+        let generate = read("generate.wesl");
+        assert!(generate.contains(&format!(
+            "const BASE_TEXELS: u32 = {}u;",
+            config::NOISE_BASE_TEXELS
+        )));
+        assert!(generate.contains(&format!(
+            "const DETAIL_TEXELS: u32 = {}u;",
+            config::NOISE_DETAIL_TEXELS
+        )));
+        let weather = read("weather.wesl");
+        assert!(weather.contains(&format!("const TEXELS: u32 = {}u;", config::WEATHER_TEXELS)));
+    }
+
     /// A shape change must flag the history invalid so the resolve does not
     /// blend two different cloud decks.
     #[test]
@@ -376,6 +502,7 @@ mod tests {
             frame: 0,
             reset_frames: 0,
             last_shape: Some((None, 0.0, None)),
+            ..default()
         };
         let changed = Some((None, 0.5, None));
         if runtime.last_shape != changed {

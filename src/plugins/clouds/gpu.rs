@@ -2,8 +2,12 @@
 //!
 //! Adapted from the vendored bevy_elements `clouds/gpu.rs` (its helpers are
 //! `pub(crate)`), minus everything the game's model does not have: no shadow
-//! map, no sky probe, no histogram. C0 renders the debug shell only; the
-//! noise slabs and weather map arrive with C1.
+//! map, no sky probe, no precipitation.
+//!
+//! View-independent kernels (noise, weather map) run in the `RenderGraph`
+//! schedule before any camera draws; the per-view march and resolve run in
+//! `Core3d` before the opaque pass (the depth prepass and Bevy's atmosphere
+//! LUTs are ready), and the composite draws after the transparent pass.
 
 use std::borrow::Cow;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -15,21 +19,26 @@ use bevy::core_pipeline::prepass::{
 };
 use bevy::core_pipeline::schedule::camera_driver;
 use bevy::core_pipeline::{Core3d, Core3dSystems, FullscreenShader};
+use bevy::pbr::resources::AtmosphereTextures;
 use bevy::prelude::*;
 use bevy::render::diagnostic::RecordDiagnostics;
+use bevy::render::extract_component::ExtractComponentPlugin;
 use bevy::render::extract_resource::ExtractResourcePlugin;
 use bevy::render::render_asset::RenderAssets;
 use bevy::render::render_resource::binding_types::{
-    sampler, texture_2d, texture_depth_2d, texture_storage_2d, uniform_buffer,
+    sampler, storage_buffer_sized, texture_2d, texture_3d, texture_depth_2d, texture_storage_2d,
+    texture_storage_3d, uniform_buffer,
 };
 use bevy::render::render_resource::{
     AddressMode, BindGroup, BindGroupEntries, BindGroupLayoutDescriptor, BindGroupLayoutEntries,
-    BlendComponent, BlendFactor, BlendOperation, BlendState, CachedComputePipelineId,
-    CachedPipelineState, CachedRenderPipelineId, ColorTargetState, ColorWrites,
-    ComputePassDescriptor, ComputePipeline, ComputePipelineDescriptor, FilterMode, FragmentState,
-    LoadOp, MipmapFilterMode, Operations, PipelineCache, RenderPassColorAttachment,
-    RenderPassDescriptor, RenderPipelineDescriptor, Sampler, SamplerBindingType, SamplerDescriptor,
-    ShaderStages, StorageTextureAccess, StoreOp, TextureFormat, TextureSampleType, UniformBuffer,
+    BlendComponent, BlendFactor, BlendOperation, BlendState, Buffer, BufferBinding,
+    BufferDescriptor, CachedComputePipelineId, CachedPipelineState, CachedRenderPipelineId,
+    ColorTargetState, ColorWrites, ComputePassDescriptor, ComputePipeline,
+    ComputePipelineDescriptor, Extent3d, FilterMode, FragmentState, LoadOp, MipmapFilterMode,
+    Operations, PipelineCache, RenderPassColorAttachment, RenderPassDescriptor,
+    RenderPipelineDescriptor, Sampler, SamplerBindingType, SamplerDescriptor, ShaderStages,
+    StorageTextureAccess, StoreOp, TextureDescriptor, TextureDimension, TextureFormat,
+    TextureSampleType, TextureUsages, TextureView, TextureViewDescriptor, UniformBuffer,
 };
 use bevy::render::renderer::{RenderContext, RenderDevice, RenderQueue, ViewQuery};
 use bevy::render::texture::GpuImage;
@@ -37,10 +46,13 @@ use bevy::render::view::{ViewTarget, ViewUniform, ViewUniformOffset, ViewUniform
 use bevy::render::{Render, RenderApp, RenderStartup, RenderSystems};
 use bevy::shader::{Shader, ShaderCacheError, ShaderDefVal};
 
+use super::config::{NOISE_DETAIL_TEXELS, NOISE_PASSES, NOISE_SLAB, WEATHER_TEXELS};
 use super::{CloudsGpu, CloudsParams, CloudsView, CloudsViewImages};
 
 /// Workgroup edge of the 2D kernels (`@workgroup_size(8, 8, 1)`).
 const WG2: u32 = 8;
+/// Workgroup edge of the 3D kernels (`@workgroup_size(4, 4, 4)`).
+const WG3: u32 = 4;
 
 // ---------------------------------------------------------------------------
 // Kernel helper (the vendor's lives in a `pub(crate)` module).
@@ -111,15 +123,42 @@ fn groups(cells: u32, edge: u32) -> u32 {
 
 #[derive(Resource)]
 struct CloudsPipelines {
+    noise_base: Kernel,
+    noise_detail: Kernel,
+    weather_clear: Kernel,
+    weather_field: Kernel,
+    weather_threshold: Kernel,
+    weather: Kernel,
     march: Kernel,
     resolve: Kernel,
     composite: CachedRenderPipelineId,
     composite_layout: BindGroupLayoutDescriptor,
+    /// Filtering + repeat, for the noise volumes and the weather map.
+    repeat: Sampler,
+    /// Filtering + clamp, for the atmosphere LUTs and the history.
     clamp: Sampler,
+    /// The weather map's own target, and the histogram the threshold pass reads.
+    weather_target: TextureView,
+    histogram: Buffer,
+    threshold: Buffer,
 }
 
 #[derive(Resource, Default)]
 struct CloudsUniform(UniformBuffer<CloudsParams>);
+
+/// The kernels' shared bind groups. Both are static once the noise volumes are
+/// uploaded: they bind buffer and texture identities, not their contents.
+#[derive(Resource, Default)]
+struct CloudsGlobal {
+    noise: Option<BindGroup>,
+    weather: Option<BindGroup>,
+}
+
+/// How many noise slabs have been generated.
+#[derive(Resource, Default)]
+struct CloudsProgress {
+    noise_passes: u32,
+}
 
 /// Bind groups of the per-view passes, rebuilt every frame (the view uniform
 /// buffers can be re-created between frames).
@@ -133,19 +172,23 @@ struct CloudsViewGroups {
 pub(super) fn plugin(app: &mut App) {
     app.add_plugins((
         ExtractResourcePlugin::<CloudsGpu>::default(),
-        bevy::render::extract_component::ExtractComponentPlugin::<CloudsView>::default(),
+        ExtractComponentPlugin::<CloudsView>::default(),
     ));
     let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
         return;
     };
     render_app
         .init_resource::<CloudsUniform>()
+        .init_resource::<CloudsGlobal>()
+        .init_resource::<CloudsProgress>()
         .add_systems(RenderStartup, init_pipelines)
         .add_systems(
             Render,
-            prepare_global.in_set(RenderSystems::PrepareBindGroups),
+            (prepare_global, prepare_views)
+                .chain()
+                .in_set(RenderSystems::PrepareBindGroups),
         )
-        .add_systems(RenderGraph, prepare_views.before(camera_driver))
+        .add_systems(RenderGraph, dispatch_global.before(camera_driver))
         .add_systems(
             Core3d,
             (
@@ -160,7 +203,6 @@ pub(super) fn plugin(app: &mut App) {
         );
 }
 
-#[allow(clippy::too_many_arguments)]
 fn init_pipelines(
     mut commands: Commands,
     assets: Res<AssetServer>,
@@ -170,6 +212,30 @@ fn init_pipelines(
 ) {
     let write = StorageTextureAccess::WriteOnly;
     let compute = ShaderStages::COMPUTE;
+
+    let noise_layout = BindGroupLayoutDescriptor::new(
+        "no_one_clouds_noise",
+        &BindGroupLayoutEntries::sequential(
+            compute,
+            (
+                uniform_buffer::<CloudsParams>(false),
+                texture_storage_3d(TextureFormat::Rgba8Unorm, write),
+                texture_storage_3d(TextureFormat::Rgba8Unorm, write),
+            ),
+        ),
+    );
+    let weather_layout = BindGroupLayoutDescriptor::new(
+        "no_one_clouds_weather",
+        &BindGroupLayoutEntries::sequential(
+            compute,
+            (
+                uniform_buffer::<CloudsParams>(false),
+                storage_buffer_sized(false, None),
+                storage_buffer_sized(false, None),
+                texture_storage_2d(TextureFormat::Rgba8Unorm, write),
+            ),
+        ),
+    );
     let march_layout = BindGroupLayoutDescriptor::new(
         "no_one_clouds_march",
         &BindGroupLayoutEntries::sequential(
@@ -177,7 +243,13 @@ fn init_pipelines(
             (
                 uniform_buffer::<ViewUniform>(true),
                 uniform_buffer::<CloudsParams>(false),
+                texture_3d(TextureSampleType::Float { filterable: true }),
+                texture_3d(TextureSampleType::Float { filterable: true }),
+                texture_2d(TextureSampleType::Float { filterable: true }),
+                texture_2d(TextureSampleType::Float { filterable: true }),
                 texture_depth_2d(),
+                sampler(SamplerBindingType::Filtering),
+                sampler(SamplerBindingType::Filtering),
                 texture_storage_2d(TextureFormat::Rgba16Float, write),
             ),
         ),
@@ -213,6 +285,8 @@ fn init_pipelines(
     let kernel = |file: Handle<Shader>, entry: &'static str, layout: &BindGroupLayoutDescriptor| {
         queue_kernel(&cache, file, entry, layout.clone(), Vec::new())
     };
+    let generate = load_embedded_asset!(assets.as_ref(), "generate.wesl");
+    let weather = load_embedded_asset!(assets.as_ref(), "weather.wesl");
     let march = load_embedded_asset!(assets.as_ref(), "march.wesl");
     let resolve = load_embedded_asset!(assets.as_ref(), "resolve.wesl");
     let composite_shader = load_embedded_asset!(assets.as_ref(), "composite.wesl");
@@ -249,36 +323,124 @@ fn init_pipelines(
         ..default()
     });
 
-    let clamp = device.create_sampler(&SamplerDescriptor {
-        address_mode_u: AddressMode::ClampToEdge,
-        address_mode_v: AddressMode::ClampToEdge,
-        address_mode_w: AddressMode::ClampToEdge,
-        mag_filter: FilterMode::Linear,
-        min_filter: FilterMode::Linear,
-        mipmap_filter: MipmapFilterMode::Linear,
-        ..default()
+    let sampler = |address: AddressMode| {
+        device.create_sampler(&SamplerDescriptor {
+            address_mode_u: address,
+            address_mode_v: address,
+            address_mode_w: address,
+            mag_filter: FilterMode::Linear,
+            min_filter: FilterMode::Linear,
+            mipmap_filter: MipmapFilterMode::Linear,
+            ..default()
+        })
+    };
+
+    let weather_texture = device.create_texture(&TextureDescriptor {
+        label: Some("no_one_clouds_weather"),
+        size: Extent3d {
+            width: WEATHER_TEXELS,
+            height: WEATHER_TEXELS,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: TextureDimension::D2,
+        format: TextureFormat::Rgba8Unorm,
+        usage: TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
     });
+    let weather_target = weather_texture.create_view(&TextureViewDescriptor::default());
+    // 256 bins of u32, and the single threshold they reduce to (the space of 4
+    // is the vendored layout, kept so the WESL array sizes match).
+    let histogram = device.create_buffer(&BufferDescriptor {
+        label: Some("no_one_clouds_histogram"),
+        size: 256 * 4,
+        usage: bevy::render::render_resource::BufferUsages::STORAGE
+            | bevy::render::render_resource::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let threshold = device.create_buffer(&BufferDescriptor {
+        label: Some("no_one_clouds_threshold"),
+        size: 4 * 4,
+        usage: bevy::render::render_resource::BufferUsages::STORAGE
+            | bevy::render::render_resource::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
     commands.insert_resource(CloudsPipelines {
+        noise_base: kernel(generate.clone(), "cloud_noise_base", &noise_layout),
+        noise_detail: kernel(generate.clone(), "cloud_noise_detail", &noise_layout),
+        weather_clear: kernel(weather.clone(), "cloud_histogram_clear", &weather_layout),
+        weather_field: kernel(weather.clone(), "cloud_field", &weather_layout),
+        weather_threshold: kernel(weather.clone(), "cloud_threshold", &weather_layout),
+        weather: kernel(weather.clone(), "cloud_weather", &weather_layout),
         march: kernel(march, "clouds_march", &march_layout),
         resolve: kernel(resolve, "clouds_resolve", &resolve_layout),
         composite,
         composite_layout,
-        clamp,
+        repeat: sampler(AddressMode::Repeat),
+        clamp: sampler(AddressMode::ClampToEdge),
+        weather_target,
+        histogram,
+        threshold,
     });
 }
 
-/// Write the uniform buffer the per-view bind groups reference.
+/// Write the uniform buffer the bind groups reference, then build the shared
+/// bind groups once their textures are uploaded.
+#[allow(clippy::too_many_arguments)]
 fn prepare_global(
     mut cloud: Option<ResMut<CloudsGpu>>,
+    pipelines: Option<Res<CloudsPipelines>>,
     mut uniform: ResMut<CloudsUniform>,
+    mut global: ResMut<CloudsGlobal>,
+    progress: Res<CloudsProgress>,
+    images: Res<RenderAssets<GpuImage>>,
     device: Res<RenderDevice>,
     queue: Res<RenderQueue>,
+    cache: Res<PipelineCache>,
 ) {
-    let Some(cloud) = cloud.as_mut() else {
+    let (Some(cloud), Some(pipelines)) = (cloud.as_mut(), pipelines) else {
         return;
     };
-    uniform.0.set(cloud.params);
+    // The noise kernels read the slab's first slice from the uniform; the
+    // weather pass ignores it.
+    let mut params = cloud.params;
+    params.counts.w = progress.noise_passes.min(NOISE_PASSES) * NOISE_SLAB;
+    uniform.0.set(params);
     uniform.0.write_buffer(&device, &queue);
+
+    if global.noise.is_none()
+        && let Some(textures) = cloud.textures.as_ref()
+        && let (Some(base), Some(detail)) =
+            (images.get(&textures.base), images.get(&textures.detail))
+    {
+        global.noise = Some(device.create_bind_group(
+            "no_one_clouds_noise",
+            &cache.get_bind_group_layout(&pipelines.noise_base.layout),
+            &BindGroupEntries::sequential((&uniform.0, &base.texture_view, &detail.texture_view)),
+        ));
+    }
+    if global.weather.is_none() {
+        global.weather = Some(device.create_bind_group(
+            "no_one_clouds_weather",
+            &cache.get_bind_group_layout(&pipelines.weather_field.layout),
+            &BindGroupEntries::sequential((
+                &uniform.0,
+                BufferBinding {
+                    buffer: &pipelines.histogram,
+                    offset: 0,
+                    size: None,
+                },
+                BufferBinding {
+                    buffer: &pipelines.threshold,
+                    offset: 0,
+                    size: None,
+                },
+                &pipelines.weather_target,
+            )),
+        ));
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -292,18 +454,30 @@ fn prepare_views(
     images: Res<RenderAssets<GpuImage>>,
     cache: Res<PipelineCache>,
     device: Res<RenderDevice>,
-    views: Query<(Entity, &ViewPrepassTextures, &Msaa), With<CloudsView>>,
+    views: Query<
+        (
+            Entity,
+            &ViewPrepassTextures,
+            &Msaa,
+            Option<&AtmosphereTextures>,
+        ),
+        With<CloudsView>,
+    >,
 ) {
     let (Some(cloud), Some(pipelines)) = (cloud, pipelines) else {
         return;
     };
-    let Some(view_images) = cloud.view.as_ref() else {
+    let (Some(view_images), Some(textures)) = (cloud.view.as_ref(), cloud.textures.as_ref()) else {
         return;
     };
     let (Some(view_binding), Some(previous_binding)) = (
         view_uniforms.uniforms.binding(),
         previous_uniforms.uniforms.binding(),
     ) else {
+        return;
+    };
+    let (Some(base), Some(detail)) = (images.get(&textures.base), images.get(&textures.detail))
+    else {
         return;
     };
     let CloudsViewImages { march, history, .. } = view_images;
@@ -321,11 +495,14 @@ fn prepare_views(
     } else {
         (history_b, history_a)
     };
-    for (entity, prepass, msaa) in &views {
+    for (entity, prepass, msaa, atmosphere) in &views {
         // The layouts bind a single-sampled depth and the composite writes the
         // main texture without a resolve: a camera that kept its MSAA
-        // (`ElementsCamera::msaa_off` off) is skipped.
+        // (`ElementsCamera` sets it off) is skipped.
         let Some(depth) = prepass.depth_only_view().filter(|_| *msaa == Msaa::Off) else {
+            continue;
+        };
+        let Some(atmosphere) = atmosphere else {
             continue;
         };
         let march_group = device.create_bind_group(
@@ -334,7 +511,15 @@ fn prepare_views(
             &BindGroupEntries::sequential((
                 view_binding.clone(),
                 &uniform.0,
+                &base.texture_view,
+                &detail.texture_view,
+                // The weather map is a render-world target, written by the
+                // weather kernels every frame.
+                &pipelines.weather_target,
+                &atmosphere.transmittance_lut.default_view,
                 depth,
+                &pipelines.repeat,
+                &pipelines.clamp,
                 &march.texture_view,
             )),
         );
@@ -369,17 +554,107 @@ fn prepare_views(
     }
 }
 
+/// Generate the noise volumes, one z slab per frame, then the weather map every
+/// frame. Runs before any camera draws.
+fn dispatch_global(
+    mut ctx: RenderContext,
+    cache: Res<PipelineCache>,
+    cloud: Option<Res<CloudsGpu>>,
+    pipelines: Option<Res<CloudsPipelines>>,
+    global: Option<Res<CloudsGlobal>>,
+    mut progress: ResMut<CloudsProgress>,
+) {
+    let (Some(cloud), Some(pipelines), Some(global)) = (cloud, pipelines, global) else {
+        return;
+    };
+    if !cloud.active {
+        return;
+    }
+    let diagnostics = ctx.diagnostic_recorder();
+    let diagnostics = diagnostics.as_deref();
+
+    if progress.noise_passes < NOISE_PASSES {
+        let Some(noise) = global.noise.as_ref() else {
+            return;
+        };
+        let (Some(base), Some(detail)) = (
+            ready(&cache, &pipelines.noise_base),
+            ready(&cache, &pipelines.noise_detail),
+        ) else {
+            return;
+        };
+        let mut pass = ctx
+            .command_encoder()
+            .begin_compute_pass(&ComputePassDescriptor {
+                label: Some("no_one_clouds_noise"),
+                ..default()
+            });
+        let span = diagnostics.pass_span(&mut pass, "no_one_clouds_noise");
+        pass.set_bind_group(0, noise, &[]);
+        pass.set_pipeline(base);
+        pass.dispatch_workgroups(
+            groups(super::config::NOISE_BASE_TEXELS, WG3),
+            groups(super::config::NOISE_BASE_TEXELS, WG3),
+            groups(NOISE_SLAB, WG3),
+        );
+        if progress.noise_passes == 0 {
+            pass.set_pipeline(detail);
+            let n = groups(NOISE_DETAIL_TEXELS, WG3);
+            pass.dispatch_workgroups(n, n, n);
+        }
+        span.end(&mut pass);
+        progress.noise_passes += 1;
+        return;
+    }
+
+    let Some(weather) = global.weather.as_ref() else {
+        return;
+    };
+    let (Some(clear), Some(field), Some(threshold), Some(weather_pass)) = (
+        ready(&cache, &pipelines.weather_clear),
+        ready(&cache, &pipelines.weather_field),
+        ready(&cache, &pipelines.weather_threshold),
+        ready(&cache, &pipelines.weather),
+    ) else {
+        return;
+    };
+    let mut pass = ctx
+        .command_encoder()
+        .begin_compute_pass(&ComputePassDescriptor {
+            label: Some("no_one_clouds_weather"),
+            ..default()
+        });
+    let span = diagnostics.pass_span(&mut pass, "no_one_clouds_weather");
+    pass.set_bind_group(0, weather, &[]);
+    let n = groups(WEATHER_TEXELS, WG2);
+    pass.set_pipeline(clear);
+    pass.dispatch_workgroups(1, 1, 1);
+    pass.set_pipeline(field);
+    pass.dispatch_workgroups(n, n, 1);
+    pass.set_pipeline(threshold);
+    pass.dispatch_workgroups(1, 1, 1);
+    pass.set_pipeline(weather_pass);
+    pass.dispatch_workgroups(n, n, 1);
+    span.end(&mut pass);
+}
+
+fn noise_ready(progress: &CloudsProgress) -> bool {
+    progress.noise_passes >= NOISE_PASSES
+}
+
 fn clouds_march(
     view: ViewQuery<(&ViewUniformOffset, &CloudsViewGroups)>,
     cloud: Option<Res<CloudsGpu>>,
     pipelines: Option<Res<CloudsPipelines>>,
+    progress: Res<CloudsProgress>,
     cache: Res<PipelineCache>,
     mut ctx: RenderContext,
 ) {
     let (Some(cloud), Some(pipelines)) = (cloud, pipelines) else {
         return;
     };
-    if !cloud.active {
+    // The debug shell needs no noise, so the C0 check still runs at startup.
+    if !cloud.active || (!noise_ready(&progress) && cloud.params.misc.x < 0.5) {
         return;
     }
     let (offset, bind) = view.into_inner();
