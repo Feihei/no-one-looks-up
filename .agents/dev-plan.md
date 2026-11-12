@@ -538,7 +538,7 @@ Feihei 验收：**「好了一些，但还是不太自然。体积云就到此�
 
 - [x] 6.0（C0）接管与管线骨架：sky.rs disable CloudPlugin + 删 `apply_cloud_layer_override` + DepthPrepass 观察器；clouds 模块（mod/params/config/gpu.rs）注册进 GamePlugins；游戏侧 WESL import spike 通过（crate 的 `bevy_elements::noise` 可 import；游戏 crate 库名 `no_one_looks_up::plugins::clouds::*`）；自写 kernel 排队辅助（vendor 的 `pub(crate)` 不可用）；debug 均匀壳层全链（march→resolve→composite）GPU 冒烟通过；单测（params 镜像/拷贝数学 tripwire/重置触发）
 - [x] 6.1（C1）噪声与形状：generate 256³ 8-slab + detail 64³、weather 256²/16km（GPU 直方图求阈值，覆盖率精确等于 cover）、密度模型（梯度四元组 × dome 包络 × coverage × 对流胞 gaps × 双段 erosion × 风切变）、march 接真密度（coarse/fine 双模跳步）；GPU 截图断言结构化天空通过
-- [ ] 6.2（C2）黄昏光照：transmittance LUT 太阳色 + Hillaire 三 octave 多重散射 + 双瓣 HG + Beer-powder、环境 cube 环境光（16 采样）、aerial perspective + far veil
+- [x] 6.2（C2）黄昏光照：transmittance LUT 太阳色 + Hillaire 三 octave 多重散射 + 双瓣 HG + Beer-powder、环境 cube 环境光（16 采样）、aerial perspective + far veil；向阳/背阳两张 GPU 截图断言通过（暖银边 R/B≈2.2、背阳整帧偏蓝）
 - [ ] 6.3（C3）时域稳健性与遮挡：重投影 clamp 硬化（reset 全触发）、深度遮挡、曝光扰动下 history 不脏、步行+转头实机验收无拖影无闪烁
 - [ ] 6.4（C4）性能与档位：`CloudsQuality::of(ElementsQuality)` 映射、RenderDiagnostics 五段 span、实机 1080p 30fps+、DX12/Vulkan 双后端核验
 - [ ] 6.5（C5）验收与文档：五 kind 参数终调（F5 逐一切换人工验收）、`tests/clouds_screenshot.rs` 断言定稿、新增 `.agents/adr-0007-clouds-rework.md`、更新 adr-0003/AGENTS 状态表
@@ -559,6 +559,16 @@ Feihei 验收：**「好了一些，但还是不太自然。体积云就到此�
 - C1 光照只是单次散射 + 占位环境项（`light_e × 0.02`）；云底在低太阳下偏暗是预期，C2 的 Hillaire 三 octave 多重散射负责抬亮
 - 每 kind 形状参数在 `config.rs::CloudShape`（gradient/sigma/dome/erosion），纯函数可测；漂移按各自 tile 周期 `wrap_drift`（bit-exact 单测）
 - GPU 冒烟新增 `cumulus_renders_a_structured_sky`：无 NaN / 相对标准差 > 0.15（非平板）/ p99 > 1.5×median（有受光云顶）/ 最亮 1% 区域 R>B（暖色）
+
+### C2 技术纪要（2026-11-12）
+
+- 光照链：`light_at`（Bevy transmittance LUT，给太阳染黄昏色）× `powder·e^(−τ_l)·phase` + `multi_scatter`（Hillaire 三 octave，a/b/c = 0.4/0.4/0.7 逐次幂）+ 环境光；`phase` 为双瓣 HG（0.7·HG(0.8)+0.3·HG(−0.5)）
+- **环境光取 Bevy 的 `GeneratedEnvironmentMapLight.environment_map`**（6 层 D2 带 Cube view，`AtmosphereEnvironmentMapLight` 每帧重算），march 里 16 个上半球 Fibonacci 采样。**必须余弦加权**（`E/π = 2/N·Σ cosθ·L`）：均匀权重会被贴地的高亮地平线带主导，云体亮得像白天（实测 1210 vs 余弦加权 984，且暗部会偏亮）
+- **`finish_ray` 的输出 alpha 是 transmittance，不是 coverage**：composite 的 blend 是 `src.rgb + dst.rgb·src.a`（`dst_factor = SrcAlpha`）。曾写成 `(1−T)`，导致晴朗天空被云的不透明度乘成近黑（"天空发黑"的真正原因）
+- aerial perspective 用 Bevy 的 aerial-view LUT（`atmo.y` 32 km / `atmo.z` 32 slices）+ `air_transmittance` 反转射线求相机到点的空气透射；far veil 在 12 km 后按 cover 补一层，避免 marching 上限处出现硬边
+- 实测：晴天黄昏 `E/π ≈ 984 nits`，云体 1000–1700 nits，向阳面（低太阳 2.7°、视线 45° 仰角，cosθ≈0.74 前向散射）最亮 1% R/B ≈ 2.2 → 银边/内透橙光成立；背阳整帧 B/R ≈ 1.6
+- 调参入口 `CloudsParams.tuning`（x 环境光 / y aerial / z powder / w 多重散射，默认 1）——adr-0007 的"人眼微调"不需要改 shader
+- GPU 冒烟改两张：向阳 `cumulus_renders_a_structured_sky`（暖银边）、背阳 `cumulus_backlit_is_sky_blue`（整帧偏蓝）；相机 `aim()` 按 `SunState` 方位角对光，俯仰 45°（保证所有射线都进壳层）
 
 ---
 
@@ -591,7 +601,7 @@ R3.14 灯头绘制距离    [██████████] 实现完成（灯�
 R3.15 环路外景物带    [██████████] 实现完成（带内建筑行+角树丛/檐底封闭/长灯臂两段/棚架宽度随机，2026-11-11，待实机验收）
 R3.16 抗锯齿 / TAA    [████████░░] 接入完成 + 立面采样器修线性 mip（2026-11-11，快门 ≈6 ms，待实机验收）
 R5.1-5 天空调参+云    [████████░░] 面板/云种/sky_gain/dome 完成；云边缘块状属已知边界（2026-10-27 收尾）
-R6: 自研体积云        [███░░░░░░░] 6.0 骨架 + 6.1 噪声/形状完成（2026-11-12）
+R6: 自研体积云        [█████░░░░░] 6.2 黄昏光照完成（2026-11-12）
 ```
 
 ### R3.11 屋顶轮廓（2026-10-31，步骤 11.3）
