@@ -26,8 +26,8 @@ use bevy::render::extract_component::ExtractComponentPlugin;
 use bevy::render::extract_resource::ExtractResourcePlugin;
 use bevy::render::render_asset::RenderAssets;
 use bevy::render::render_resource::binding_types::{
-    sampler, storage_buffer_sized, texture_2d, texture_3d, texture_depth_2d, texture_storage_2d,
-    texture_storage_3d, uniform_buffer,
+    sampler, storage_buffer_sized, texture_2d, texture_3d, texture_cube, texture_depth_2d,
+    texture_storage_2d, texture_storage_3d, uniform_buffer,
 };
 use bevy::render::render_resource::{
     AddressMode, BindGroup, BindGroupEntries, BindGroupLayoutDescriptor, BindGroupLayoutEntries,
@@ -141,6 +141,9 @@ struct CloudsPipelines {
     weather_target: TextureView,
     histogram: Buffer,
     threshold: Buffer,
+    /// A zero-filled cube bound when the camera has no environment map yet
+    /// (the march then falls back to a sun-derived ambient luminance).
+    empty_cube: TextureView,
 }
 
 #[derive(Resource, Default)]
@@ -247,6 +250,8 @@ fn init_pipelines(
                 texture_3d(TextureSampleType::Float { filterable: true }),
                 texture_2d(TextureSampleType::Float { filterable: true }),
                 texture_2d(TextureSampleType::Float { filterable: true }),
+                texture_3d(TextureSampleType::Float { filterable: true }),
+                texture_cube(TextureSampleType::Float { filterable: true }),
                 texture_depth_2d(),
                 sampler(SamplerBindingType::Filtering),
                 sampler(SamplerBindingType::Filtering),
@@ -350,6 +355,24 @@ fn init_pipelines(
         view_formats: &[],
     });
     let weather_target = weather_texture.create_view(&TextureViewDescriptor::default());
+    let empty_cube_texture = device.create_texture(&TextureDescriptor {
+        label: Some("no_one_clouds_empty_cube"),
+        size: Extent3d {
+            width: 1,
+            height: 1,
+            depth_or_array_layers: 6,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: TextureDimension::D2,
+        format: TextureFormat::Rgba16Float,
+        usage: TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let empty_cube = empty_cube_texture.create_view(&TextureViewDescriptor {
+        dimension: Some(bevy::render::render_resource::TextureViewDimension::Cube),
+        ..default()
+    });
     // 256 bins of u32, and the single threshold they reduce to (the space of 4
     // is the vendored layout, kept so the WESL array sizes match).
     let histogram = device.create_buffer(&BufferDescriptor {
@@ -383,6 +406,7 @@ fn init_pipelines(
         weather_target,
         histogram,
         threshold,
+        empty_cube,
     });
 }
 
@@ -495,6 +519,13 @@ fn prepare_views(
     } else {
         (history_b, history_a)
     };
+    // The camera's atmosphere environment map, or the empty cube until Bevy has
+    // generated it (the march then uses its sun-derived ambient floor).
+    let env_view = cloud
+        .env_map
+        .as_ref()
+        .and_then(|handle| images.get(handle))
+        .map_or(&pipelines.empty_cube, |image| &image.texture_view);
     for (entity, prepass, msaa, atmosphere) in &views {
         // The layouts bind a single-sampled depth and the composite writes the
         // main texture without a resolve: a camera that kept its MSAA
@@ -517,6 +548,8 @@ fn prepare_views(
                 // weather kernels every frame.
                 &pipelines.weather_target,
                 &atmosphere.transmittance_lut.default_view,
+                &atmosphere.aerial_view_lut.default_view,
+                env_view,
                 depth,
                 &pipelines.repeat,
                 &pipelines.clamp,

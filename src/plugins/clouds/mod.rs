@@ -103,6 +103,10 @@ pub(crate) struct CloudsTextures {
 pub(crate) struct CloudsGpu {
     pub view: Option<CloudsViewImages>,
     pub textures: Option<CloudsTextures>,
+    /// Bevy's atmosphere environment map, averaged over the upper hemisphere by
+    /// the march for the cloud's ambient. `None` (or not yet uploaded) falls
+    /// back to a neutral sky cube.
+    pub env_map: Option<Handle<Image>>,
     pub params: CloudsParams,
     /// A followed camera with clouds (or a debug shell) present.
     pub active: bool,
@@ -289,6 +293,7 @@ fn update_gpu(
     units: Option<Res<ElementsUnits>>,
     quality: Res<ElementsQuality>,
     atmospheres: Query<&Atmosphere>,
+    envs: Query<&bevy::light::GeneratedEnvironmentMapLight, With<ElementsCamera>>,
     cameras: Query<&GlobalTransform, With<ElementsCamera>>,
     mut images: ResMut<Assets<Image>>,
     mut runtime: ResMut<CloudsRuntime>,
@@ -321,6 +326,13 @@ fn update_gpu(
         return;
     }
     ensure_textures(&mut images, &mut gpu);
+    // Bevy regenerates this cube from the atmosphere every frame; the march
+    // averages it over the upper hemisphere for the ambient.
+    gpu.env_map = envs
+        .iter()
+        .next()
+        .map(|env| env.environment_map.clone())
+        .filter(|handle| *handle != Handle::default());
 
     // The field drifts with the wind. Wrapped onto each tile so the shader
     // keeps its f32 precision however long the session runs.
@@ -405,6 +417,7 @@ fn update_gpu(
             0.0,
         ),
         noise: Vec4::new(BASE_TILE_M, DETAIL_TILE_M, config::WIND_SKEW_M, 0.0),
+        tuning: Vec4::ONE,
     };
 }
 

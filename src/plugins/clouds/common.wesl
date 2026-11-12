@@ -59,6 +59,9 @@ struct CloudParams {
     /// x: base noise tile, m. y: detail noise tile, m. z: wind skew per unit height, m.
     /// w: unused.
     noise: vec4<f32>,
+    /// x: ambient brightness fuse (1 neutral). y: aerial in-scatter fuse (1 neutral).
+    /// z: powder strength (1 neutral). w: multiple-scattering strength (1 neutral).
+    tuning: vec4<f32>,
 }
 
 const PI: f32 = 3.14159265358979;
@@ -404,6 +407,93 @@ fn hg(cos_t: f32, g: f32) -> f32 {
 /// (g = −0.5) weighted 0.3. The backward lobe is what turns a backlit rim silver.
 fn phase(cos_t: f32) -> f32 {
     return 0.7 * hg(cos_t, 0.8) + 0.3 * hg(cos_t, -0.5);
+}
+
+/// The dual lobe with the forward lobe's anisotropy set to `g` (the multiple-scattering
+/// octaves narrow it).
+fn dual_phase(cos_t: f32, g: f32) -> f32 {
+    return 0.7 * hg(cos_t, g) + 0.3 * hg(cos_t, -0.5);
+}
+
+// Hillaire's analytic multiple-scattering octaves (2020, "A Physically Based Sky, Atmosphere
+// and Cloud Rendering"): the light that has bounced off the cloud twice or more, as a sum of
+// three attenuated, phase-shifted copies of the single-scattering answer. It costs no extra
+// samples — only the light optical depth, which single scattering already paid for.
+const MS_A: f32 = 0.4;
+const MS_B: f32 = 0.4;
+const MS_C: f32 = 0.7;
+
+/// Light scattered more than once, relative to the incident sun: three octaves, each down by
+/// `MS_A` in amplitude, `MS_B` in optical depth and `MS_C` in forward anisotropy. This is what
+/// keeps a dusk cloud from going black — at 2.6° of sun elevation a single scatter only
+/// reaches the tops, while the bounced light fills the body and gives it its internal glow.
+fn multi_scatter(tau_l: f32, cos_t: f32, strength: f32) -> f32 {
+    var a = MS_A;
+    var b = MS_B;
+    var c = MS_C;
+    var sum = 0.0;
+    for (var octave = 0; octave < 3; octave += 1) {
+        sum += a * exp(-tau_l * b) * dual_phase(cos_t, 0.8 * c);
+        a *= MS_A;
+        b *= MS_B;
+        c *= MS_C;
+    }
+    return sum * strength;
+}
+
+/// The ambient source of luminance `s` in the colour of the sky's irradiance `sky_e`.
+fn ambient_light(sky_e: vec3<f32>, s: f32) -> vec3<f32> {
+    let lum = dot(sky_e, vec3<f32>(0.2126, 0.7152, 0.0722));
+    if !(lum > 1e-12) {
+        return vec3<f32>(s);
+    }
+    return sky_e * (s / lum);
+}
+
+/// Transmittance of the air from the camera at radius `o_r` to `depth` along `dir`.
+///
+/// The LUT holds the transmittance to the top of the atmosphere, which a descending ray never
+/// reaches (it meets the ground): the air between two points is then taken along the reversed
+/// ray, which leaves the atmosphere through the camera (Bruneton's `GetTransmittance`).
+fn air_transmittance(
+    dir: vec3<f32>,
+    depth: f32,
+    o_r: f32,
+    lut: texture_2d<f32>,
+    smp: sampler,
+    p: CloudParams,
+) -> vec3<f32> {
+    let r_d = sqrt(max(o_r * o_r + 2.0 * o_r * depth * dir.y + depth * depth, 1.0));
+    let mu_d = (o_r * dir.y + depth) / r_d;
+    if dir.y < 0.0 {
+        let t_from_far = sample_transmittance(lut, smp, r_d, -mu_d, p);
+        let t_from_cam = sample_transmittance(lut, smp, o_r, -dir.y, p);
+        return min(t_from_far / max(t_from_cam, vec3<f32>(1e-6)), vec3<f32>(1.0));
+    }
+    let t_cam = sample_transmittance(lut, smp, o_r, dir.y, p);
+    let t_far = sample_transmittance(lut, smp, r_d, mu_d, p);
+    return min(t_cam / max(t_far, vec3<f32>(1e-6)), vec3<f32>(1.0));
+}
+
+/// The air's in-scatter along the screen position `uv` to `depth`, luminance: Bevy's
+/// aerial-view LUT holds the beam's in-scatter (the sun light that carries only the cloud's
+/// beam), and the rest is the air lit by the cloud-scattered diffuse light, `(1 − T) · L` for
+/// the uniform sky radiance `L`.
+fn aerial_in_scatter(
+    uv: vec2<f32>,
+    depth: f32,
+    t_ap: vec3<f32>,
+    lut: texture_3d<f32>,
+    smp: sampler,
+    p: CloudParams,
+    radiance: vec3<f32>,
+) -> vec3<f32> {
+    let slices = p.atmo.z;
+    let range = p.atmo.y;
+    let slice = clamp(depth / range - 0.5 / slices, 0.0, 1.0);
+    let lut_value = textureSampleLevel(lut, smp, vec3<f32>(uv, slice), 0.0);
+    let beam = exp(lut_value.rgb) * clamp(depth / (range / slices), 0.0, 1.0);
+    return (beam + (vec3<f32>(1.0) - t_ap) * radiance) * p.tuning.y;
 }
 
 /// Visibility of the light from a point of altitude `h` whose local vertical makes cosine `mu`

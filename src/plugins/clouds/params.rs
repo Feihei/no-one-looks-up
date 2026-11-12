@@ -46,6 +46,11 @@ pub struct CloudsParams {
     /// x: base noise tile, m. y: detail noise tile, m. z: wind skew per unit height, m.
     /// w: unused.
     pub noise: Vec4,
+    /// x: ambient brightness fuse (1 neutral). y: aerial in-scatter fuse (1 neutral).
+    /// z: powder strength (1 neutral). w: multiple-scattering strength (1 neutral).
+    /// The two fuses exist to retune the cloud against the sky by eye without a rebuild
+    /// (adr-0007); they start at 1.
+    pub tuning: Vec4,
 }
 
 #[cfg(test)]
@@ -56,6 +61,6 @@ mod tests {
     fn every_field_is_one_vec4_of_the_same_width() {
         // The WESL mirror relies on every field being 16 bytes: all-vec4
         // structs need no alignment or padding logic, in either language.
-        assert_eq!(size_of::<CloudsParams>(), 16 * 15);
+        assert_eq!(size_of::<CloudsParams>(), 16 * 16);
     }
 }

@@ -3,11 +3,13 @@
 //! - `debug_shell_renders_through_the_chain` (C0): a uniform, jittered shell
 //!   through march → temporal resolve → composite proves the whole pipeline
 //!   runs and the reprojection does not smear the per-texel jitter away.
-//! - `cumulus_renders_a_structured_sky` (C1): the real noise volumes and
-//!   density model produce a sky with structure — bright lit tops over a
-//!   darker dusk sky, no NaN, no flat plate.
+//! - `cumulus_renders_a_structured_sky` (C1/C2): the real noise volumes and
+//!   density model give a structured cumulus whose sunward edges are the
+//!   warmest pixels — the silver lining and the inner glow.
+//! - `cumulus_backlit_is_sky_blue` (C2): with the sun behind the camera the
+//!   frame turns blue: the cloud's shadow side is lit by the dusk sky.
 //!
-//! Both need a real GPU (atmosphere and cloud compute pipelines). They are
+//! All need a real GPU (atmosphere and cloud compute pipelines). They are
 //! `#[ignore]`d: run locally with
 //! `cargo test --test clouds_screenshot -- --ignored --nocapture`.
 
@@ -28,7 +30,7 @@ use bevy::prelude::*;
 use bevy::render::RenderPlugin;
 use bevy::render::render_resource::TextureFormat;
 use bevy::render::view::screenshot::{Screenshot, ScreenshotCaptured};
-use bevy_elements::ElementsCamera;
+use bevy_elements::{ElementsCamera, SunState};
 
 use no_one_looks_up::plugins::GamePlugins;
 use no_one_looks_up::plugins::clouds::CloudsDebug;
@@ -117,6 +119,22 @@ fn harness(sky: DuskSky, debug: Option<CloudsDebug>) -> (App, Handle<Image>) {
         )),
     ));
     (app, target)
+}
+
+/// Aims the test camera `offset_deg` around the vertical from the sun's
+/// azimuth, still pitched 45° up. The sky must have resolved the sun first.
+fn aim(app: &mut App, offset_deg: f32) {
+    app.update();
+    let sun = app.world().resource::<SunState>().direction;
+    let yaw = f32::atan2(-sun.x, -sun.z) + offset_deg.to_radians();
+    let entity = {
+        let world = app.world_mut();
+        let mut query = world.query_filtered::<Entity, With<ElementsCamera>>();
+        query.single(world).expect("one test camera")
+    };
+    if let Some(mut transform) = app.world_mut().get_mut::<Transform>(entity) {
+        transform.rotation = Quat::from_euler(EulerRot::YXZ, yaw, 45f32.to_radians(), 0.0);
+    }
 }
 
 /// Runs until `frame`, requests the capture, then runs until it lands.
@@ -225,14 +243,15 @@ fn debug_shell_renders_through_the_chain() {
 fn cumulus_renders_a_structured_sky() {
     let sky = DuskSky {
         cloud_kind: Some(CloudKind::BrokenCumulus),
-        cloud_amount: 1.0,
+        cloud_amount: 0.5,
         ..DuskSky::default()
     };
     let (mut app, _) = harness(sky, None);
+    aim(&mut app, 0.0);
     // The noise volumes take 8 frames plus shader compilation.
-    let image = capture_at(&mut app, 240, "target/clouds_cumulus.png");
+    let image = capture_at(&mut app, 240, "target/clouds_sunward.png");
     let stats = FrameStats::of(&image);
-    println!("cumulus stats: {stats:?}");
+    println!("sunward stats: {stats:?}");
 
     assert_eq!(
         stats.nan, 0,
@@ -260,6 +279,41 @@ fn cumulus_renders_a_structured_sky() {
         "lit cloud is not warm (bright R {:.3} vs B {:.3})",
         stats.bright_relative[0],
         stats.bright_relative[2]
+    );
+}
+
+#[test]
+#[ignore = "requires a physical GPU (atmosphere/cloud compute); run locally with --ignored"]
+fn cumulus_backlit_is_sky_blue() {
+    let sky = DuskSky {
+        cloud_kind: Some(CloudKind::BrokenCumulus),
+        cloud_amount: 0.5,
+        ..DuskSky::default()
+    };
+    let (mut app, _) = harness(sky, None);
+    aim(&mut app, 180.0);
+    let image = capture_at(&mut app, 240, "target/clouds_backlit.png");
+    let stats = FrameStats::of(&image);
+    println!("backlit stats: {stats:?}");
+
+    assert_eq!(
+        stats.nan, 0,
+        "{} NaN pixels in the captured frame",
+        stats.nan
+    );
+    assert!(
+        stats.relative_stddev > 0.15,
+        "frame is flat (relative stddev {:.3}); no cloud structure behind the \
+         camera",
+        stats.relative_stddev
+    );
+    // With the sun behind the camera the cloud is lit by the sky alone: the
+    // frame must be blue-dominant, unlike the sunward one.
+    assert!(
+        stats.relative[2] > stats.relative[0],
+        "backlit frame is not sky-blue (relative R {:.3} vs B {:.3})",
+        stats.relative[0],
+        stats.relative[2]
     );
 }
 
