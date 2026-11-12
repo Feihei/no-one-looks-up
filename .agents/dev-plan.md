@@ -537,7 +537,7 @@ Feihei 验收：**「好了一些，但还是不太自然。体积云就到此�
 **背景**：Feihei 验收结论——crate 体积云噪声粒度 32–64 m 太粗、团块无翻卷细节，黄昏光照发灰无银边；其面向全天候动态天气的通用设计正是观感问题根源（本作锁定黄昏 17:30 + 晴朗低云量 + 仰视相机）。计划见 `.trae/documents/self-built-volumetric-clouds.md`，决策落地后登记为 adr-0007。已确认决策：游戏侧新模块 `src/plugins/clouds/`（vendor 不动，零升级合并风险）；半分辨率 march + 时域重投影（中低端独显 30fps+）；只做黄昏积云一种模型（5 种 CloudKind 全部映射进积云参数空间）。
 
 - [x] 6.0（C0）接管与管线骨架：sky.rs disable CloudPlugin + 删 `apply_cloud_layer_override` + DepthPrepass 观察器；clouds 模块（mod/params/config/gpu.rs）注册进 GamePlugins；游戏侧 WESL import spike 通过（crate 的 `bevy_elements::noise` 可 import；游戏 crate 库名 `no_one_looks_up::plugins::clouds::*`）；自写 kernel 排队辅助（vendor 的 `pub(crate)` 不可用）；debug 均匀壳层全链（march→resolve→composite）GPU 冒烟通过；单测（params 镜像/拷贝数学 tripwire/重置触发）
-- [ ] 6.1（C1）噪声与形状：generate 256³ 8-slab + detail 64³、weather 256²/16km、密度模型（高度梯度/dome/cell gaps/erosion/wind skew）、march 接真密度（coarse/fine 双模跳步）
+- [x] 6.1（C1）噪声与形状：generate 256³ 8-slab + detail 64³、weather 256²/16km（GPU 直方图求阈值，覆盖率精确等于 cover）、密度模型（梯度四元组 × dome 包络 × coverage × 对流胞 gaps × 双段 erosion × 风切变）、march 接真密度（coarse/fine 双模跳步）；GPU 截图断言结构化天空通过
 - [ ] 6.2（C2）黄昏光照：transmittance LUT 太阳色 + Hillaire 三 octave 多重散射 + 双瓣 HG + Beer-powder、环境 cube 环境光（16 采样）、aerial perspective + far veil
 - [ ] 6.3（C3）时域稳健性与遮挡：重投影 clamp 硬化（reset 全触发）、深度遮挡、曝光扰动下 history 不脏、步行+转头实机验收无拖影无闪烁
 - [ ] 6.4（C4）性能与档位：`CloudsQuality::of(ElementsQuality)` 映射、RenderDiagnostics 五段 span、实机 1080p 30fps+、DX12/Vulkan 双后端核验
@@ -549,6 +549,16 @@ Feihei 验收：**「好了一些，但还是不太自然。体积云就到此�
 - 历史纹理存**未曝光**辐射亮度，曝光在 composite 乘 `view.exposure`（ev100 13 → exposure ≈ 1e-4，天空辐射单位在千级——debug 壳层 luminance 6000 才是中灰，0.5 会整帧黑屏且 T=0 盖掉天空）
 - resolve 无 Bayer 槽位：每 texel 每帧全量 march → 全像素 fresh 双线性上采样 + 3×3 fresh clamp + mix 0.5；壳入点世界空间重投影（`previous.clip_from_world`）
 - GPU 冒烟 `tests/clouds_screenshot.rs`（#[ignore]）：断言全部 ratio 化（无 NaN / R>B 暖色 / p90-p10 抖动带宽上下限），相机用 `Tonemapping::None`（ACES 会把 1.67× 抖动压缩到 1.19×，统计须在 tonemap 前）
+
+### C1 技术纪要（2026-11-12）
+
+- 噪声规格：base 256³ rgba8unorm，tile 2048 m → 8 m/texel（vendor 为 128³/4096 m = 32 m/texel），Worley cells 8/16/32/64/128（最细 ~16 m）；detail 64³，tile 512 m → 8 m/texel，cells 2…32；**detail.b 用 0.5·w16 + 0.5·w32**（vendor 把最细 octave 埋到 0.125 权重里，正是"光滑团块"的成因）
+- weather：256²、16 km 周期窗（相机居中，随漂移平移），R=coverage、A=dome（DOME_WIDTH 0.30）；覆盖率用 **GPU 直方图**（clear→field→threshold→weather 四个 kernel）取 (1−cover) 分位阈值，故覆盖面积精确等于 cover，soft edge 0.18 只软化边缘
+- **坑：天气图必须是 render-world 目标**。曾把 weather 纹理建成主世界 `Assets<Image>` 供 march 采样，结果 march 读到全零 → 整帧无云；正确做法是 weather 纹理只在 `init_pipelines` 建、weather kernel 与 march 共用同一个 `TextureView`
+- 密度模型（积云单一族）：`envelope(dome, cell, dome_weight) × height_gradient(grad) × coverage × gaps(cell, cover⁴)`，再走 `value_erosion`；dome_weight=0 的层状 kind 退化成等厚板（不再有 domes）
+- C1 光照只是单次散射 + 占位环境项（`light_e × 0.02`）；云底在低太阳下偏暗是预期，C2 的 Hillaire 三 octave 多重散射负责抬亮
+- 每 kind 形状参数在 `config.rs::CloudShape`（gradient/sigma/dome/erosion），纯函数可测；漂移按各自 tile 周期 `wrap_drift`（bit-exact 单测）
+- GPU 冒烟新增 `cumulus_renders_a_structured_sky`：无 NaN / 相对标准差 > 0.15（非平板）/ p99 > 1.5×median（有受光云顶）/ 最亮 1% 区域 R>B（暖色）
 
 ---
 
@@ -581,7 +591,7 @@ R3.14 灯头绘制距离    [██████████] 实现完成（灯�
 R3.15 环路外景物带    [██████████] 实现完成（带内建筑行+角树丛/檐底封闭/长灯臂两段/棚架宽度随机，2026-11-11，待实机验收）
 R3.16 抗锯齿 / TAA    [████████░░] 接入完成 + 立面采样器修线性 mip（2026-11-11，快门 ≈6 ms，待实机验收）
 R5.1-5 天空调参+云    [████████░░] 面板/云种/sky_gain/dome 完成；云边缘块状属已知边界（2026-10-27 收尾）
-R6: 自研体积云        [█░░░░░░░░░] 6.0 管线骨架完成（2026-11-11；crate CloudPlugin 已停用）
+R6: 自研体积云        [███░░░░░░░] 6.0 骨架 + 6.1 噪声/形状完成（2026-11-12）
 ```
 
 ### R3.11 屋顶轮廓（2026-10-31，步骤 11.3）
