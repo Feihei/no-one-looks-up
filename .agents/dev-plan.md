@@ -539,7 +539,7 @@ Feihei 验收：**「好了一些，但还是不太自然。体积云就到此�
 - [x] 6.0（C0）接管与管线骨架：sky.rs disable CloudPlugin + 删 `apply_cloud_layer_override` + DepthPrepass 观察器；clouds 模块（mod/params/config/gpu.rs）注册进 GamePlugins；游戏侧 WESL import spike 通过（crate 的 `bevy_elements::noise` 可 import；游戏 crate 库名 `no_one_looks_up::plugins::clouds::*`）；自写 kernel 排队辅助（vendor 的 `pub(crate)` 不可用）；debug 均匀壳层全链（march→resolve→composite）GPU 冒烟通过；单测（params 镜像/拷贝数学 tripwire/重置触发）
 - [x] 6.1（C1）噪声与形状：generate 256³ 8-slab + detail 64³、weather 256²/16km（GPU 直方图求阈值，覆盖率精确等于 cover）、密度模型（梯度四元组 × dome 包络 × coverage × 对流胞 gaps × 双段 erosion × 风切变）、march 接真密度（coarse/fine 双模跳步）；GPU 截图断言结构化天空通过
 - [x] 6.2（C2）黄昏光照：transmittance LUT 太阳色 + Hillaire 三 octave 多重散射 + 双瓣 HG + Beer-powder、环境 cube 环境光（16 采样）、aerial perspective + far veil；向阳/背阳两张 GPU 截图断言通过（暖银边 R/B≈2.2、背阳整帧偏蓝）
-- [ ] 6.3（C3）时域稳健性与遮挡：重投影 clamp 硬化（reset 全触发）、深度遮挡、曝光扰动下 history 不脏、步行+转头实机验收无拖影无闪烁
+- [x] 6.3（C3）时域稳健性与遮挡：重投影 clamp 硬化（reset 全触发）、深度遮挡、曝光扰动下 history 不脏、步行+转头实机验收无拖影无闪烁（前三项自动化已绿；实机验收待 Feihei）
 - [ ] 6.4（C4）性能与档位：`CloudsQuality::of(ElementsQuality)` 映射、RenderDiagnostics 五段 span、实机 1080p 30fps+、DX12/Vulkan 双后端核验
 - [ ] 6.5（C5）验收与文档：五 kind 参数终调（F5 逐一切换人工验收）、`tests/clouds_screenshot.rs` 断言定稿、新增 `.agents/adr-0007-clouds-rework.md`、更新 adr-0003/AGENTS 状态表
 
@@ -559,6 +559,13 @@ Feihei 验收：**「好了一些，但还是不太自然。体积云就到此�
 - C1 光照只是单次散射 + 占位环境项（`light_e × 0.02`）；云底在低太阳下偏暗是预期，C2 的 Hillaire 三 octave 多重散射负责抬亮
 - 每 kind 形状参数在 `config.rs::CloudShape`（gradient/sigma/dome/erosion），纯函数可测；漂移按各自 tile 周期 `wrap_drift`（bit-exact 单测）
 - GPU 冒烟新增 `cumulus_renders_a_structured_sky`：无 NaN / 相对标准差 > 0.15（非平板）/ p99 > 1.5×median（有受光云顶）/ 最亮 1% 区域 R>B（暖色）
+
+### C3 技术纪要（2026-11-13）
+
+- **所有 reset 触发收敛到 `CloudsRuntime::observe(shape, quality, cam)`**：kind/amount/layer 变（壳层移动）、quality 变（步进图案变）、相机单帧位移 > `TELEPORT_M`（50 m，传送/读档；步行 2 m/s 在 1.5 km 云层视差亚像素，不重置）、resize（`update_views` 里建新纹理时）。命中即 `reset_frames = 2`，resolve 直接写 fresh 上采样。单测 `stale_history_triggers_reset` 逐条覆盖（含"步行不重置"）。
+- **深度遮挡改为块级保守判定**：march 每个半分辨率 texel 覆盖 2×2 像素，四个像素**全部**被前景遮挡才整块跳过；任一像素是天空/超出壳层就照常 march。否则前景轮廓边缘那一块会被整块抹掉，物体移动时云会沿轮廓闪。
+- **曝光不脏 history**：history 存未曝光亮度，只有 composite 乘 `view.exposure`。`only_the_composite_applies_exposure` 是 tripwire（扫描三个 shader 源码），防止以后有人在 march/resolve 里顺手乘曝光，导致 `DuskSky` 的 ±0.15 ev 扰动在 history 里残留 2 帧。
+- 还没做：实机转头/步行的拖影与闪烁人工验收（Feihei）。若发现拖影，先看 `FRESH_BLEND`（现 0.5）和 3×3 clamp 的框是否太窄，再看重投影的壳入点（相机贴地时 shell.x 极小，重投影误差会被放大）。
 
 ### C2 技术纪要（2026-11-12）
 
@@ -601,7 +608,7 @@ R3.14 灯头绘制距离    [██████████] 实现完成（灯�
 R3.15 环路外景物带    [██████████] 实现完成（带内建筑行+角树丛/檐底封闭/长灯臂两段/棚架宽度随机，2026-11-11，待实机验收）
 R3.16 抗锯齿 / TAA    [████████░░] 接入完成 + 立面采样器修线性 mip（2026-11-11，快门 ≈6 ms，待实机验收）
 R5.1-5 天空调参+云    [████████░░] 面板/云种/sky_gain/dome 完成；云边缘块状属已知边界（2026-10-27 收尾）
-R6: 自研体积云        [█████░░░░░] 6.2 黄昏光照完成（2026-11-12）
+R6: 自研体积云        [██████░░░░] 6.3 时域/遮挡完成，待实机验收（2026-11-13）
 ```
 
 ### R3.11 屋顶轮廓（2026-10-31，步骤 11.3）
