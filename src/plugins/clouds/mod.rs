@@ -63,6 +63,11 @@ impl CloudsDebug {
 /// `DuskSky`'s wind speed. [0.94, 0.34] is its unit direction.
 const WIND_DIR: DVec2 = DVec2::new(0.94, 0.34);
 
+/// Camera travel after which the temporal history is meaningless: the shell
+/// entry points do not reproject through the previous view at walking speed, but
+/// a teleport moves them off screen, m.
+const TELEPORT_M: f32 = 50.0;
+
 /// Main-world state of the cloud simulation.
 #[derive(Resource, Default)]
 pub(crate) struct CloudsRuntime {
@@ -75,6 +80,38 @@ pub(crate) struct CloudsRuntime {
     reset_frames: u32,
     /// The last resolved (kind, amount, layer) — a change invalidates history.
     last_shape: Option<ShapeKey>,
+    /// The last step pattern; changing it changes what each texel samples.
+    last_quality: Option<CloudsQuality>,
+    /// Where the camera was last frame, for the teleport test.
+    last_cam: Option<Vec3>,
+}
+
+impl CloudsRuntime {
+    /// Tracks what invalidates the temporal history and returns whether it was
+    /// invalidated this frame: the cloud shape (the shell moves), the quality
+    /// (the step pattern moves), or a camera teleport. Resizes are handled by
+    /// [`update_views`].
+    fn observe(&mut self, shape: ShapeKey, quality: CloudsQuality, cam: Option<Vec3>) -> bool {
+        let mut reset = false;
+        if self.last_shape != Some(shape) {
+            self.last_shape = Some(shape);
+            reset = true;
+        }
+        if self.last_quality != Some(quality) {
+            self.last_quality = Some(quality);
+            reset = true;
+        }
+        if let (Some(last), Some(cam)) = (self.last_cam, cam) {
+            reset |= last.distance_squared(cam) > TELEPORT_M * TELEPORT_M;
+        }
+        if cam.is_some() {
+            self.last_cam = cam;
+        }
+        if reset {
+            self.reset_frames = 2;
+        }
+        reset
+    }
 }
 
 /// A resolved cloud shape: the kind, its amount and any explicit layer.
@@ -303,19 +340,18 @@ fn update_gpu(
     let clouds = resolve_clouds(&sky);
     let debug = debug.as_deref().copied().unwrap_or_default();
 
-    // A kind/amount/layer change invalidates the history (the shell moves).
-    let shape = (sky.cloud_kind, sky.cloud_amount, sky.cloud_layer);
-    if runtime.last_shape != Some(shape) {
-        runtime.last_shape = Some(shape);
-        runtime.reset_frames = 2;
-    }
-    let reset = runtime.reset_frames > 0;
-    runtime.reset_frames = runtime.reset_frames.saturating_sub(1);
-
     let (cam, size) = match gpu.view.as_ref() {
         Some(view) => (cameras.iter().next().map(|t| t.translation()), view.size),
         None => (None, UVec2::ONE),
     };
+    // A shape, quality or teleport change invalidates the history.
+    runtime.observe(
+        (sky.cloud_kind, sky.cloud_amount, sky.cloud_layer),
+        CloudsQuality::of(*quality),
+        cam,
+    );
+    let reset = runtime.reset_frames > 0;
+    runtime.reset_frames = runtime.reset_frames.saturating_sub(1);
     let Some(cam) = cam else {
         gpu.active = false;
         return;
@@ -453,6 +489,7 @@ mod tests {
             "grad",
             "shape",
             "noise",
+            "tuning",
         ] {
             assert!(
                 common.contains(&format!("    {field}: ")),
@@ -507,21 +544,64 @@ mod tests {
         assert!(weather.contains(&format!("const TEXELS: u32 = {}u;", config::WEATHER_TEXELS)));
     }
 
-    /// A shape change must flag the history invalid so the resolve does not
-    /// blend two different cloud decks.
+    /// Every trigger must flag the history invalid: the resolve blends two
+    /// different cloud decks or two unrelated viewpoints otherwise.
     #[test]
-    fn shape_change_resets_the_history() {
+    fn stale_history_triggers_reset() {
         let mut runtime = CloudsRuntime {
             frame: 0,
             reset_frames: 0,
-            last_shape: Some((None, 0.0, None)),
             ..default()
         };
-        let changed = Some((None, 0.5, None));
-        if runtime.last_shape != changed {
-            runtime.last_shape = changed;
-            runtime.reset_frames = 2;
-        }
+        let shape = (None, 0.5, None);
+        let cam = Vec3::new(10.0, 1.65, 10.0);
+        let def = Some(cam);
+        // The first frame only records the state: the history is already clear.
+        runtime.observe(shape, CloudsQuality::Medium, def);
+        runtime.reset_frames = 0;
+
+        // Nothing changed: the history stays.
+        assert!(!runtime.observe(shape, CloudsQuality::Medium, def));
+        assert_eq!(runtime.reset_frames, 0);
+        // A different amount (the shell/deck changes).
+        assert!(runtime.observe((None, 1.0, None), CloudsQuality::Medium, def));
         assert_eq!(runtime.reset_frames, 2);
+        runtime.reset_frames = 0;
+        // A different quality (the step pattern changes).
+        assert!(runtime.observe((None, 1.0, None), CloudsQuality::High, def));
+        assert_eq!(runtime.reset_frames, 2);
+        runtime.reset_frames = 0;
+        // Walking keeps the history: the reprojection is sub-pixel at 1.5 km.
+        let walked = Some(cam + Vec3::new(0.0, 0.0, -2.0));
+        assert!(!runtime.observe((None, 1.0, None), CloudsQuality::High, walked));
+        assert_eq!(runtime.reset_frames, 0);
+        // A teleport does not.
+        let teleported = Some(walked.unwrap() + Vec3::new(TELEPORT_M + 1.0, 0.0, 0.0));
+        assert!(runtime.observe((None, 1.0, None), CloudsQuality::High, teleported));
+        assert_eq!(runtime.reset_frames, 2);
+    }
+
+    /// The history holds UNexposed luminance: only the composite may scale by
+    /// the view's exposure, or a `DuskSky` exposure perturbation would leave the
+    /// marching's output dirty for the frames the history lasts.
+    #[test]
+    fn only_the_composite_applies_exposure() {
+        let read = |name: &str| {
+            std::fs::read_to_string(format!(
+                "{}/src/plugins/clouds/{name}",
+                env!("CARGO_MANIFEST_DIR")
+            ))
+            .expect(name)
+        };
+        for shader in ["march.wesl", "resolve.wesl"] {
+            assert!(
+                !read(shader).contains(".exposure"),
+                "{shader} scales by the exposure; the history must stay unexposed"
+            );
+        }
+        assert!(
+            read("composite.wesl").contains("view.exposure"),
+            "composite.wesl must apply the exposure; the history is unexposed"
+        );
     }
 }

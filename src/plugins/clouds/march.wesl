@@ -322,10 +322,29 @@ fn clouds_march(@builtin(global_invocation_id) id: vec3<u32>) {
     if shell.y > shell.x {
         // A surface in front of the shell hides the cloud on this ray (the
         // composite discards it anyway; skipping keeps the fresh field
-        // consistent for the resolve).
-        let depth = textureLoad(depth_tex, vec2<i32>(id.xy * 2u), 0);
-        let hidden = depth > 0.0
-            && scene_distance(uv, depth, view.world_from_clip, ray, params.units.x) < shell.x;
+        // consistent for the resolve). The block is skipped only when ALL of
+        // its pixels are occluded: a partially covered block still marches, so
+        // the cloud beside a foreground silhouette never blinks out.
+        let base = vec2<i32>(id.xy * 2u);
+        let inv_size = vec2<f32>(1.0) / vec2<f32>(size);
+        var hidden = true;
+        for (var j = 0; j < 2; j += 1) {
+            for (var i = 0; i < 2; i += 1) {
+                let pixel = base + vec2<i32>(i, j);
+                let depth = textureLoad(depth_tex, pixel, 0);
+                let pixel_uv = (vec2<f32>(pixel) + vec2<f32>(0.5)) * inv_size;
+                hidden = hidden
+                    && depth > 0.0
+                    && scene_distance(
+                            pixel_uv,
+                            depth,
+                            view.world_from_clip,
+                            ray,
+                            params.units.x,
+                        )
+                        < shell.x;
+            }
+        }
         if !hidden {
             if params.misc.x > 0.5 {
                 // Debug shell: a warm white with per-texel jitter so temporal
