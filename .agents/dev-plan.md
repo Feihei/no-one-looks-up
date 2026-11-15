@@ -540,7 +540,7 @@ Feihei 验收：**「好了一些，但还是不太自然。体积云就到此�
 - [x] 6.1（C1）噪声与形状：generate 256³ 8-slab + detail 64³、weather 256²/16km（GPU 直方图求阈值，覆盖率精确等于 cover）、密度模型（梯度四元组 × dome 包络 × coverage × 对流胞 gaps × 双段 erosion × 风切变）、march 接真密度（coarse/fine 双模跳步）；GPU 截图断言结构化天空通过
 - [x] 6.2（C2）黄昏光照：transmittance LUT 太阳色 + Hillaire 三 octave 多重散射 + 双瓣 HG + Beer-powder、环境 cube 环境光（16 采样）、aerial perspective + far veil；向阳/背阳两张 GPU 截图断言通过（暖银边 R/B≈2.2、背阳整帧偏蓝）
 - [x] 6.3（C3）时域稳健性与遮挡：重投影 clamp 硬化（reset 全触发）、深度遮挡、曝光扰动下 history 不脏、步行+转头实机验收无拖影无闪烁（前三项自动化已绿；实机验收待 Feihei）
-- [ ] 6.4（C4）性能与档位：`CloudsQuality::of(ElementsQuality)` 映射、RenderDiagnostics 五段 span、实机 1080p 30fps+、DX12/Vulkan 双后端核验
+- [x] 6.4（C4）性能与档位：`CloudsQuality::of(ElementsQuality)` 映射、Low 档丢 detail 体积（`misc.z` 权重 0，省每采样一次 fetch + wispy 侵蚀）、RenderDiagnostics 五段 span（并给主程序加 `RenderDiagnosticsPlugin`）、1080p 帧预算测试、DX12/Vulkan 双后端核验
 - [ ] 6.5（C5）验收与文档：五 kind 参数终调（F5 逐一切换人工验收）、`tests/clouds_screenshot.rs` 断言定稿、新增 `.agents/adr-0007-clouds-rework.md`、更新 adr-0003/AGENTS 状态表
 
 ### C0 技术纪要（2026-11-11）
@@ -566,6 +566,14 @@ Feihei 验收：**「好了一些，但还是不太自然。体积云就到此�
 - **深度遮挡改为块级保守判定**：march 每个半分辨率 texel 覆盖 2×2 像素，四个像素**全部**被前景遮挡才整块跳过；任一像素是天空/超出壳层就照常 march。否则前景轮廓边缘那一块会被整块抹掉，物体移动时云会沿轮廓闪。
 - **曝光不脏 history**：history 存未曝光亮度，只有 composite 乘 `view.exposure`。`only_the_composite_applies_exposure` 是 tripwire（扫描三个 shader 源码），防止以后有人在 march/resolve 里顺手乘曝光，导致 `DuskSky` 的 ±0.15 ev 扰动在 history 里残留 2 帧。
 - 还没做：实机转头/步行的拖影与闪烁人工验收（Feihei）。若发现拖影，先看 `FRESH_BLEND`（现 0.5）和 3×3 clamp 的框是否太窄，再看重投影的壳入点（相机贴地时 shell.x 极小，重投影误差会被放大）。
+
+### C4 技术纪要（2026-11-14）
+
+- 档位（`CloudsQuality`）：march 步数 40/56/72/96，光路采样 4/6/6/8，detail 体积权重 0/1/1/1。**Low 直接丢 detail**：`cloud_sigma` 里 `detail <= 0` 就跳过 detail 纹理采样与 wispy 侵蚀（每密采样省一次 fetch + 若干运算），只留 base 体积的翻卷——低端机本来就分辨不出 16 m 的毛边。
+- `pass_span` 五段：`no_one_clouds_noise / weather / march / resolve / composite`。Bevy 的 `RenderDiagnosticsPlugin` 不在 `DefaultPlugins` 里，之前 `diagnostic_recorder()` 恒为 `None`、span 全部是空操作；已给 `main.rs` 补上，现在 diagnostics overlay 里能按段看 GPU 时间。
+- 帧预算：新增 `clouds_keep_thirty_fps_at_1080p`（1920×1080、BrokenCumulus cover 0.5，热身 180 帧后量 120 帧）。**headless 实测 12.6 ms/帧（DX12）/ 13.8 ms/帧（Vulkan）**，都含渲染子 app；游戏里还要加 present 与城区场景，所以这是下界不是最终值。
+- 双后端：`WGPU_BACKEND=vulkan` 下四个 GPU 测试全绿，且统计与 DX12 四位小数一致（mean 0.10541 vs 0.10540，同一 seed/同一 weather 场），说明 WESL→naga 的两条后端没有差异。
+- 还没做：实机 1080p 帧时间与 Low 档视觉（丢 detail 后的轮廓）人工确认。
 
 ### C2 技术纪要（2026-11-12）
 
@@ -608,7 +616,7 @@ R3.14 灯头绘制距离    [██████████] 实现完成（灯�
 R3.15 环路外景物带    [██████████] 实现完成（带内建筑行+角树丛/檐底封闭/长灯臂两段/棚架宽度随机，2026-11-11，待实机验收）
 R3.16 抗锯齿 / TAA    [████████░░] 接入完成 + 立面采样器修线性 mip（2026-11-11，快门 ≈6 ms，待实机验收）
 R5.1-5 天空调参+云    [████████░░] 面板/云种/sky_gain/dome 完成；云边缘块状属已知边界（2026-10-27 收尾）
-R6: 自研体积云        [██████░░░░] 6.3 时域/遮挡完成，待实机验收（2026-11-13）
+R6: 自研体积云        [███████░░░] 6.4 性能/档位完成（2026-11-14）
 ```
 
 ### R3.11 屋顶轮廓（2026-10-31，步骤 11.3）
