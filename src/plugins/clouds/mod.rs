@@ -441,7 +441,7 @@ fn update_gpu(
         misc: Vec4::new(
             debug.mode,
             debug.luminance,
-            0.0,
+            q.detail_gain(),
             if reset { 1.0 } else { 0.0 },
         ),
         units: Vec4::new(per_metre, 0.0, 0.0, 0.0),
@@ -576,7 +576,7 @@ mod tests {
         assert!(!runtime.observe((None, 1.0, None), CloudsQuality::High, walked));
         assert_eq!(runtime.reset_frames, 0);
         // A teleport does not.
-        let teleported = Some(walked.unwrap() + Vec3::new(TELEPORT_M + 1.0, 0.0, 0.0));
+        let teleported = walked.map(|p| p + Vec3::new(TELEPORT_M + 1.0, 0.0, 0.0));
         assert!(runtime.observe((None, 1.0, None), CloudsQuality::High, teleported));
         assert_eq!(runtime.reset_frames, 2);
     }

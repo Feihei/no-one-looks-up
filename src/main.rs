@@ -25,6 +25,9 @@ fn main() -> AppExit {
             }),
             GamePlugins,
             PlayerPlugin,
+            // GPU timings per pass (the clouds' noise/weather/march/resolve/
+            // composite spans feed the diagnostics overlay).
+            bevy::render::diagnostic::RenderDiagnosticsPlugin,
         ))
         .add_systems(Startup, (setup_scene, log_sky_state.after(setup_scene)))
         .run()

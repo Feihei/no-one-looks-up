@@ -45,7 +45,8 @@ struct CloudParams {
     /// xy: full resolution. zw: march resolution.
     sizes: vec4<u32>,
     /// x: debug mode (0 off, 1 uniform shell of luminance y). y: debug shell luminance.
-    /// z: unused. w: 1 on the first frame(s) of a history (no valid history).
+    /// z: detail-volume weight in the density (0 on `Low`, 1 otherwise). w: 1 on the first
+    /// frame(s) of a history (no valid history).
     misc: vec4<f32>,
     /// x: world units per metre (`ElementsUnits`). Everything above is in metres; Bevy's view
     /// matrices and depth are in world units, so the shaders divide what they take from them by

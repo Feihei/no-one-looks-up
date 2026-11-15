@@ -77,6 +77,20 @@ impl CloudsQuality {
             Self::Ultra => 8,
         }
     }
+
+    /// Weight of the detail volume in the density, 0–1.
+    ///
+    /// `Low` drops the detail tap (one fetch per dense sample) and its wispy
+    /// erosion: the base volume's billows still carry the silhouette, only the
+    /// frayed edge goes. That is the biggest per-sample saving there is, and it
+    /// is exactly the kind of detail a low-tier machine would lose to filtering
+    /// anyway.
+    pub fn detail_gain(self) -> f32 {
+        match self {
+            Self::Low => 0.0,
+            Self::Medium | Self::High | Self::Ultra => 1.0,
+        }
+    }
 }
 
 /// The shape of one cloud kind, in the single cumulus model's parameter space.
@@ -169,6 +183,20 @@ mod tests {
         assert!(steps(ElementsQuality::Low) <= steps(ElementsQuality::Medium));
         assert!(steps(ElementsQuality::Medium) <= steps(ElementsQuality::High));
         assert!(steps(ElementsQuality::High) <= steps(ElementsQuality::Ultra));
+    }
+
+    /// Only the low tier may drop the detail volume: the others would lose the
+    /// frayed silhouette the whole rework is about.
+    #[test]
+    fn only_the_low_tier_drops_the_detail_volume() {
+        assert_eq!(CloudsQuality::Low.detail_gain(), 0.0);
+        for quality in [
+            ElementsQuality::Medium,
+            ElementsQuality::High,
+            ElementsQuality::Ultra,
+        ] {
+            assert_eq!(CloudsQuality::of(quality).detail_gain(), 1.0);
+        }
     }
 
     #[test]

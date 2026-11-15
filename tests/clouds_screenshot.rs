@@ -48,6 +48,11 @@ struct CapturePath(&'static str);
 
 /// A headless app running the whole game plugin set into an offscreen target.
 fn harness(sky: DuskSky, debug: Option<CloudsDebug>) -> (App, Handle<Image>) {
+    harness_sized(sky, debug, UVec2::new(320, 180))
+}
+
+/// As [`harness`], rendering into a target of `size` pixels.
+fn harness_sized(sky: DuskSky, debug: Option<CloudsDebug>, size: UVec2) -> (App, Handle<Image>) {
     let mut app = App::new();
     app.add_plugins((
         MinimalPlugins,
@@ -87,8 +92,8 @@ fn harness(sky: DuskSky, debug: Option<CloudsDebug>) -> (App, Handle<Image>) {
     let target = {
         let mut images = app.world_mut().resource_mut::<Assets<Image>>();
         images.add(Image::new_target_texture(
-            320,
-            180,
+            size.x,
+            size.y,
             TextureFormat::Rgba16Float,
             None,
         ))
@@ -315,6 +320,33 @@ fn cumulus_backlit_is_sky_blue() {
         stats.relative[0],
         stats.relative[2]
     );
+}
+
+/// R6.4: at 1080p the cloud passes must leave room for 30 fps. The measured
+/// number is a whole headless frame including the render app; the game's
+/// present and the rest of its scene only add to it, so this is the floor.
+#[test]
+#[ignore = "requires a physical GPU (atmosphere/cloud compute); run locally with --ignored"]
+fn clouds_keep_thirty_fps_at_1080p() {
+    let sky = DuskSky {
+        cloud_kind: Some(CloudKind::BrokenCumulus),
+        cloud_amount: 0.5,
+        ..DuskSky::default()
+    };
+    let (mut app, _) = harness_sized(sky, None, UVec2::new(1920, 1080));
+    aim(&mut app, 0.0);
+    // Shader compilation, the eight noise slabs, the environment cube.
+    for _ in 0..180 {
+        app.update();
+    }
+    let frames = 120;
+    let start = std::time::Instant::now();
+    for _ in 0..frames {
+        app.update();
+    }
+    let ms = start.elapsed().as_secs_f64() * 1000.0 / f64::from(frames);
+    println!("clouds 1080p: {ms:.2} ms/frame (30 fps allows 33.3)");
+    assert!(ms <= 33.3, "clouds at 1080p take {ms:.2} ms/frame");
 }
 
 /// Statistics of one captured linear HDR frame.

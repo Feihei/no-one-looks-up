@@ -163,7 +163,9 @@ fn integrate(
     let n = f32(steps);
     let dt = max(clamp((t1 - t0) / n, 25.0, 400.0), (t1 - t0) / (1.5 * n));
     let cos_t = dot(dir, l);
-    let detail = detail_weight(dt, params.noise.y);
+    // The detail volume fades out with distance; the quality tier can drop it
+    // entirely (`Low`), which also skips its fetch inside `cloud_sigma`.
+    let detail = detail_weight(dt, params.noise.y) * params.misc.z;
     let powder_weight = clamp(0.5 - 0.5 * cos_t, 0.0, 1.0);
     // The ambient's luminance at full sky, `E/π` (a cloud under the sky
     // reflects about what a horizontal white surface would see); its colour is
