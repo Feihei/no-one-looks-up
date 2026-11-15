@@ -44,7 +44,7 @@ struct CapturedFrame(Option<Image>);
 
 /// Where the captured frame is written.
 #[derive(Resource)]
-struct CapturePath(&'static str);
+struct CapturePath(String);
 
 /// A headless app running the whole game plugin set into an offscreen target.
 fn harness(sky: DuskSky, debug: Option<CloudsDebug>) -> (App, Handle<Image>) {
@@ -143,8 +143,8 @@ fn aim(app: &mut App, offset_deg: f32) {
 }
 
 /// Runs until `frame`, requests the capture, then runs until it lands.
-fn capture_at(app: &mut App, frame: usize, path: &'static str) -> Image {
-    app.insert_resource(CapturePath(path));
+fn capture_at(app: &mut App, frame: usize, path: impl Into<String>) -> Image {
+    app.insert_resource(CapturePath(path.into()));
     app.add_systems(
         Update,
         (bump_frame_counter, take_screenshot.run_if(at_frame(frame))).chain(),
@@ -193,7 +193,7 @@ fn take_screenshot(
                 frame.0 = Some(trigger.image.clone());
             },
         )
-        .observe(bevy::render::view::screenshot::save_to_disk(path.0));
+        .observe(bevy::render::view::screenshot::save_to_disk(path.0.clone()));
 }
 
 #[test]
@@ -320,6 +320,49 @@ fn cumulus_backlit_is_sky_blue() {
         stats.relative[0],
         stats.relative[2]
     );
+}
+
+/// C5: all five kinds at their designed cover, side by side, each one a PNG to
+/// look at. Guards the parameter table: no kind may go black, blow out, or
+/// collapse into a plate — except the two deck kinds, which *are* lids by
+/// design and only have to stay non-flat enough to avoid a dead grey field.
+#[test]
+#[ignore = "requires a physical GPU (atmosphere/cloud compute); run locally with --ignored"]
+fn every_kind_renders_a_structured_dusk_sky() {
+    for (index, kind) in CloudKind::ALL.into_iter().enumerate() {
+        let sky = DuskSky {
+            cloud_kind: Some(kind),
+            cloud_amount: 1.0,
+            ..DuskSky::default()
+        };
+        let (mut app, _) = harness(sky, None);
+        aim(&mut app, 0.0);
+        let path = format!("target/clouds_kind_{index}.png");
+        let image = capture_at(&mut app, 240, path);
+        let stats = FrameStats::of(&image);
+        println!("{kind:?}: {stats:?}");
+
+        assert_eq!(stats.nan, 0, "{kind:?}: {} NaN pixels", stats.nan);
+        assert!(
+            (0.01..0.6).contains(&stats.mean),
+            "{kind:?}: mean {:.4} — the frame is black or blown out",
+            stats.mean
+        );
+        // Overcast is an UNBROKEN lid: at 0.9 cover it is a flat grey field by
+        // construction (stddev ~0.01), so only "not dead/flat-lined" is
+        // asserted. A deck that needs visible relief needs base-height noise,
+        // which this model does not have (C5 note).
+        let min_stddev = match kind {
+            CloudKind::Overcast => 0.005,
+            CloudKind::Stratocumulus => 0.02,
+            _ => 0.10,
+        };
+        assert!(
+            stats.relative_stddev > min_stddev,
+            "{kind:?}: relative stddev {:.3} — the kind is a flat plate",
+            stats.relative_stddev
+        );
+    }
 }
 
 /// R6.4: at 1080p the cloud passes must leave room for 30 fps. The measured
