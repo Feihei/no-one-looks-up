@@ -1,6 +1,6 @@
 # ADR-0003: 程序化天空系统（Bevy 迁移版）
 
-状态：接受
+状态：接受（2026-11-15 修订：**云改为自研**，`CloudPlugin` 停用，见 [ADR-0007](adr-0007-clouds-rework.md)；大气散射 / Celestial / Fog 仍用 bevy_elements）
 
 日期：2026-10-19（自原 Godot 版 ADR-0003 2026-07-08 迁移改写；技术选型全面更新为 Bevy 0.20 + bevy_elements，其余设计决策保留）
 
@@ -12,7 +12,7 @@
 
 ### 技术选型
 
-- **主方案（A）**: Bevy 0.20 内置 `Atmosphere`（`ScatteringMedium::earth`，物理基 Rayleigh/Mie 散射）+ bevy_elements 的 Celestial/Cloud/Fog 模块，外封装一层 `DuskSky` Resource 管理器
+- **主方案（A）**: Bevy 0.20 内置 `Atmosphere`（`ScatteringMedium::earth`，物理基 Rayleigh/Mie 散射）+ bevy_elements 的 Celestial/Fog 模块（云自 2026-11-15 起自研，见 ADR-0007），外封装一层 `DuskSky` Resource 管理器
 - **备选（B）**: 不用 bevy_elements，只用官方内置 Atmosphere + VolumetricFog + 自写云（`FullscreenMaterial`/compute raymarch）——零外部依赖但工作量大，作为 bevy_elements 不满足需求时的退路
 - **已否决（C）**: bevy_weather / bevy-volumetric-clouds——截至 2026-10-19 分别停在 Bevy 0.19 / 0.18，未跟进 0.20；且 bevy-volumetric-clouds 不读 depth buffer（不能飞进云里）、未与内置 atmosphere 集成
 
@@ -21,7 +21,7 @@
 | 原设计 | Bevy/bevy_elements 实现 |
 |--------|----------------------|
 | 黄昏色调：金黄→橙红→深蓝紫渐变 | 内置 `Atmosphere` 物理散射在低太阳仰角自动呈现橙红天色（0.18 的 Atmosphere Occlusion + PBR 整合）；固定时间见下节 |
-| 云层：随机生成、缓慢飘移，每次加载不同 | bevy_elements CloudPlugin：compute ray-march 云，由 weather map 驱动；云影（CloudShadows）投射地面 |
+| 云层：随机生成、缓慢飘移，每次加载不同 | 【2026-11-15 起】自研 `src/plugins/clouds/`（体积 march + 时域重投影，见 ADR-0007）；bevy_elements `CloudPlugin` 已 `.disable()`，其云影一并失去 |
 | 星星：黄昏后期缓缓显现 | bevy_elements CelestialPlugin：Yale 亮星星表；0.20 的 atmosphere 合成方式使星空随天色变亮自然熄灭 |
 | 月亮：天际较高位置，可选弯月/满月，位置随机 | bevy_elements 月亮盘（LROC 贴图 + 相位正确）；形态/位置参数经 DuskSky 封装暴露 |
 | 不同位置天空氛围细微差异（世界坐标噪声） | 【适配】需自写：以世界坐标驱动 `ScatteringMedium` 密度乘子（`with_density_multiplier`）或 exposure 微扰，作为 DuskSky 的一部分 |

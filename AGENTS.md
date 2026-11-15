@@ -13,7 +13,7 @@
 | 名称 | 中文《即使独自漫步你也很少看天》／英文 `No One Looks Up Even Alone`（简称 **No One**）；Godot 原作目录名仍为 `heads_up` |
 | Rust 包名 | `no_one_looks_up`（snake_case，Cargo 要求） |
 | 引擎 | **Bevy 0.20.1**（crates.io，2026-10-28 补丁发布；最低 Rust 1.97.1） |
-| 天气/天空插件 | **bevy_elements 0.6.0**（vendored + 3 个云 shader 补丁，见 `vendor/bevy_elements/PATCHES.md`）。bevy_flora 0.46 试装已结束（结论：自研树为准，依赖已移除，见 dev-plan R0.6） |
+| 天气/天空插件 | **bevy_elements 0.6.0**（vendored + 3 个云 shader 补丁，见 `vendor/bevy_elements/PATCHES.md`）——只用 Atmosphere/Celestial/Fog；云自 R6 起自研（`src/plugins/clouds/`，`CloudPlugin` 已 disable，见 adr-0007）。bevy_flora 0.46 试装已结束（结论：自研树为准，依赖已移除，见 dev-plan R0.6） |
 | 语言 | Rust（edition 2024），所有代码 |
 | 目标平台 | PC（Windows 优先，兼顾跨平台） |
 | 类型 | 第一人称无尽散步体验，核心是抬头仰望天空与黄昏天色 |
@@ -128,6 +128,7 @@ serde_json = "1"
 | R3.9-3.12 | 程序化树 / 叶卡 / 立面与屋顶 / 观感修复 | 完成（2026-10-27 ～ 11-05，待实机验收） |
 | R3.13 | 跨街上部元素（电线/悬挑灯臂/防护棚） | 实现完成（2026-11-09，待实机验收；见 adr-0006） |
 | R4 | 存档与菜单 | 完成（2026-10-24；按钮/完成弹窗接线留 R5.6） |
+| R6 | 自研体积云（替换 CloudPlugin，见 adr-0007） | 实现完成（C0–C4，2026-11-14；五 kind 与实机帧时间待 Feihei 人眼验收） |
 | R5 | 声音与润色 | 待开始 |
 
 ## 风险
