@@ -47,6 +47,7 @@ const NODE: Rgb = Rgb(255, 255, 255);
 fn block_color(kind: BlockType) -> Rgb {
     match kind {
         BlockType::OldCity => Rgb(186, 78, 70),
+        BlockType::UrbanVillage => Rgb(206, 128, 74),
         BlockType::Apartment => Rgb(88, 120, 180),
         BlockType::Factory => Rgb(196, 172, 78),
         BlockType::Plaza => Rgb(96, 176, 96),
@@ -336,6 +337,7 @@ fn main() {
     for block in &graph.blocks {
         let key = match block.kind {
             BlockType::OldCity => "old_city",
+            BlockType::UrbanVillage => "urban_village",
             BlockType::Apartment => "apartment",
             BlockType::Factory => "factory",
             BlockType::Plaza => "plaza",

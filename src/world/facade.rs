@@ -74,13 +74,23 @@ pub enum FacadeStyle {
     Apartment,
     /// 旧厂房: corrugated steel, ribbon windows, 6 m floors.
     Factory,
+    /// 城中村: self-built plaster houses, small windows, 3 m floors. Shares
+    /// the old city's wall language (brick-and-plaster, small casements) but
+    /// bakes its own variant: the style seeds the pattern, so village walls
+    /// never repeat an old-city tile.
+    UrbanVillage,
 }
 
+/// Number of styles in [`FacadeStyle::ALL`]. Typed arrays in `chunks.rs` and
+/// the baking loops are sized from this.
+pub const STYLE_COUNT: usize = 4;
+
 impl FacadeStyle {
-    pub const ALL: [FacadeStyle; 3] = [
+    pub const ALL: [FacadeStyle; STYLE_COUNT] = [
         FacadeStyle::OldCity,
         FacadeStyle::Apartment,
         FacadeStyle::Factory,
+        FacadeStyle::UrbanVillage,
     ];
 
     /// The facade style of a block type, or `None` for walkable blocks.
@@ -89,6 +99,7 @@ impl FacadeStyle {
             BlockType::OldCity => Some(FacadeStyle::OldCity),
             BlockType::Apartment => Some(FacadeStyle::Apartment),
             BlockType::Factory => Some(FacadeStyle::Factory),
+            BlockType::UrbanVillage => Some(FacadeStyle::UrbanVillage),
             BlockType::Plaza | BlockType::Forest => None,
         }
     }
@@ -98,6 +109,7 @@ impl FacadeStyle {
             FacadeStyle::OldCity => "old_city",
             FacadeStyle::Apartment => "apartment",
             FacadeStyle::Factory => "factory",
+            FacadeStyle::UrbanVillage => "urban_village",
         }
     }
 
@@ -125,6 +137,12 @@ impl FacadeStyle {
                 bay: 6.0,
                 floor: 6.0,
             },
+            // Same rhythm as the old city: self-built houses sit on the same
+            // 2.0 m bay / 3.0 m floor grid, only their wall pattern differs.
+            FacadeStyle::UrbanVillage => FacadeDims {
+                bay: 2.0,
+                floor: 3.0,
+            },
         }
     }
 
@@ -138,6 +156,17 @@ impl FacadeStyle {
                 panes: 2,
                 blank: 0.22,
                 lit: 0.42,
+            },
+            // Village houses: smaller openings, more blank piers (walls that
+            // were extended floor by floor leave irregular fenestration), and
+            // slightly more lit rooms (denser living).
+            FacadeStyle::UrbanVillage => WindowSpec {
+                width: 0.42,
+                top: 0.28,
+                bottom: 0.74,
+                panes: 2,
+                blank: 0.30,
+                lit: 0.46,
             },
             FacadeStyle::Apartment => WindowSpec {
                 width: 0.66,
@@ -237,6 +266,10 @@ pub fn sample(style: FacadeStyle, variant: u8, u: f32, v: f32) -> Surface {
     let seed = variant as u32 * 7919 + style as u32 * 104_729;
     let mut surface = match style {
         FacadeStyle::OldCity => old_city_wall(style, seed, bay, floor, fx, fy, u, v),
+        // The village shares the old city's brick-and-plaster wall body; the
+        // style reaches the function through `style.dims()` and the seed, so
+        // village walls bake their own tiles without a second body.
+        FacadeStyle::UrbanVillage => old_city_wall(style, seed, bay, floor, fx, fy, u, v),
         FacadeStyle::Apartment => apartment_wall(seed, bay, floor, fx, fy, u, v),
         FacadeStyle::Factory => factory_wall(seed, bay, floor, fx, fy, u, v),
     };
@@ -357,6 +390,15 @@ fn window_surface(
                 ([0.74, 0.86, 1.0], 0.55 + 0.3 * pane.glow)
             }
         }
+        // Village rooms: warmer than the old city, one bare fluorescent tube
+        // in twelve (workrooms, corner shops).
+        FacadeStyle::UrbanVillage => {
+            if pane.seed.is_multiple_of(12) {
+                ([0.72, 0.85, 1.0], 0.48)
+            } else {
+                ([1.0, 0.70, 0.40], pane.glow)
+            }
+        }
     };
 
     if !pane.glass {
@@ -366,6 +408,8 @@ fn window_surface(
             FacadeStyle::OldCity => [0.50, 0.46, 0.40],
             FacadeStyle::Apartment => [0.52, 0.53, 0.54],
             FacadeStyle::Factory => [0.34, 0.33, 0.31],
+            // Village frames: cheap painted steel, a little bluer.
+            FacadeStyle::UrbanVillage => [0.46, 0.45, 0.43],
         };
         return Surface {
             albedo: mix3(wall.albedo, frame, 0.75),
@@ -383,6 +427,7 @@ fn window_surface(
         FacadeStyle::OldCity => [0.055, 0.062, 0.070],
         FacadeStyle::Apartment => [0.048, 0.056, 0.066],
         FacadeStyle::Factory => [0.070, 0.074, 0.072],
+        FacadeStyle::UrbanVillage => [0.052, 0.058, 0.062],
     };
     // Corrugation / dust: a little variation so panes are not identical.
     let dust = 0.004 * hash01(pane.seed, 3, seed);
@@ -398,6 +443,8 @@ fn window_surface(
         FacadeStyle::OldCity => 0.055 + 0.05 * hash01(pane.seed, 5, seed),
         FacadeStyle::Apartment => 0.045 + 0.05 * hash01(pane.seed, 5, seed),
         FacadeStyle::Factory => 0.10 + 0.16 * hash01(pane.seed, 5, seed),
+        // Village glass: cheap single glazing, so a touch cloudier.
+        FacadeStyle::UrbanVillage => 0.07 + 0.06 * hash01(pane.seed, 5, seed),
     };
 
     // A point light inside the room: brightest at the centre of the pane, with
@@ -823,7 +870,7 @@ fn fbm(u: f32, v: f32, freq: u32, seed: u32, octaves: u32) -> f32 {
 mod tests {
     use super::*;
 
-    const STYLES: [FacadeStyle; 3] = FacadeStyle::ALL;
+    const STYLES: [FacadeStyle; STYLE_COUNT] = FacadeStyle::ALL;
 
     /// Every style must end up as a wall with countable windows, not as noise.
     #[test]

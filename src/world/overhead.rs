@@ -78,6 +78,12 @@ pub const CROSS_WIRE_HEIGHTS: [f32; 2] = [6.0, 6.5];
 /// Share of pole pairs that carry a cross-street drop line.
 pub const CROSS_WIRE_CHANCE: f32 = 0.4;
 
+/// Share of pole pairs carrying a drop line when either curb is a 城中村 lane
+/// (2026-11 field visit: wires cross the narrow lanes constantly, pole to
+/// pole and house to house). The lanes are short and the pole lines dense,
+/// so the same roll lands far more cables per metre of walking.
+pub const VILLAGE_CROSS_WIRE_CHANCE: f32 = 0.85;
+
 /// Sag baked into the unit cross-street span (m) at [`CROSS_WIRE_NOMINAL`].
 ///
 /// A cross-street drop is strung tight over a short gap, so it sags far less
@@ -303,10 +309,16 @@ pub fn place_overhead_furniture(
     // line to hang from, and its block polygon is not solid, so a post there
     // would stand in walkable space.
     let mut sides: [Option<BuildingParams>; 2] = [None; 2];
+    // 城中村 flags per side, kept next to the params: they drive the denser
+    // pole replay and the cross-wire chance. Must match the flag
+    // `plan_chunk` passes `place_street_furniture` (same block kinds, read
+    // the same way), or the replayed poles stop meeting the spawned ones.
+    let mut village: [bool; 2] = [false; 2];
     for (i, block_id) in [edge.left_block, edge.right_block].into_iter().enumerate() {
         let Some(block) = block_id.and_then(|id| graph.blocks.get(id as usize)) else {
             continue;
         };
+        village[i] = block.kind == crate::world::layout_graph::BlockType::UrbanVillage;
         sides[i] = BuildingParams::of(block.kind);
     }
     let [Some(left), Some(right)] = sides else {
@@ -316,8 +328,8 @@ pub fn place_overhead_furniture(
 
     let side_normals = [normal, -normal];
     let poles: [Vec<props::PoleSlot>; 2] = [
-        props::pole_slots(seed, edge_index as u32, 0, length),
-        props::pole_slots(seed, edge_index as u32, 1, length),
+        props::pole_slots(seed, edge_index as u32, 0, length, village[0]),
+        props::pole_slots(seed, edge_index as u32, 1, length, village[1]),
     ];
     // Where the street trees actually stand, replayed from the placement
     // stream. Empty when no tree asset is loaded, which is also when no tree
@@ -343,7 +355,21 @@ pub fn place_overhead_furniture(
 
     let mut rng = overhead_rng(seed, edge_index as u32);
 
-    place_cross_wires(plan, &mut rng, mid, dir, normal, stand, &poles);
+    let cross_wire_chance = if village[0] || village[1] {
+        VILLAGE_CROSS_WIRE_CHANCE
+    } else {
+        CROSS_WIRE_CHANCE
+    };
+    place_cross_wires(
+        plan,
+        &mut rng,
+        mid,
+        dir,
+        normal,
+        stand,
+        &poles,
+        cross_wire_chance,
+    );
     place_long_brackets(plan, &mut rng, mid, dir, side_normals, stand, &poles);
     place_scaffold(
         plan, &mut rng, mid, dir, normal, curb, length, &poles, &trees, params,
@@ -356,6 +382,10 @@ pub fn place_overhead_furniture(
 /// Both sides get the same number of slots (same edge length), so pairing by
 /// index is well defined. The two poles are jittered independently, which
 /// leaves the span slightly diagonal -- exactly how a real drop line looks.
+///
+/// `chance` is the per-pole-pair share computed by the caller: 0.4 for the
+/// ordinary streets, 0.85 when either curb is a 城中村 lane.
+#[allow(clippy::too_many_arguments)]
 fn place_cross_wires(
     plan: &mut ChunkPlan,
     rng: &mut StdRng,
@@ -364,10 +394,11 @@ fn place_cross_wires(
     normal: Vec2,
     stand: f32,
     poles: &[Vec<props::PoleSlot>; 2],
+    chance: f32,
 ) {
     for (a, b) in poles[0].iter().zip(poles[1].iter()) {
         let roll: f32 = rng.random();
-        if roll >= CROSS_WIRE_CHANCE {
+        if roll >= chance {
             continue;
         }
         let start = mid + dir * a.along + normal * stand;
@@ -781,10 +812,19 @@ mod tests {
             let mut plan = ChunkPlan::default();
             let mut rng = overhead_rng(9, edge);
             let poles = [
-                props::pole_slots(9, edge, 0, 120.0),
-                props::pole_slots(9, edge, 1, 120.0),
+                props::pole_slots(9, edge, 0, 120.0, false),
+                props::pole_slots(9, edge, 1, 120.0, false),
             ];
-            place_cross_wires(&mut plan, &mut rng, MID, DIR, NORMAL, STAND, &poles);
+            place_cross_wires(
+                &mut plan,
+                &mut rng,
+                MID,
+                DIR,
+                NORMAL,
+                STAND,
+                &poles,
+                CROSS_WIRE_CHANCE,
+            );
             if !plan.objects.is_empty() {
                 found = Some(plan.objects);
                 break;
@@ -827,8 +867,8 @@ mod tests {
             let mut plan = ChunkPlan::default();
             let mut rng = overhead_rng(11, edge);
             let poles = [
-                props::pole_slots(11, edge, 0, 150.0),
-                props::pole_slots(11, edge, 1, 150.0),
+                props::pole_slots(11, edge, 0, 150.0, false),
+                props::pole_slots(11, edge, 1, 150.0, false),
             ];
             place_long_brackets(
                 &mut plan,
@@ -1080,10 +1120,19 @@ mod tests {
             let dir = Vec2::new(1.0, 0.0);
             let normal = Vec2::new(0.0, 1.0);
             let poles = [
-                props::pole_slots(7, edge, 0, 120.0),
-                props::pole_slots(7, edge, 1, 120.0),
+                props::pole_slots(7, edge, 0, 120.0, false),
+                props::pole_slots(7, edge, 1, 120.0, false),
             ];
-            place_cross_wires(&mut plan, &mut rng, mid, dir, normal, 4.45, &poles);
+            place_cross_wires(
+                &mut plan,
+                &mut rng,
+                mid,
+                dir,
+                normal,
+                4.45,
+                &poles,
+                CROSS_WIRE_CHANCE,
+            );
             plan.objects
         };
         assert_eq!(furniture(3), furniture(3), "same edge, same overhead");

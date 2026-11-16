@@ -142,6 +142,7 @@ fn wall_tint(style: FacadeStyle) -> [f32; 3] {
         FacadeStyle::OldCity => [0.54, 0.50, 0.44],
         FacadeStyle::Apartment => [0.47, 0.47, 0.49],
         FacadeStyle::Factory => [0.27, 0.26, 0.25],
+        FacadeStyle::UrbanVillage => [0.55, 0.50, 0.42],
     }
 }
 

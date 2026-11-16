@@ -53,6 +53,8 @@ pub enum PrismKind {
     OldCity,
     Apartment,
     Factory,
+    /// 城中村 lane blocks: solid like the rest, debugged in its own colour.
+    UrbanVillage,
     /// The ring wall closing off the scenery band.
     SceneryRing,
 }
@@ -210,6 +212,7 @@ fn prism_kind(kind: BlockType) -> PrismKind {
         BlockType::OldCity => PrismKind::OldCity,
         BlockType::Apartment => PrismKind::Apartment,
         BlockType::Factory => PrismKind::Factory,
+        BlockType::UrbanVillage => PrismKind::UrbanVillage,
         // Walkable types are filtered out by `is_solid`; the ring is separate.
         BlockType::Plaza | BlockType::Forest => PrismKind::SceneryRing,
     }
@@ -221,7 +224,10 @@ pub fn is_solid(kind: BlockType, is_outer: bool) -> bool {
     match kind {
         BlockType::Plaza => false,
         BlockType::Forest => is_outer,
-        BlockType::OldCity | BlockType::Apartment | BlockType::Factory => true,
+        BlockType::OldCity
+        | BlockType::UrbanVillage
+        | BlockType::Apartment
+        | BlockType::Factory => true,
     }
 }
 

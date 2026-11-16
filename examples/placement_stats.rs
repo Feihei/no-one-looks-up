@@ -23,10 +23,12 @@ fn main() {
                 for o in plan.objects {
                     let key = match o.kind {
                         PlacedKind::Building(BlockType::OldCity) => "building/old",
+                        PlacedKind::Building(BlockType::UrbanVillage) => "building/village",
                         PlacedKind::Building(BlockType::Apartment) => "building/apt",
                         PlacedKind::Building(BlockType::Factory) => "building/fac",
                         PlacedKind::Building(_) => "building/other",
                         PlacedKind::SceneryBuilding(BlockType::OldCity) => "band/old",
+                        PlacedKind::SceneryBuilding(BlockType::UrbanVillage) => "band/village",
                         PlacedKind::SceneryBuilding(BlockType::Apartment) => "band/apt",
                         PlacedKind::SceneryBuilding(_) => "band/fac",
                         PlacedKind::StreetTree => "tree/street",
@@ -39,6 +41,7 @@ fn main() {
                             PropKind::AcUnit => "prop/ac",
                             PropKind::Downspout => "prop/pipe",
                             PropKind::Balcony => "prop/balcony",
+                            PropKind::ExternalStair => "prop/ext_stair",
                             PropKind::WaterTank => "prop/tank",
                             PropKind::Chimney => "prop/chimney",
                             PropKind::StairBox => "prop/stair",

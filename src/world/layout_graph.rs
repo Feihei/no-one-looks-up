@@ -33,6 +33,9 @@ pub enum BlockType {
     Apartment,
     /// 旧厂房：tall volumes.
     Factory,
+    /// 城中村：3-storey self-built houses packed against 2-3.5 m lanes,
+    /// street trees nowhere, clutter everywhere (2026-11 field visit).
+    UrbanVillage,
     /// 广场：open plaza, walkable.
     Plaza,
     /// 树林：edge transition zone, dense trees.

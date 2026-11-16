@@ -12,6 +12,7 @@
 //! | 老城 | 双坡 gable, eave overhang baked | ADR-0001: "低矮坡屋顶"; a ridge along the street keeps the skyline a clean saw-free band and the gable ends face the side streets |
 //! | 旧公寓 | parapet ring (女儿墙) | the 1980s slab's flat top with a 0.9 m wall is its whole identity from below |
 //! | 旧厂房 | sawtooth (锯齿) | ADR-0001: "高耸体量"; teeth repeating along the FRONTAGE cut the silhouette into the zigzag that reads as a factory |
+//! | 城中村 | low parapet ring | the self-built flat deck behind a 0.55 m lean-over wall, carrying water tanks and stair bulkheads |
 //!
 //! # Roofs are dark, on purpose
 //!
@@ -93,6 +94,16 @@ impl RoofProfile {
                 rise: 2.2,
                 pitch: SAWTOOTH_PITCH,
                 tint: [0.22, 0.22, 0.24],
+            },
+            // 城中村 self-built roofs are flat decks behind a low parapet,
+            // carrying the water tanks and stair bulkheads the prop pass
+            // hangs on Parapet roofs. A 0.55 m parapet is the low wall a
+            // resident can lean over to rig a wire across the lane.
+            FacadeStyle::UrbanVillage => Self {
+                kind: RoofKind::Parapet,
+                rise: 0.55,
+                pitch: 0.0,
+                tint: [0.30, 0.28, 0.26],
             },
         }
     }
@@ -477,6 +488,7 @@ mod tests {
                 FacadeStyle::OldCity => 0.54,
                 FacadeStyle::Apartment => 0.47,
                 FacadeStyle::Factory => 0.27,
+                FacadeStyle::UrbanVillage => 0.40,
             };
             assert!(
                 luma < limit,

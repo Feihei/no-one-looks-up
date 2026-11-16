@@ -27,6 +27,7 @@ fn main() {
                     let id = e.left_block.or(e.right_block).unwrap();
                     let k = match g.blocks[id as usize].kind {
                         BlockType::OldCity => "old",
+                        BlockType::UrbanVillage => "village",
                         BlockType::Apartment => "apt",
                         BlockType::Factory => "fac",
                         BlockType::Plaza => "plaza",

@@ -60,6 +60,9 @@ pub enum PropKind {
     Downspout,
     /// 阳台: slab + railing strip on an apartment facade (one baked mesh).
     Balcony,
+    /// 外挂楼梯: one baked floor-flight of an external steel stair, hung on
+    /// the street facade. A building stacks one instance per storey.
+    ExternalStair,
     /// 水箱: roof water tank on a flat (parapet) roof.
     WaterTank,
     /// 烟囱: a kitchen stove pipe through old-city gables, a tall stack on
@@ -108,6 +111,11 @@ pub const AC_DEPTH: f32 = 0.3;
 /// on a 12-bay, 6-floor slab.
 pub const APARTMENT_AC_CAP: usize = 14;
 
+/// Cap on AC condensers per 城中村 house: a 3-bay, 3-floor facade at a 0.30
+/// roll would average ~2.7 condensers, but a lucky roll must not tile the
+/// whole wall.
+pub const VILLAGE_AC_CAP: usize = 6;
+
 /// Utility pole height (m). Tall enough that the lowest wire clears the
 /// tallest old-city ridge (6 m wall + ~1.27 m gable) with room to spare.
 pub const POLE_HEIGHT: f32 = 8.0;
@@ -120,6 +128,12 @@ pub const POLE_STANDOFF: f32 = 0.45;
 /// Nominal pole spacing along an edge (m). Edges are ~50 m cell sides, so
 /// most get two poles and one wire span.
 pub const POLE_SPACING: f32 = 30.0;
+
+/// Pole spacing along a 城中村 lane edge (m): poles every ~14 m, so a 50 m
+/// edge carries four instead of two. The lanes are too narrow for the poles
+/// to stand back from — they hug the curb line and the wires crowd the sky
+/// over them (2026-11 field visit: "电线杆和电线会更密集凌乱").
+pub const VILLAGE_POLE_SPACING: f32 = 14.0;
 
 /// Wire attachment heights on the pole (m), stacked the way concrete poles
 /// carry a three-wire run.
@@ -502,6 +516,104 @@ pub fn place_building_props(
                 );
             }
         }
+        FacadeStyle::UrbanVillage => {
+            // 城中村 facades carry MORE than the old city, not less: every
+            // self-built house along a 2-3.5 m lane shows its rent economy.
+            // Probabilities are up across the board vs. OldCity, and the
+            // external stair (外挂楼梯) joins the set.
+            //
+            // 雨棚: almost every bay that faces the lane gets a canvas --
+            // shops on the ground floor, kitchens above.
+            let bays = (l / 2.0).round().max(1.0) as usize;
+            for b in 0..bays {
+                if rng.random::<f32>() >= 0.65 {
+                    continue;
+                }
+                let canvas = u8::from(rng.random::<f32>() < 0.5);
+                push_prop(
+                    plan,
+                    PropKind::Awning,
+                    face + along * bay_u(b, bays, l),
+                    out_yaw,
+                    Vec3::ONE,
+                    AWNING_MOUNT,
+                    canvas,
+                );
+            }
+            // 空调外机: one roll per (bay, floor) with a per-building cap --
+            // the same grid logic as the apartments, but hung on a 9 m house
+            // it reads as a condenser on nearly every landing.
+            let floors = (h / 3.0).round().max(1.0) as i32;
+            let mut hung = 0;
+            for floor in 0..floors {
+                for b in 0..bays {
+                    if hung >= VILLAGE_AC_CAP {
+                        break;
+                    }
+                    if rng.random::<f32>() < 0.30 {
+                        let variant = u8::from(rng.random::<f32>() < rust_chance);
+                        push_prop(
+                            plan,
+                            PropKind::AcUnit,
+                            face + along * bay_u(b, bays, l) + street * (AC_DEPTH * 0.5),
+                            building.yaw,
+                            Vec3::new(0.75, 0.55, AC_DEPTH),
+                            floor as f32 * 3.0 + 0.3,
+                            variant,
+                        );
+                        hung += 1;
+                    }
+                }
+            }
+            // 落水管: one per house at a facade end, more often than the old
+            // city (the lanes flood; every house drains hard).
+            if rng.random::<f32>() < 0.5 {
+                let side = if rng.random::<bool>() { 1.0 } else { -1.0 };
+                let variant = u8::from(rng.random::<f32>() < rust_chance);
+                push_prop(
+                    plan,
+                    PropKind::Downspout,
+                    face + along * (side * (l * 0.5 - 0.15)),
+                    building.yaw,
+                    Vec3::new(0.18, h, 0.18),
+                    0.0,
+                    variant,
+                );
+            }
+            // 烟囱: kitchen stove pipe through the parapet, like the old
+            // city's gable pipes.
+            if rng.random::<f32>() < 0.35 {
+                let u = rng.random_range(-l * 0.3..=l * 0.3);
+                push_prop(
+                    plan,
+                    PropKind::Chimney,
+                    building.position + along * u,
+                    building.yaw,
+                    Vec3::new(0.36, 1.5, 0.36),
+                    h - 0.2,
+                    0,
+                );
+            }
+            // 外挂楼梯: a steep steel flight hugging the facade, one baked
+            // floor-flight per storey, at a randomly picked end. Half the
+            // houses have one; the variant bit rusts it on worn houses.
+            if rng.random::<f32>() < 0.45 {
+                let side = if rng.random::<bool>() { 1.0 } else { -1.0 };
+                let variant = u8::from(rng.random::<f32>() < rust_chance);
+                let u = side * (l * 0.5 - 0.55);
+                for floor in 0..floors {
+                    push_prop(
+                        plan,
+                        PropKind::ExternalStair,
+                        face + along * u,
+                        out_yaw,
+                        Vec3::ONE,
+                        floor as f32 * 3.0,
+                        variant,
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -527,19 +639,37 @@ pub struct PoleSlot {
 /// so extracting it moved no pole by a millimetre (the furniture stability
 /// test pins that). The cross-street pass in `world::overhead` replays it to
 /// hang cables on real poles rather than guessing where the poles are.
-pub fn pole_slots(seed: u64, edge_index: u32, side: u32, edge_length: f32) -> Vec<PoleSlot> {
+///
+/// `village` densifies the line for a 城中村 lane curb
+/// ([`VILLAGE_POLE_SPACING`] instead of [`POLE_SPACING`]); both this pass and
+/// the overhead replay must agree on the flag, or the wires stop meeting the
+/// poles.
+pub fn pole_slots(
+    seed: u64,
+    edge_index: u32,
+    side: u32,
+    edge_length: f32,
+    village: bool,
+) -> Vec<PoleSlot> {
     let mut rng = edge_salt_rng(seed, edge_index, side);
     // Pole slots along the edge, evenly spaced like the tree candidates,
     // with one deterministic micro-jitter so a street of poles does not
     // read as a parade. The jitter draws even when nothing else does, so
     // the stream stays stable under any future rule change.
-    let count = ((edge_length / POLE_SPACING).round() as usize).max(2);
+    let spacing = if village {
+        VILLAGE_POLE_SPACING
+    } else {
+        POLE_SPACING
+    };
+    let count = ((edge_length / spacing).round() as usize).max(2);
     let mut slots = Vec::with_capacity(count);
     for i in 0..count {
         let t = (i as f32 + 0.5) / count as f32;
         let along = (t - 0.5) * edge_length + rng.random_range(-2.5..=2.5);
-        // Street lamps are common but not universal on old streets.
-        let lamp = rng.random::<f32>() < 0.45;
+        // Street lamps are common but not universal on old streets; village
+        // lanes light themselves off the shopfronts, so lamps are rarer.
+        let lamp_roll = 0.45;
+        let lamp = rng.random::<f32>() < lamp_roll;
         let crossarm_jitter = rng.random_range(-CROSSARM_YAW_JITTER..=CROSSARM_YAW_JITTER);
         slots.push(PoleSlot {
             along,
@@ -561,6 +691,9 @@ pub fn pole_slots(seed: u64, edge_index: u32, side: u32, edge_length: f32) -> Ve
 /// dedicated RNG salt, so neither the approved wear sequence nor the tree
 /// stream moves by a single draw. Poles always spawn (every street carries
 /// lines); only the lamp brackets roll.
+///
+/// `village` densifies the pole line for a 城中村 lane curb; the flag must
+/// match the one `world::overhead` replays the slots with.
 #[allow(clippy::too_many_arguments)]
 pub fn place_street_furniture(
     plan: &mut ChunkPlan,
@@ -572,10 +705,11 @@ pub fn place_street_furniture(
     edge_normal: bevy::math::Vec2,
     edge_length: f32,
     curb: f32,
+    village: bool,
 ) {
     let street_dir = -edge_normal;
     let stand_line = edge_mid + edge_normal * (curb + POLE_STANDOFF);
-    let slots = pole_slots(seed, edge_index, side, edge_length);
+    let slots = pole_slots(seed, edge_index, side, edge_length, village);
 
     for slot in &slots {
         let position = stand_line + edge_dir * slot.along;
@@ -784,6 +918,55 @@ pub fn bake_balcony() -> Mesh {
     buf.build()
 }
 
+/// One floor-flight of the 外挂楼梯 (external steel/concrete stair), baked at
+/// real size: wall plane at z = 0, the bottom step's top at local y = 0, the
+/// flight rising a full 3.0 m storey toward +y and projecting ~1.5 m toward
+/// +z. A building stacks one instance per storey (`base = floor * 3.0`), so
+/// the flights read as one continuous run hugging the facade.
+///
+/// The pitch is deliberately steep ([`STAIR_RUN`] per 0.214 m rise, ~63° from
+/// the ground): village stair runs steal every centimetre from a lane that
+/// is already 2-3.5 m wide, and the shallow 30° flight of a mainstream
+/// stairwell would eat a full walking lane.
+pub fn bake_external_stair() -> Mesh {
+    /// Steps per 3.0 m storey: a 0.214 m rise, steep but climbable.
+    const STEPS: usize = 14;
+    /// Rise per step (m): exactly 3.0 / 14, so the flight tops out at a
+    /// whole storey line.
+    const RISE: f32 = 3.0 / STEPS as f32;
+    /// Run per step (m): the tread depth the flight steals from the lane.
+    const RUN: f32 = 0.11;
+    /// Half-width of the flight (m): a 0.9 m stair, one person wide.
+    const HW: f32 = 0.45;
+    /// Stepped handrail height above each tread (m).
+    const RAIL: f32 = 0.85;
+    /// Handrail thickness (m).
+    const RAIL_T: f32 = 0.05;
+
+    let mut buf = MeshBuf::new();
+    // Solid stepped mass: each tread's box spans from the wall out to its own
+    // leading edge, stacked one rise band above the last -- the classic
+    // cast-against-the-wall stair profile, 14 boxes, no overlapping volume.
+    for i in 0..STEPS {
+        let y0 = i as f32 * RISE;
+        let z1 = (i + 1) as f32 * RUN;
+        push_box(&mut buf, [-HW, y0, 0.0], [HW, y0 + RISE, z1]);
+        // Handrails: a thin stepped band on both open sides, rising with the
+        // treads so the run reads as climbable steel, not a wall stripe.
+        push_box(
+            &mut buf,
+            [-HW, y0, z1 - RAIL_T],
+            [-HW + RAIL_T, y0 + RISE + RAIL, z1],
+        );
+        push_box(
+            &mut buf,
+            [HW - RAIL_T, y0, z1 - RAIL_T],
+            [HW, y0 + RISE + RAIL, z1],
+        );
+    }
+    buf.build()
+}
+
 /// The crossarm: a horizontal beam across the pole top with two insulator
 /// pegs where the wire run sits, plus a clamp around the pole. Baked at real
 /// size with the beam centre at the origin, because the arm's proportions
@@ -909,6 +1092,7 @@ mod tests {
                 FacadeStyle::OldCity => BlockType::OldCity,
                 FacadeStyle::Apartment => BlockType::Apartment,
                 FacadeStyle::Factory => BlockType::Factory,
+                FacadeStyle::UrbanVillage => BlockType::UrbanVillage,
             }),
             position: bevy::math::Vec2::new(100.0 + offset, 200.0),
             yaw: 0.0,
@@ -973,6 +1157,7 @@ mod tests {
             (FacadeStyle::OldCity, Vec3::new(6.0, 6.0, 5.0)),
             (FacadeStyle::Apartment, Vec3::new(33.0, 18.0, 13.0)),
             (FacadeStyle::Factory, Vec3::new(50.0, 24.0, 50.0)),
+            (FacadeStyle::UrbanVillage, Vec3::new(7.0, 9.0, 6.0)),
         ] {
             for offset in [0.0, 3.7, 11.2] {
                 let center = building(style, offset, size, 0.5).position;
@@ -1029,6 +1214,7 @@ mod tests {
             (FacadeStyle::OldCity, Vec3::new(6.0, 6.0, 5.0)),
             (FacadeStyle::Apartment, Vec3::new(33.0, 18.0, 13.0)),
             (FacadeStyle::Factory, Vec3::new(50.0, 24.0, 50.0)),
+            (FacadeStyle::UrbanVillage, Vec3::new(7.0, 9.0, 6.0)),
         ] {
             for p in props_of(style, size, 0.5, 2.3) {
                 let PlacedKind::Prop(kind) = p.kind else {
@@ -1141,6 +1327,71 @@ mod tests {
             (26..=40).contains(&chimneys),
             "chimney fraction {chimneys}/40 is off the 0.8 roll"
         );
+
+        // 城中村 houses: dense lane-facing clutter and the external stair.
+        // The stair is one baked flight per storey, so every stair-carrying
+        // house of this 3-storey sample must show exactly three flights on
+        // storey lines.
+        let mut stair_houses = 0;
+        let mut flight_checks = 0;
+        let mut awning_houses = 0;
+        let mut ac_houses = 0;
+        for i in 0..20 {
+            let props = props_of(
+                FacadeStyle::UrbanVillage,
+                Vec3::new(7.0, 9.0, 6.0),
+                0.4,
+                i as f32,
+            );
+            let flights: Vec<&PlacedObject> = props
+                .iter()
+                .filter(|p| matches!(p.kind, PlacedKind::Prop(PropKind::ExternalStair)))
+                .collect();
+            if !flights.is_empty() {
+                stair_houses += 1;
+                assert_eq!(
+                    flights.len(),
+                    3,
+                    "one flight per storey, got {}",
+                    flights.len()
+                );
+                for f in &flights {
+                    let storey = (f.base / 3.0).round() as i32;
+                    assert!(
+                        (0..3).contains(&storey) && (f.base - storey as f32 * 3.0).abs() < 1e-4,
+                        "flight base {} is not on a storey line",
+                        f.base
+                    );
+                    flight_checks += 1;
+                }
+            }
+            awning_houses += usize::from(
+                props
+                    .iter()
+                    .any(|p| matches!(p.kind, PlacedKind::Prop(PropKind::Awning))),
+            );
+            ac_houses += usize::from(
+                props
+                    .iter()
+                    .any(|p| matches!(p.kind, PlacedKind::Prop(PropKind::AcUnit))),
+            );
+        }
+        assert!(
+            stair_houses >= 3,
+            "0.45 roll across 20 houses must build stairs often, got {stair_houses}"
+        );
+        assert!(
+            flight_checks >= 9,
+            "every stair is a full 3-storey run, got {flight_checks} flights"
+        );
+        assert!(
+            awning_houses >= 12,
+            "0.65-per-bay roll across 20 houses must dress the lanes, got {awning_houses}"
+        );
+        assert!(
+            ac_houses >= 10,
+            "0.30-per-(bay,floor) roll must hang condensers, got {ac_houses}"
+        );
     }
 
     #[test]
@@ -1160,6 +1411,17 @@ mod tests {
         );
         let fac = props_of(FacadeStyle::Factory, Vec3::new(50.0, 24.0, 50.0), 0.9, 0.0).len();
         assert!(fac <= 8, "factory dressing {fac} exceeds the shed budget");
+        // 城中村 house: 4 awnings + 6 condensers (cap) + downspout + chimney
+        // + 3 stair flights. The clutter is the point, but it must stay
+        // bounded: the cap holds the wall rolls in check.
+        let vil = props_of(
+            FacadeStyle::UrbanVillage,
+            Vec3::new(7.0, 9.0, 6.0),
+            0.9,
+            0.0,
+        )
+        .len();
+        assert!(vil <= 20, "village dressing {vil} exceeds the house budget");
     }
 
     /// Extracts the triangle soup of a baked mesh.
@@ -1278,6 +1540,12 @@ mod tests {
     /// Furniture for one synthetic edge side: dir = +x, curb at 4 m, the
     /// into-block normal flipped per side like `plan_chunk` passes it.
     fn furniture(side: u32, length: f32) -> Vec<PlacedObject> {
+        furniture_village(side, length, false)
+    }
+
+    /// The village-dense variant of [`furniture`]: pole spacing shrinks to
+    /// [`VILLAGE_POLE_SPACING`], so a 120 m edge carries 9 poles instead of 4.
+    fn furniture_village(side: u32, length: f32, village: bool) -> Vec<PlacedObject> {
         let mut plan = ChunkPlan::default();
         place_street_furniture(
             &mut plan,
@@ -1289,6 +1557,7 @@ mod tests {
             bevy::math::Vec2::new(0.0, if side == 0 { 1.0 } else { -1.0 }),
             length,
             4.0,
+            village,
         );
         plan.objects
     }
@@ -1317,6 +1586,31 @@ mod tests {
                 assert!(
                     (p.size.y - POLE_HEIGHT).abs() < 1e-4,
                     "pole is {POLE_HEIGHT} m"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn village_lanes_carry_more_poles() {
+        for side in [0u32, 1] {
+            let objects = furniture_village(side, 120.0, true);
+            let poles: Vec<&PlacedObject> = objects
+                .iter()
+                .filter(|o| matches!(o.kind, PlacedKind::Prop(PropKind::Pole)))
+                .collect();
+            assert_eq!(
+                poles.len(),
+                9,
+                "a 120 m lane edge carries round(120/14) = 9 poles"
+            );
+            // The curb offset is unchanged: dense is spacing, not standing.
+            let sign = if side == 0 { 1.0 } else { -1.0 };
+            for p in &poles {
+                let rel = p.position - EDGE_MID;
+                assert!(
+                    (rel.y - sign * (4.0 + POLE_STANDOFF)).abs() < 1e-4,
+                    "lane poles still hug the curb on side {side}"
                 );
             }
         }
@@ -1449,6 +1743,7 @@ mod tests {
                     bevy::math::Vec2::new(0.0, 1.0),
                     120.0,
                     4.0,
+                    false,
                 );
                 plan.objects != a
             })

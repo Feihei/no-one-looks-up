@@ -18,8 +18,7 @@ use bevy::prelude::*;
 
 use crate::plugins::facade::{FacadeMaterial, facade_material};
 use crate::world::collision::CollisionIndex;
-use crate::world::facade::{FacadeStyle, VARIANT_COUNT, bake_facade, texture_image};
-use crate::world::layout_graph::BlockType;
+use crate::world::facade::{FacadeStyle, STYLE_COUNT, VARIANT_COUNT, bake_facade, texture_image};
 use crate::world::layout_graph::LayoutGraph;
 use crate::world::path_network::{WorldSeed, generate_world};
 use crate::world::placement;
@@ -324,16 +323,17 @@ pub(crate) struct PlacementAssets {
     /// draw state beyond the bucket switch (R3.6) and neighbours rarely share
     /// the same 12 m tile (R3.11).
     ///
-    /// 3 x 2 x 4 = 24 materials for the whole city, which is the number that
-    /// makes this affordable at all: one material per building would put a
-    /// streaming window into the thousands of draw calls.
+    /// 4 x 2 x 4 = 32 materials for the whole city (2026-11: the 城中村
+    /// style joins), which is the number that makes this affordable at all:
+    /// one material per building would put a streaming window into the
+    /// thousands of draw calls.
     facade_materials:
-        [[[Handle<FacadeMaterial>; placement::WEAR_BUCKETS]; VARIANT_COUNT as usize]; 3],
+        [[[Handle<FacadeMaterial>; placement::WEAR_BUCKETS]; VARIANT_COUNT as usize]; STYLE_COUNT],
     /// One roof material and mesh set per style. The gable and sawtooth tooth
     /// are unit meshes scaled per instance; the parapet is four instances of the
     /// shared unit cube, because its wall thickness must stay ~0.25 m absolute
     /// and a baked ring would scale it with the building.
-    roofs: [RoofAssets; 3],
+    roofs: [RoofAssets; STYLE_COUNT],
     plaza_material: Handle<StandardMaterial>,
     /// One baked mesh pair per `(lod, species, variant)` (R3.9): a whole tree
     /// in a single `Mesh3d` per part, so a chunk costs one entity per tree part
@@ -379,6 +379,10 @@ pub(crate) struct PropAssets {
     awning: Handle<Mesh>,
     /// The balcony slab + railing, wall plane at local z = 0 (real size).
     balcony: Handle<Mesh>,
+    /// One floor-flight of the 外挂楼梯 external stair, wall plane at local
+    /// z = 0, ground step at local y = 0, top step at y = 3.0 (real size).
+    /// A building stacks one instance per floor at `base = floor * 3.0`.
+    external_stair: Handle<Mesh>,
     /// The street-lamp bracket reaching local +x (real size).
     lamp_arm: Handle<Mesh>,
     /// The glowing lamp head in the bracket (real size).
@@ -455,6 +459,7 @@ fn build_prop_assets(
         ],
         awning: meshes.add(crate::world::props::bake_awning()),
         balcony: meshes.add(crate::world::props::bake_balcony()),
+        external_stair: meshes.add(crate::world::props::bake_external_stair()),
         lamp_arm: meshes.add(crate::world::props::bake_lamp_arm()),
         lamp_head: meshes.add(crate::world::props::bake_lamp_head()),
         crossarm: meshes.add(crate::world::props::bake_crossarm()),
@@ -498,7 +503,7 @@ impl PlacementAssets {
 fn build_roof_assets(
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<StandardMaterial>,
-) -> [RoofAssets; 3] {
+) -> [RoofAssets; STYLE_COUNT] {
     FacadeStyle::ALL.map(|style| {
         let profile = RoofProfile::of(style);
         RoofAssets {
@@ -527,17 +532,18 @@ fn build_facade_materials(
     materials: &mut Assets<FacadeMaterial>,
     mut images: Option<&mut Assets<Image>>,
     palette: &placement::StylePalette,
-) -> [[[Handle<FacadeMaterial>; placement::WEAR_BUCKETS]; VARIANT_COUNT as usize]; 3] {
-    let mut out: [[[Handle<FacadeMaterial>; placement::WEAR_BUCKETS]; VARIANT_COUNT as usize]; 3] =
-        std::array::from_fn(|_| {
-            std::array::from_fn(|_| std::array::from_fn(|_| Handle::<FacadeMaterial>::default()))
-        });
+) -> [[[Handle<FacadeMaterial>; placement::WEAR_BUCKETS]; VARIANT_COUNT as usize]; STYLE_COUNT] {
+    let mut out: [[[Handle<FacadeMaterial>; placement::WEAR_BUCKETS]; VARIANT_COUNT as usize];
+        STYLE_COUNT] = std::array::from_fn(|_| {
+        std::array::from_fn(|_| std::array::from_fn(|_| Handle::<FacadeMaterial>::default()))
+    });
 
     for (style_index, style) in FacadeStyle::ALL.into_iter().enumerate() {
         let tint = match style {
             FacadeStyle::OldCity => palette.old_city,
             FacadeStyle::Apartment => palette.apartment,
             FacadeStyle::Factory => palette.factory,
+            FacadeStyle::UrbanVillage => palette.urban_village,
         };
         for (variant_index, slot) in out[style_index].iter_mut().enumerate() {
             let variant = variant_index as u8;
@@ -881,6 +887,17 @@ fn spawn_prop(
             object.base,
             object.size,
         ),
+        // 外挂楼梯: one baked floor-flight hung at its ground step; a
+        // building stacks one instance per storey (see the village arm in
+        // `place_building_props`). The variant bit rusts the steel on worn
+        // buildings, like the other facade fixtures.
+        PropKind::ExternalStair => (
+            "ExternalStair",
+            props.external_stair.clone(),
+            props.fixture(object.variant),
+            object.base,
+            object.size,
+        ),
         PropKind::WaterTank => (
             "WaterTank",
             assets.unit_cylinder.clone(),
@@ -1027,11 +1044,14 @@ fn spawn_chunk_content(
             // the city continuing rather than as a backdrop.
             placement::PlacedKind::Building(kind)
             | placement::PlacedKind::SceneryBuilding(kind) => {
-                let style = match kind {
-                    BlockType::OldCity => 0,
-                    BlockType::Apartment => 1,
-                    _ => 2,
-                };
+                // Style index into FacadeStyle::ALL, derived from the enum so
+                // a new style cannot drift out of sync with its row here.
+                // Building/SceneryBuilding kinds always carry a facade style;
+                // walkable kinds never plan a building at all.
+                let style = FacadeStyle::ALL
+                    .iter()
+                    .position(|s| Some(*s) == FacadeStyle::of(kind))
+                    .expect("building kinds always carry a facade style");
                 let roof = &assets.roofs[style];
                 let material = &assets.facade_materials[style]
                     [object.variant as usize % VARIANT_COUNT as usize]

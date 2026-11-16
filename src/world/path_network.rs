@@ -29,7 +29,7 @@ use crate::world::layout_graph::{
 use crate::world::world_grid::WorldGrid;
 use crate::world::{
     CELL_SIZE, FOREST_EDGE_MAX_DISTANCE_CELLS, GRID_CELLS, OUTER_BAND_CELLS, PERTURB_MAX,
-    STREET_WIDTH_MAX, STREET_WIDTH_MIN,
+    STREET_WIDTH_MAX, STREET_WIDTH_MIN, VILLAGE_STREET_WIDTH_MAX, VILLAGE_STREET_WIDTH_MIN,
 };
 
 /// The save seed driving generation (ADR-0002: one save = one seed = one
@@ -44,11 +44,21 @@ pub const SCENERY_BAND_CELL: u32 = u32::MAX;
 
 /// Type selection weights (port of the original `_assign_interior_type`).
 ///
-/// Interior cells: PLAZA 5%, FOREST 10% (edge transition only), then the
-/// remaining 80% split OLD_CITY 50 / APARTMENT 30 / FACTORY 20 — cumulative
-/// thresholds 0.05 / 0.15 / 0.55 / 0.79 / 0.95 / 1.0.
+/// Interior cells: PLAZA 6%, FOREST 14% (edge transition only), then
+/// URBAN_VILLAGE 10% (2026-11: the 城中村 districts the design asks for), and
+/// the remaining 70% split OLD_CITY 87 / APARTMENT 10 / FACTORY 3 of the
+/// built-up remainder — cumulative thresholds
+/// 0.06 / 0.20 / 0.30 / 0.87-built / 0.97-built / 1.0.
+///
+/// Villages and old-city blocks are both 1x1, so the per-block roll IS the
+/// per-area roll for them; apartments and factories are merged, and their
+/// built-up split below is the same area-biased port as before.
 const P_PLAZA_END: f32 = 0.06;
 const P_FOREST_END: f32 = 0.20;
+/// 城中村 share of interior cells: about one lane district in ten, clustered
+/// nowhere (the scan is row-major, so they scatter), which keeps one usually
+/// within a few minutes of the spawn point without dominating the walk.
+const P_VILLAGE_END: f32 = 0.30;
 /// Built-up split (ADR-0001 "风格比例约 50/30/20"), tuned so the **area**
 /// the player sees matches it: a 1x1 old-city block claims 1 cell while a
 /// factory claims 16-25, so old city gets the larger probability mass.
@@ -186,6 +196,8 @@ fn partition_blocks(rng: &mut StdRng, nodes: &[Vec2]) -> GameResult<(Vec<LayoutB
                 BlockType::Plaza
             } else if roll < P_FOREST_END {
                 BlockType::Forest
+            } else if roll < P_VILLAGE_END {
+                BlockType::UrbanVillage
             } else {
                 let built_roll: f32 = rng.random();
                 if built_roll < P_OLD_AREA {
@@ -219,7 +231,10 @@ fn partition_blocks(rng: &mut StdRng, nodes: &[Vec2]) -> GameResult<(Vec<LayoutB
             let min_side = match kind {
                 BlockType::Apartment => 2,
                 BlockType::Factory => 4,
-                BlockType::OldCity | BlockType::Plaza | BlockType::Forest => 1,
+                BlockType::OldCity
+                | BlockType::UrbanVillage
+                | BlockType::Plaza
+                | BlockType::Forest => 1,
             };
             if merge < min_side {
                 // Degrade to a 1x1 OLD_CITY (the dense low-rise filler);
@@ -229,7 +244,15 @@ fn partition_blocks(rng: &mut StdRng, nodes: &[Vec2]) -> GameResult<(Vec<LayoutB
             }
 
             let block_id = blocks.len() as u32;
-            let street_width = rng.random_range(STREET_WIDTH_MIN..=STREET_WIDTH_MAX);
+            // One draw either way, so the RNG stream keeps one street-width
+            // draw per block regardless of kind (2026-11: villages draw from
+            // their own narrower range — see VILLAGE_STREET_WIDTH_*).
+            let street_width = match kind {
+                BlockType::UrbanVillage => {
+                    rng.random_range(VILLAGE_STREET_WIDTH_MIN..=VILLAGE_STREET_WIDTH_MAX)
+                }
+                _ => rng.random_range(STREET_WIDTH_MIN..=STREET_WIDTH_MAX),
+            };
             let mut cells = Vec::with_capacity((merge * merge) as usize);
             for r in row..(row + merge) {
                 for c in col..(col + merge) {
@@ -328,8 +351,10 @@ fn block_perimeter(row: u32, col: u32, rows: u32, cols: u32, nodes: &[Vec2]) -> 
     poly
 }
 
-/// Merge size for a block type (ADR-0004 table): OLD_CITY/PLAZA/FOREST 1x1,
-/// APARTMENT 2x2 or 3x3, FACTORY 4x4 or 5x5 (random).
+/// Merge size for a block type (ADR-0004 table): OLD_CITY/URBAN_VILLAGE/
+/// PLAZA/FOREST 1x1, APARTMENT 2x2 or 3x3, FACTORY 4x4 or 5x5 (random).
+/// A 城中村 district is one dense 50 m cell of houses against lanes, so it
+/// merges like the old city.
 fn merge_size(rng: &mut StdRng, kind: BlockType) -> u32 {
     match kind {
         BlockType::Apartment => {
@@ -905,16 +930,24 @@ mod tests {
     fn street_widths_stay_in_range() {
         let (_, graph) = world(7);
         for block in &graph.blocks {
+            let (min, max) = match block.kind {
+                BlockType::UrbanVillage => (VILLAGE_STREET_WIDTH_MIN, VILLAGE_STREET_WIDTH_MAX),
+                _ => (STREET_WIDTH_MIN, STREET_WIDTH_MAX),
+            };
             assert!(
-                (STREET_WIDTH_MIN..=STREET_WIDTH_MAX).contains(&block.street_width),
-                "block {} width {} out of range",
+                (min..=max).contains(&block.street_width),
+                "block {} width {} out of {:?} range",
                 block.id,
-                block.street_width
+                block.street_width,
+                block.kind
             );
         }
+        // Edge width is the average of the flanking blocks, so it can be as
+        // narrow as two adjacent 2.0 m village lanes (2.0 m) and as wide as
+        // two adjacent 10 m blocks (10.0 m).
         for edge in &graph.edges {
             assert!(
-                (STREET_WIDTH_MIN..=STREET_WIDTH_MAX).contains(&edge.width),
+                (VILLAGE_STREET_WIDTH_MIN..=STREET_WIDTH_MAX).contains(&edge.width),
                 "street edge width {} out of range",
                 edge.width
             );
@@ -927,7 +960,10 @@ mod tests {
         for block in &graph.blocks {
             let span = block.cells.len();
             match block.kind {
-                BlockType::OldCity | BlockType::Plaza | BlockType::Forest => {
+                BlockType::OldCity
+                | BlockType::UrbanVillage
+                | BlockType::Plaza
+                | BlockType::Forest => {
                     assert_eq!(span, 1, "{:?} blocks merge 1x1", block.kind);
                 }
                 BlockType::Apartment => {

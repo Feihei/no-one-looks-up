@@ -97,6 +97,22 @@ impl BuildingParams {
                 setback: 10.0,
                 street_tree_probability: 0.8,
             },
+            // 城中村 self-built houses (2026-11 field visit): 3 storeys packed
+            // against the lane. Length 4-7 m and depth 5-8 m read as one
+            // house per lane-facing plot; spacing 0 keeps neighbours touching
+            // (贴线而建), the 0.25 m setback is the drainage strip the walls
+            // actually keep from the curb. Heights snap to the OldCity-style
+            // 3.0 m floor, and 8.5-10.0 rounds to exactly 3 storeys on every
+            // building — the "self-built houses are all ~3 floors" rule.
+            // Street trees: none, a lane has no verge for them.
+            BlockType::UrbanVillage => BuildingParams {
+                length: (4.0, 7.0),
+                depth: (5.0, 8.0),
+                height: (8.5, 10.0),
+                spacing: 0.0,
+                setback: 0.25,
+                street_tree_probability: 0.0,
+            },
             BlockType::Plaza | BlockType::Forest => return None,
         };
         Some(params)
@@ -110,6 +126,10 @@ pub struct StylePalette {
     pub old_city: [f32; 3],
     pub apartment: [f32; 3],
     pub factory: [f32; 3],
+    /// 城中村: warm beige plaster and terracotta tile patches, a notch
+    /// warmer than the old city's grey brick so the district reads from a
+    /// distance.
+    pub urban_village: [f32; 3],
     pub plaza: [f32; 3],
 }
 
@@ -119,6 +139,7 @@ impl Default for StylePalette {
             old_city: [0.80, 0.60, 0.30],
             apartment: [0.50, 0.50, 0.60],
             factory: [0.40, 0.25, 0.25],
+            urban_village: [0.78, 0.68, 0.54],
             plaza: [0.70, 0.70, 0.65],
         }
     }
@@ -335,7 +356,9 @@ pub fn plan_chunk(graph: &LayoutGraph, seed: u64, chunk: (i32, i32), tree_assets
             );
             // R3.11 step 11.5: utility poles, street lamps and the wires
             // between them, on this side's curb line. Its RNG salt is
-            // private to the furniture, so nothing upstream moves.
+            // private to the furniture, so nothing upstream moves. Village
+            // curbs double the pole line (2026-11: dense, messy wires over
+            // the lanes); the flag must match the overhead replay's.
             crate::world::props::place_street_furniture(
                 &mut plan,
                 seed,
@@ -346,6 +369,7 @@ pub fn plan_chunk(graph: &LayoutGraph, seed: u64, chunk: (i32, i32), tree_assets
                 normal * sign,
                 length,
                 curb,
+                block.kind == BlockType::UrbanVillage,
             );
         }
         // R3.13: the cross-street overhead layer -- cables, long lamp brackets
@@ -1105,8 +1129,12 @@ mod tests {
                     let PlacedKind::Prop(kind) = object.kind else {
                         continue;
                     };
-                    // Street furniture stands on the curb line by design --
-                    // `streets_carry_poles_at_the_curb` owns that check.
+                    // Street furniture is anchored to the curb/pole line, not
+                    // to a building: the along-street run and the R3.13
+                    // cross-street layer (drop lines, long brackets,
+                    // scaffolds) all hang from `pole_slots` positions.
+                    // `streets_carry_poles_at_the_curb` owns that check; here
+                    // only building-anchored props are asserted.
                     if matches!(
                         kind,
                         PropKind::Pole
@@ -1114,6 +1142,12 @@ mod tests {
                             | PropKind::LampHead
                             | PropKind::CrossArm
                             | PropKind::Wire
+                            | PropKind::CrossWire
+                            | PropKind::LongLampArm
+                            | PropKind::LongLampHead
+                            | PropKind::ScaffoldPost
+                            | PropKind::ScaffoldBeam
+                            | PropKind::ScaffoldDeck
                     ) {
                         continue;
                     }
@@ -1123,7 +1157,7 @@ mod tests {
                             matches!(b.kind, PlacedKind::Building(_))
                                 && (b.position - object.position).length() <= 28.0
                         }),
-                        "seed {seed}: prop at {:?} has no building nearby",
+                        "seed {seed}: {kind:?} prop at {:?} has no building nearby",
                         object.position
                     );
                 }

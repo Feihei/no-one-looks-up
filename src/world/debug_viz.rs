@@ -126,6 +126,8 @@ pub(crate) fn draw_debug_viz(
                 BlockType::Factory => Color::srgba(0.9, 0.9, 0.3, 0.6),
                 BlockType::Plaza => Color::srgba(0.3, 0.9, 0.3, 0.6),
                 BlockType::Forest => Color::srgba(0.2, 0.7, 0.3, 0.6),
+                // 城中村: burnt orange, distinct from the old city's red.
+                BlockType::UrbanVillage => Color::srgba(0.95, 0.55, 0.2, 0.6),
             };
             let mut points: Vec<Vec3> = block
                 .polygon
@@ -149,6 +151,7 @@ pub(crate) fn draw_debug_viz(
                     PrismKind::OldCity => Color::srgba(1.0, 0.25, 0.25, 0.9),
                     PrismKind::Apartment => Color::srgba(0.3, 0.6, 1.0, 0.9),
                     PrismKind::Factory => Color::srgba(1.0, 0.9, 0.2, 0.9),
+                    PrismKind::UrbanVillage => Color::srgba(1.0, 0.55, 0.15, 0.9),
                     PrismKind::SceneryRing => Color::srgba(0.6, 0.6, 0.65, 0.55),
                 };
                 let mut points: Vec<Vec3> = prism

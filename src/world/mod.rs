@@ -62,6 +62,20 @@ pub const STREET_WIDTH: f32 = 8.0;
 pub const STREET_WIDTH_MIN: f32 = 6.0;
 pub const STREET_WIDTH_MAX: f32 = 10.0;
 
+/// Per-block street width range for [`BlockType::UrbanVillage`] blocks (城中村
+/// lanes, 2026-11 field visit). Two village blocks facing each other share the
+/// centerline like any other pair, so their alley is the average of the two
+/// widths: 2.0-3.5 m of open ground, wall-to-wall ~2.5-4.0 m once each side's
+/// 0.25 m [`BuildingParams::setback`] is added — the "walls 3-4 m apart,
+/// walkable under 2 m where the poles stand in" feel. Where a village block
+/// meets an ordinary 6-10 m block the street lands at 4-6.75 m: a narrower
+/// seam than the old city, so the transition still reads.
+///
+/// Smaller insets only ever grow a block polygon, so the inset-collapse guard
+/// that [`STREET_WIDTH`] needs does not apply here.
+pub const VILLAGE_STREET_WIDTH_MIN: f32 = 2.0;
+pub const VILLAGE_STREET_WIDTH_MAX: f32 = 3.5;
+
 /// Maximum lattice-node perturbation on each axis, in meters.
 ///
 /// The original used 12 m, but at a 50 m cell pitch that lets two adjacent

@@ -739,6 +739,22 @@ R6: 自研体积云        [█████████░] 6.0–6.5 全部完�
 - **待实机确认**：① 6 ms 的开销在你的显卡与真实窗口下是否可接受，若 fps 不够先 `HU_TAA=off`；② 快速甩头时树冠拖影的容忍度；③ TAA 默认把树冠轻微"压暗"（亚像素叶卡片被与背景平均）是否符合观感
 - **后续可做**：把 TAA 开关接进 `sky_panel` 的调试面板（现在只有环境变量），以及云 pass 若改读多样采样 depth 后可换回 MSAA 4×（那时 TAA 可退为可选）
 
+### R3.17 城中村街区（2026-11-15）
+
+**背景**：Feihei 实地踩点城中村后提出在地图里加入这类区域：外墙间距 3-4 m、可走宽度不足 2 m、路口间距 6-10 m、两侧 3 层自建房贴线而建、首层局部退 1 m、外挂楼梯、电线杆与电线密集凌乱。落地为新的 `BlockType::UrbanVillage`（城中村），沿用街区骨架，按类型分发参数。
+
+- [x] **生成**（`layout_graph.rs` / `path_network.rs` / `world/mod.rs`）：类型 roll 链插入 `P_VILLAGE_END = 0.30`（Plaza 6% → Forest 14% → Village 10% → 老城/公寓/厂房按原 87/10/3 分剩余 70%）；village 固定 1x1 合并；街宽从独立区间 `VILLAGE_STREET_WIDTH_*`（2.0-3.5 m）抽取——两村相邻巷道 2-3.5 m，加两侧 0.25 m setback 墙距 2.5-4 m，与老城相邻时落在 4-6.75 m 收窄过渡。两种抽取都只花一次 RNG draw，流长度不变
+- [x] **建筑**（`placement.rs`）：`BuildingParams` 长 4-7 m × 深 5-8 m、高 8.5-10.0（快照到 3 m 楼层后**恒为 9 m = 3 层**，对应"自建房都是 3 层左右"）、spacing 0（贴线）、setback 0.25（巷道贴墙）、无行道树。`StylePalette.urban_village` 暖米黄
+- [x] **立面**（`facade.rs` / `roof.rs`）：新增 `FacadeStyle::UrbanVillage`（第 4 风格，`STYLE_COUNT` 驱动 chunks.rs 的材质/屋顶数组字面量），墙身复用老城砖墙函数但独立 seed；窗更小更疏、亮灯率更高；屋顶为 0.55 m 低女儿墙平顶（水箱/楼梯间的挂载面）。`chunks.rs` 建筑样式索引改为按 `FacadeStyle::ALL` 查位，避免新增风格错位
+- [x] **外挂构件**（`props.rs` / `chunks.rs`）：新 `PropKind::ExternalStair`——烘焙一层 3 m 楼梯跑（14 步、0.214 m 踢面 / 0.11 m 踏面、两侧阶梯扶手），按楼层逐层叠挂（base = 层 ×3），45% 的民居有、锈蚀位随 wear。城中村 prop 臂整体加密：雨棚 0.65/开间（老城 0.45）、空调外机按（开间×层）0.30 挂格上限 6、水落管 0.5、烟囱 0.35
+- [x] **线杆**（`props.rs` / `overhead.rs`）：`pole_slots`/`place_street_furniture` 增加 `village` 标志（路侧块为城中村时杆距 30→14 m，50 m 边 2 杆→4 杆）；跨街垂线概率城中村边 0.4→0.85。两个调用方（placement 与 overhead 重放）读同一标志，否则线不落在杆上
+- [x] **碰撞与调试**（`collision.rs` / `debug_viz.rs` / examples）：village 实心棱柱 + 专属调试色（橙）；`world_map`/`placement_stats`/`roof_gallery`/`edge_stats`/`_stats` 补齐枚举分支
+- [x] **测试（净增 2，总数 252）**：`village_lanes_carry_more_poles`（120 m 村巷边 9 杆且仍贴路缘）；`styles_get_their_signature_props` 扩城中村臂（楼梯逐层成跑、雨棚/外机覆盖率下限）。`street_widths_stay_in_range` 改按类型分区间、合并边区间放宽到 2.0-10.0；`plans_carry_props_next_to_their_buildings` 的跳过名单补上 R3.13 跨街层（CrossWire/长灯臂/棚架是杆线锚定街道家具，此前"邻近建筑"断言只是几何运气，换图后暴露——建筑锚定 prop 仍严格断言，含新的外挂楼梯）
+- [x] **实测（`examples/_stats`，3 seed）**：village 9-14 块（4.6-7.1% 面积，1x1 故块数即面积占比）；`placement_stats` seed 0x48454144：`building/village` 393 座（全部 9.0 m）、`ext_stair` 558、`pole` 1172 / `wire` 1899 / `xwire` 420（村边加密后全线抬升）
+- [x] **验证**：`cargo fmt --check`、`cargo clippy --all-targets`（0 警告）、`cargo test --all-targets`（252 lib + 4 集成）全绿；`world_map` 顶视图渲染正常
+- **待实机确认**：① 2-3.5 m 巷道在 22.55-60° 相机下的压迫感与天空占比是否达标；② 外挂楼梯 63° 陡度与 1.5 m 出挑在巷中的遮挡感；③ 村巷电线（3 层杆线 + 85% 跨街线）密度是否够"凌乱"；④ 首层退 1 m（骑楼）未做——现有 setback 0.25 m 是排水缝，骑楼需要按层几何退台，另立条目
+- **已知限制**：合并长边只记录首段 unit edge 的左右街区（既有 quirk），长边中段贴村巷的跨街线可能悬在无建筑 plan 里；如观感突兀，后续把 placement 改成按 unit edge 分段规划
+
 ## 风险与依赖
 
 | 风险 | 影响 | 缓解措施 |
