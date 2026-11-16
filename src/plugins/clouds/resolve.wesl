@@ -57,7 +57,9 @@ fn clouds_resolve(@builtin(global_invocation_id) id: vec3<u32>) {
     let ray = view_ray(
         uv,
         view.world_from_clip,
-        params.camera.xyz,
+        // Same frame as the view matrices: the reprojection must use the eye
+        // the march used (see `march.wesl`).
+        view.world_position,
         is_orthographic(view.clip_from_view),
         params.camera.xyz,
         params.units.x,

@@ -10,7 +10,9 @@ use bevy::render::render_resource::ShaderType;
 /// The uniform the march, resolve and composite kernels read.
 #[derive(Clone, Copy, Debug, Default, ShaderType)]
 pub struct CloudsParams {
-    /// xyz: camera world position, m. w: planet radius, m.
+    /// xyz: the camera's metre-frame position, the orthographic focus plane's anchor
+    /// (perspective rays take their eye from the view uniform: this main-world value is a
+    /// frame behind it). w: planet radius, m.
     pub camera: Vec4,
     /// x: atmosphere outer radius, m. y: aerial-view LUT range, m. z: aerial-view LUT slices.
     /// w: the night sky's background radiance, cd/m².

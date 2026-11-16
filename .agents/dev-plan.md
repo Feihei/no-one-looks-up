@@ -566,6 +566,7 @@ Feihei 验收：**「好了一些，但还是不太自然。体积云就到此�
 - **深度遮挡改为块级保守判定**：march 每个半分辨率 texel 覆盖 2×2 像素，四个像素**全部**被前景遮挡才整块跳过；任一像素是天空/超出壳层就照常 march。否则前景轮廓边缘那一块会被整块抹掉，物体移动时云会沿轮廓闪。
 - **曝光不脏 history**：history 存未曝光亮度，只有 composite 乘 `view.exposure`。`only_the_composite_applies_exposure` 是 tripwire（扫描三个 shader 源码），防止以后有人在 march/resolve 里顺手乘曝光，导致 `DuskSky` 的 ±0.15 ev 扰动在 history 里残留 2 帧。
 - 还没做：实机转头/步行的拖影与闪烁人工验收（Feihei）。若发现拖影，先看 `FRESH_BLEND`（现 0.5）和 3×3 clamp 的框是否太窄，再看重投影的壳入点（相机贴地时 shell.x 极小，重投影误差会被放大）。
+- **实机反馈（2026-11-16）已修**：Feihei 走路/转头时云整片快速摆动并抖动。根因是三个 shader（march/resolve/composite）把 `params.camera.xyz` 当射线起点——它来自主世界 `Update` 读的 `GlobalTransform`，比渲染世界的视矩阵晚一帧；而透视射线是"近平面点（0.1 m）− 眼睛"，一帧走动的 2–3 cm 会放大成十几度方向误差。vendored 版本用的是 `view.world_position`。改为从视 uniform 取眼睛（`params.camera.xyz` 只留作正交聚焦点），并加 tripwire `the_eye_comes_from_the_view_uniform`（三个 shader 必须出现 `view.world_position`、`params.camera.xyz` 恰一次）。顺带把天气图原点吸到 62.5 m texel 网格（`config::weather_origin`）：原先原点随相机连续滑动，每帧把整个周期场重新离散化，步行时云边缘会爬动；对齐后窗口只按整 texel 平移，内容世界固定。
 
 ### C5 技术纪要（2026-11-15）
 
@@ -623,7 +624,7 @@ R3.14 灯头绘制距离    [██████████] 实现完成（灯�
 R3.15 环路外景物带    [██████████] 实现完成（带内建筑行+角树丛/檐底封闭/长灯臂两段/棚架宽度随机，2026-11-11，待实机验收）
 R3.16 抗锯齿 / TAA    [████████░░] 接入完成 + 立面采样器修线性 mip（2026-11-11，快门 ≈6 ms，待实机验收）
 R5.1-5 天空调参+云    [████████░░] 面板/云种/sky_gain/dome 完成；云边缘块状属已知边界（2026-10-27 收尾）
-R6: 自研体积云        [█████████░] 6.0–6.5 全部完成，待人眼验收（2026-11-15）
+R6: 自研体积云        [█████████░] 6.0–6.5 完成 + 视 uniform 锚定修复（2026-11-16），待人眼复测
 ```
 
 ### R3.11 屋顶轮廓（2026-10-31，步骤 11.3）

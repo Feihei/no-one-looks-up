@@ -24,7 +24,9 @@ fn cloud_composite(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
     let ray = view_ray(
         in.uv,
         view.world_from_clip,
-        params.camera.xyz,
+        // Same frame as the depth and the view matrices: the occlusion test
+        // compares this ray against the prepass depth (see `march.wesl`).
+        view.world_position,
         is_orthographic(view.clip_from_view),
         params.camera.xyz,
         params.units.x,

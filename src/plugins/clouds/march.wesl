@@ -310,7 +310,11 @@ fn clouds_march(@builtin(global_invocation_id) id: vec3<u32>) {
     let ray = view_ray(
         uv,
         view.world_from_clip,
-        params.camera.xyz,
+        // The eye comes from the view uniform, not the cloud params: the
+        // main world's camera transform is a frame behind the render world's,
+        // and a perspective ray is measured from a point ~0.1 m out, so one
+        // frame of walking would swing every ray by degrees.
+        view.world_position,
         is_orthographic(view.clip_from_view),
         params.camera.xyz,
         params.units.x,

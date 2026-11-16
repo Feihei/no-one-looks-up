@@ -22,7 +22,9 @@
 /// Mirrors the Rust `CloudsParams` (`params.rs`). Every field is a vec4 so the
 /// layouts agree.
 struct CloudParams {
-    /// xyz: camera world position, m. w: planet radius R, m.
+    /// xyz: the camera's metre-frame position, the orthographic focus plane's anchor.
+    /// Perspective rays take their eye from the view uniform (`view.world_position`), which
+    /// is this frame's; this main-world value is a frame behind it. w: planet radius R, m.
     camera: vec4<f32>,
     /// x: atmosphere outer radius, m. y: aerial-view LUT range, m. z: aerial-view LUT slices.
     /// w: the night sky's background radiance, cd/m².

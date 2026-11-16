@@ -1,7 +1,7 @@
 //! Quality mapping, noise tiling and the per-kind shape table (pure data,
 //! CPU-testable).
 
-use bevy::math::Vec4;
+use bevy::math::{Vec2, Vec4};
 use bevy_elements::ElementsQuality;
 
 use crate::plugins::sky::CloudKind;
@@ -162,6 +162,18 @@ impl CloudShape {
     }
 }
 
+/// The world origin (XZ, m) of the weather window for a camera at `cam_xz`.
+///
+/// The window follows the camera, but snapped to the texel lattice. A
+/// free-sliding origin resamples the whole periodic field onto a new lattice
+/// every frame, so a cloud edge wobbles as the camera walks; on the lattice the
+/// window only ever moves in whole texels, whose content is world-fixed, and a
+/// move changes nothing at all.
+pub fn weather_origin(cam_xz: Vec2) -> Vec2 {
+    let texel = WEATHER_EXTENT_M / WEATHER_TEXELS as f32;
+    ((cam_xz - Vec2::splat(0.5 * WEATHER_EXTENT_M)) / texel).floor() * texel
+}
+
 /// Wraps a drifted offset onto its tile period, m.
 ///
 /// The cloud field is a periodic function of the world position, so drifting it
@@ -242,6 +254,27 @@ mod tests {
         ] {
             assert!(CloudShape::of(kind).dome >= 0.9, "{kind:?} lost its dome");
         }
+    }
+
+    /// The window must sit on the texel lattice: walking inside a texel must
+    /// not move it, and a whole texel of walking must move it exactly one.
+    #[test]
+    fn the_weather_window_snaps_to_the_texel_lattice() {
+        let texel = WEATHER_EXTENT_M / WEATHER_TEXELS as f32;
+        let origin = weather_origin(Vec2::new(1000.0, -500.0));
+        assert_eq!(
+            origin,
+            weather_origin(Vec2::new(1000.0 + 0.5 * texel, -500.0 + 0.4 * texel)),
+            "walking within a texel must not move the window"
+        );
+        assert_eq!(
+            weather_origin(Vec2::new(1000.0 + texel, -500.0)),
+            origin + Vec2::new(texel, 0.0),
+            "a whole texel of walking moves the window exactly one texel"
+        );
+        // A texel-aligned origin puts every texel of the map on one global
+        // world lattice, which is what makes the content world-fixed.
+        assert_eq!((origin / texel).fract(), Vec2::ZERO);
     }
 
     #[test]

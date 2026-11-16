@@ -23,7 +23,7 @@ mod params;
 use bevy::core_pipeline::prepass::DepthPrepass;
 use bevy::light::Atmosphere;
 use bevy::light::light_consts::lux;
-use bevy::math::{DVec2, UVec2, UVec4, Vec2, Vec4};
+use bevy::math::{DVec2, UVec2, UVec4, Vec4};
 use bevy::prelude::*;
 use bevy::render::RenderApp;
 use bevy::render::extract_component::ExtractComponent;
@@ -409,7 +409,7 @@ fn update_gpu(
         .unwrap_or_else(|| CloudShape::of(CloudKind::ScatteredCumulus));
     let q = CloudsQuality::of(*quality);
     let low = (size + UVec2::splat(1)) / 2;
-    let origin = cam_m.xz() - Vec2::splat(0.5 * WEATHER_EXTENT_M);
+    let origin = config::weather_origin(cam_m.xz());
 
     gpu.params = CloudsParams {
         // World units: `view_ray` divides by `units` itself.
@@ -579,6 +579,30 @@ mod tests {
         let teleported = walked.map(|p| p + Vec3::new(TELEPORT_M + 1.0, 0.0, 0.0));
         assert!(runtime.observe((None, 1.0, None), CloudsQuality::High, teleported));
         assert_eq!(runtime.reset_frames, 2);
+    }
+
+    /// Perspective rays must start at the view uniform's eye. The main world's
+    /// camera `GlobalTransform` is a frame behind the render world's, and a
+    /// perspective ray is measured from a point ~0.1 m out — one frame of
+    /// walking would swing every ray by degrees and the clouds would swim.
+    #[test]
+    fn the_eye_comes_from_the_view_uniform() {
+        for shader in ["march.wesl", "resolve.wesl", "composite.wesl"] {
+            let source = std::fs::read_to_string(format!(
+                "{}/src/plugins/clouds/{shader}",
+                env!("CARGO_MANIFEST_DIR")
+            ))
+            .expect(shader);
+            assert!(
+                source.contains("view.world_position"),
+                "{shader} must take its ray origin from the view uniform"
+            );
+            assert_eq!(
+                source.matches("params.camera.xyz").count(),
+                1,
+                "{shader} must use params.camera.xyz only as the orthographic focus"
+            );
+        }
     }
 
     /// The history holds UNexposed luminance: only the composite may scale by
