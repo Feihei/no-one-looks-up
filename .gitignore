@@ -30,7 +30,14 @@
 
 # Local-only diagnostics / screenshots
 /examples/_stats.rs
+/examples/diag_wire.rs
 /image*.png
+
+# Urban-village preview model (Blender import sample) + its generator/QA
+# renders: generated locally by village_preview/gen_urban_village_glb.py,
+# regenerable, not project content.
+/urban_village.glb
+/village_preview/
 
 # Local save files (player runtime data)
 /saves/
