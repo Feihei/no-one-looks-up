@@ -33,8 +33,10 @@
 
 # Local-only diagnostics / screenshots
 /examples/_stats.rs
+/examples/_degree_probe.rs
 /examples/diag_wire.rs
 /image*.png
+/image*.webp
 
 # Urban-village preview model (Blender import sample) + its generator/QA
 # renders: generated locally by village_preview/gen_urban_village_glb.py,
