@@ -19,7 +19,7 @@ use crate::world::path_network::{WorldSeed, generate_world};
 use crate::world::season::SeasonState;
 
 pub use self::save_data::{
-    AUTOSAVE_SLOT, SaveData, Season, list_slots, read_save, save_path, write_save,
+    AUTOSAVE_SLOT, SaveData, Season, list_slots, read_save, save_path, slot_info, write_save,
 };
 
 /// Requests a restore from a captured save. Sent by the R4.5 menu (and by
@@ -31,7 +31,8 @@ pub struct LoadRequest(pub SaveData);
 /// save panel (R4.5); the autosave system writes slot 0 directly.
 #[derive(Message, Debug, Clone)]
 pub struct SaveGameRequest {
-    /// Destination slot (1-3 for user saves).
+    /// Destination slot (1-99 for user saves; the load browser shows all
+    /// 00-99, with 00 the autosave).
     pub slot: u32,
 }
 

@@ -104,6 +104,17 @@ impl Season {
             Season::Winter => Season::Spring,
         }
     }
+
+    /// The previous season in calendar order, wrapping spring back to winter
+    /// (the menu's season editor steps in both directions).
+    pub fn prev(self) -> Season {
+        match self {
+            Season::Spring => Season::Winter,
+            Season::Summer => Season::Spring,
+            Season::Autumn => Season::Summer,
+            Season::Winter => Season::Autumn,
+        }
+    }
 }
 
 /// The four numbers a season resolves to (ADR-0004 §6).

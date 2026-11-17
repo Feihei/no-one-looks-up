@@ -14,6 +14,9 @@
 # run without them (a missing shader shows up as an invisible effect, not an
 # error).
 !/assets/shaders/
+# ...and the processed title art: small, load-bearing for the title screen,
+# regenerated from a photo by an offline script (not committed).
+!/assets/ui/
 # The shader must be `.wesl`: `#import`/`import` are WESL syntax and a `.wgsl`
 # file is fed to plain WGSL, which rejects the imports. A stale copy with the
 # wrong extension is a trap, not a file.

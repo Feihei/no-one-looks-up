@@ -70,10 +70,11 @@ impl SaveData {
     }
 }
 
-/// Slot numbering (ADR-0001): slot 0 is the autosave, slots 1-3 are the
-/// user's manual saves.
+/// Slot numbering (ADR-0001): slot 0 is the autosave, slots 1-99 are the
+/// user's manual saves. The load browser shows every slot zero-padded
+/// (00-99, one hundred slots).
 pub const AUTOSAVE_SLOT: u32 = 0;
-pub const USER_SLOT_COUNT: u32 = 3;
+pub const USER_SLOT_COUNT: u32 = 99;
 
 /// What the slot list (R4.4/4.5) shows for one save file.
 #[derive(Debug, Clone, PartialEq)]
@@ -93,32 +94,33 @@ pub struct SaveSlotInfo {
 /// Lists every occupied slot, oldest-modified first.
 ///
 /// Corrupt or unreadable files are skipped (a bad save must never break the
-/// menu); an empty directory yields an empty list.
+/// menu); an empty directory yields an empty list. With one hundred slots
+/// this reads every file — the menu's load browser uses [`slot_info`] for
+/// the one slot it shows instead of calling this per frame.
 pub fn list_slots() -> Vec<SaveSlotInfo> {
-    let mut slots = Vec::new();
-    for slot in AUTOSAVE_SLOT..=USER_SLOT_COUNT {
-        let Ok(json) = fs::read_to_string(save_path(slot)) else {
-            continue;
-        };
-        let Ok(data) = serde_json::from_str::<SaveData>(&json) else {
-            continue;
-        };
-        let modified_secs = fs::metadata(save_path(slot))
-            .and_then(|m| m.modified())
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        slots.push(SaveSlotInfo {
-            slot,
-            seed: data.seed,
-            season: data.season,
-            explored_chunks: data.explored.len(),
-            modified_secs,
-        });
-    }
+    let mut slots: Vec<SaveSlotInfo> = (AUTOSAVE_SLOT..=USER_SLOT_COUNT)
+        .filter_map(slot_info)
+        .collect();
     slots.sort_by_key(|info| info.modified_secs);
     slots
+}
+
+/// Reads one slot's list info, or `None` when the slot is empty/corrupt.
+pub fn slot_info(slot: u32) -> Option<SaveSlotInfo> {
+    let data = read_save(slot).ok()?;
+    let modified_secs = fs::metadata(save_path(slot))
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    Some(SaveSlotInfo {
+        slot,
+        seed: data.seed,
+        season: data.season,
+        explored_chunks: data.explored.len(),
+        modified_secs,
+    })
 }
 
 /// Directory that holds the save files.
