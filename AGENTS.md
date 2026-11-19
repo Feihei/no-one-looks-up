@@ -109,6 +109,7 @@ serde_json = "1"
 3. 设计取舍用 A/B/C 选项向 Feihei 提案，不擅自扩大范围（主动标记 scope creep）。
 4. 每阶段完成后：build + fmt + clippy + test 全绿，再小步提交（Conventional Commits），更新 dev-plan。
 5. 跨平台验证：Windows 优先，关键渲染特性（大气/云/TAA）在核验时注意不同 GPU 后端（Vulkan/DX12）差异。
+6. **发布打包**：`scripts/package.sh`（Git Bash，`--no-build` 可复用已有 release）→ `dist/`（exe + `assets/shaders` + `assets/ui` + README）。**不要单独分发裸 exe**：缺少 `CARGO_MANIFEST_DIR` 时 Bevy 以 exe 同目录为资产根，缺 `assets/` 不报错，只是树和建筑立面（含窗光）整片不渲染、路灯照旧亮——最容易被误判成 release 优化 bug。
 
 ## AI Agent 测试工作流
 
