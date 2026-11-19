@@ -40,3 +40,16 @@ debug = "line-tables-only"
 # atmosphere/cloud iteration on this machine while easing parallel rustc peak
 # memory (opt-level 3 pushed parallel bevy compiles past the host's budget).
 opt-level = 2
+
+[profile.release]
+# Belt and braces, not a size win: on MSVC the symbols already live in the
+# sidecar `.pdb` (70 MB, never copied into `dist/`) and a release build has
+# `debug = 0`, so this changes nothing today. It only guarantees a stray
+# `debug = true` cannot end up inside the packaged binary.
+#
+# The 105 MB really is code: `.text` 74 MB + `.rdata` 26 MB. To shrink it,
+# use `lto = "thin"` / `codegen-units = 1` or trim Bevy's default features --
+# stripping is the wrong lever. Backtraces from a stripped build keep frames
+# but lose function names.
+strip = "symbols"
+
