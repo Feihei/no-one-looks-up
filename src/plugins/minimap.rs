@@ -139,7 +139,7 @@ fn sync_minimap_root(
         let entity = commands
             .spawn((Node {
                 position_type: PositionType::Absolute,
-                // Under the "Explored: ..." status line, same corner,
+                // Under the "已探索 ..." status line, same corner,
                 // same show/hide rhythm -- no panel chrome of its own so
                 // the dusk sky stays visible behind the street lines.
                 top: Val::Px(40.0),

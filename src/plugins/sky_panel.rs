@@ -21,6 +21,7 @@ use bevy::prelude::*;
 use crate::core::input::{
     DEV_PANEL_DOWN, DEV_PANEL_LEFT, DEV_PANEL_RIGHT, DEV_PANEL_UP, DEV_TOGGLE_SKY_PANEL,
 };
+use crate::core::ui_font::UiFont;
 use crate::plugins::sky::DuskSky;
 
 /// Whether the panel is drawn and accepting keys.
@@ -328,6 +329,7 @@ fn sky_panel_ui(
     state: Res<SkyPanelState>,
     sky: Res<DuskSky>,
     cirrus: Res<crate::plugins::cirrus::CirrusSettings>,
+    font: Res<UiFont>,
     mut commands: Commands,
     roots: Query<Entity, With<SkyPanelRoot>>,
     mut cached: Local<Option<(bool, usize, Vec<String>)>>,
@@ -377,13 +379,13 @@ fn sky_panel_ui(
         .with_children(|panel| {
             panel.spawn((
                 Text::new("SKY TUNING  F5"),
-                TextFont::from_font_size(13.0),
+                font.at(13.0),
                 TextColor(Color::srgb(0.95, 0.85, 0.55)),
             ));
             for line in &lines {
                 panel.spawn((
                     Text::new(line.clone()),
-                    TextFont::from_font_size(12.0),
+                    font.at(12.0),
                     TextColor(Color::srgb(0.88, 0.90, 0.92)),
                 ));
             }
@@ -396,6 +398,9 @@ impl Plugin for SkyPanelPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<SkyPanelState>()
             .init_resource::<DuskSky>()
+            // The panel is a text overlay like the menus; `UiFontPlugin`
+            // supplies the face, the default covers harnesses without assets.
+            .init_resource::<UiFont>()
             .add_systems(Update, (sky_panel_input, sky_panel_ui).chain());
     }
 }

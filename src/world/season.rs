@@ -85,13 +85,24 @@ impl Season {
         }
     }
 
-    /// Short name for menus and logs.
+    /// Short name for logs (English: logs stay ASCII so they grep cleanly).
     pub fn label(self) -> &'static str {
         match self {
             Season::Spring => "Spring",
             Season::Summer => "Summer",
             Season::Autumn => "Autumn",
             Season::Winter => "Winter",
+        }
+    }
+
+    /// Short name for the player-facing menu (Chinese, like every other
+    /// on-screen string).
+    pub fn label_zh(self) -> &'static str {
+        match self {
+            Season::Spring => "春",
+            Season::Summer => "夏",
+            Season::Autumn => "秋",
+            Season::Winter => "冬",
         }
     }
 

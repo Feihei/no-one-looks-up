@@ -20,7 +20,9 @@ fn main() -> AppExit {
         .add_plugins((
             DefaultPlugins.set(WindowPlugin {
                 primary_window: Some(Window {
-                    title: "No One Looks Up Even Alone".to_string(),
+                    // Player-facing text is Chinese throughout (menus, HUD);
+                    // the window title follows.
+                    title: "即使独自漫步你也很少看天".to_string(),
                     ..default()
                 }),
                 ..default()

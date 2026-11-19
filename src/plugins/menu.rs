@@ -2,7 +2,12 @@
 //!
 //! Front-end flow: the handwritten title (`assets/ui/title.png`, white ink
 //! extracted from a photo) fades in over the world, waits for any key, fades
-//! out, and hands over to the menu. The menu is keyboard-driven: up/down
+//! out, and hands over to the menu. The title carries no key hint of its own:
+//! the handwriting is the whole screen, and any key still dismisses it.
+//!
+//! Every player-facing string is Chinese and set in the ink face
+//! ([`crate::core::ui_font::UiFont`]), so the typewriter type of the title and
+//! the menus read as one hand. The menu is keyboard-driven: up/down
 //! moves the cursor, Enter confirms, Esc cancels back one level. Seed and
 //! season are rows that open their own editor screens (left/right adjust,
 //! digits type directly, Enter keeps, Esc reverts); Load opens a browser
@@ -16,12 +21,12 @@
 
 use bevy::ecs::hierarchy::ChildOf;
 use bevy::prelude::*;
-use bevy::text::TextFont;
 use bevy::ui::Node;
 use bevy::window::{CursorGrabMode, CursorOptions, PrimaryWindow};
 
 use crate::core::game_state::{GamePhase, SeedInput};
 use crate::core::input::PAUSE;
+use crate::core::ui_font::UiFont;
 use crate::plugins::save::{AUTOSAVE_SLOT, LoadRequest, SaveData, Season, read_save, slot_info};
 use crate::world::chunks::DEFAULT_SEED;
 use crate::world::explored::{ExploredBitmap, WorldExplorationCompleted};
@@ -41,6 +46,10 @@ impl Plugin for MenuPlugin {
             .map(|server| server.load("ui/title.png"));
         app.init_resource::<GamePhase>()
             .init_resource::<SeedInput>()
+            // `UiFontPlugin` installs the ink face in the real app; the
+            // default keeps headless tests (no `AssetServer`) on Bevy's
+            // built-in font instead of panicking on a missing resource.
+            .init_resource::<UiFont>()
             .init_resource::<MenuUiRoot>()
             .init_resource::<MenuSelection>()
             .init_resource::<MenuScreen>()
@@ -121,10 +130,6 @@ const TITLE_ART_ASPECT: f32 = 1.96;
 #[derive(Resource, Debug, Default)]
 struct TitleArt(Option<Handle<Image>>);
 
-/// Marker for the title's hint text so the fade can tint it.
-#[derive(Component, Debug)]
-struct TitleHint;
-
 /// The load screen's browsing state: which slot is shown and any digits
 /// typed toward a jump.
 #[derive(Resource, Debug, Default)]
@@ -183,9 +188,9 @@ enum MenuAction {
 /// The pause menu's rows in display order.
 fn pause_rows() -> Vec<(String, MenuAction)> {
     vec![
-        ("Resume".to_string(), MenuAction::Resume),
-        ("Save".to_string(), MenuAction::OpenSave),
-        ("Main menu".to_string(), MenuAction::BackToMenu),
+        ("继续".to_string(), MenuAction::Resume),
+        ("保存".to_string(), MenuAction::OpenSave),
+        ("返回主菜单".to_string(), MenuAction::BackToMenu),
     ]
 }
 
@@ -212,11 +217,11 @@ const DIGIT_KEYS: [(KeyCode, char); 10] = [
 /// The root menu's rows in display order: label + confirm action.
 fn root_rows(seed_display: &str, season_label: &str) -> Vec<(String, MenuAction)> {
     vec![
-        (format!("Seed: {seed_display}"), MenuAction::EditSeed),
-        (format!("Season: {season_label}"), MenuAction::EditSeason),
-        ("Start".to_string(), MenuAction::Start),
-        ("Load".to_string(), MenuAction::OpenLoad),
-        ("Quit".to_string(), MenuAction::Quit),
+        (format!("种子：{seed_display}"), MenuAction::EditSeed),
+        (format!("季节：{season_label}"), MenuAction::EditSeason),
+        ("开始".to_string(), MenuAction::Start),
+        ("读取".to_string(), MenuAction::OpenLoad),
+        ("退出".to_string(), MenuAction::Quit),
     ]
 }
 
@@ -272,10 +277,11 @@ fn hud_node() -> Node {
     }
 }
 
-fn text_node(line: &str, size: f32) -> (Text, TextFont, TextColor) {
+/// One line of UI text, set in the ink face at `size` px.
+fn text_node(font: &UiFont, line: &str, size: f32) -> (Text, TextFont, TextColor) {
     (
         Text::new(line.to_string()),
-        TextFont::from_font_size(size),
+        font.at(size),
         TextColor(Color::WHITE),
     )
 }
@@ -283,7 +289,7 @@ fn text_node(line: &str, size: f32) -> (Text, TextFont, TextColor) {
 /// The HUD's exploration readout.
 fn hud_line(bitmap: &ExploredBitmap) -> String {
     format!(
-        "Explored: {} / {} ({:.1}%)",
+        "已探索 {} / {}（{:.1}%）",
         bitmap.len(),
         bitmap.total(),
         bitmap.fraction() * 100.0
@@ -301,29 +307,31 @@ fn screen_panels(
 ) -> (Vec<String>, Vec<(String, MenuAction)>, Vec<String>) {
     match screen {
         MenuScreen::Root => (
-            vec!["NO ONE LOOKS UP".to_string(), String::new()],
-            root_rows(&effective_seed(seed_input), season.season.label()),
-            vec!["arrows select, Enter confirms, Esc quits".to_string()],
+            // No header: the title has already said the name (and the menu
+            // itself is just rows).
+            Vec::new(),
+            root_rows(&effective_seed(seed_input), season.season.label_zh()),
+            vec!["方向键选择，回车确认，Esc 退出".to_string()],
         ),
         MenuScreen::SeedEdit { .. } => (
             vec![
-                "SEED".to_string(),
+                "种子".to_string(),
                 String::new(),
                 effective_seed(seed_input),
             ],
             Vec::new(),
-            vec!["left/right adjust, digits type, Enter ok, Esc cancels".to_string()],
+            vec!["左右键调整，数字键输入，回车确定，Esc 取消".to_string()],
         ),
         MenuScreen::SeasonEdit { .. } => (
             vec![
-                "SEASON".to_string(),
+                "季节".to_string(),
                 String::new(),
-                season.season.label().to_string(),
+                season.season.label_zh().to_string(),
             ],
             Vec::new(),
-            vec!["left/right change, Enter ok, Esc cancels".to_string()],
+            vec!["左右键切换，回车确定，Esc 取消".to_string()],
         ),
-        MenuScreen::Load => slot_pick_panels("LOAD", browser, bitmap, false),
+        MenuScreen::Load => slot_pick_panels("读取", browser, bitmap, false),
         // Unreachable here: the title screen spawns its own panel (image +
         // fading hint) and SavePick only exists in the pause flow, whose
         // panel sync_ui_root builds directly.
@@ -342,35 +350,35 @@ fn slot_pick_panels(
 ) -> (Vec<String>, Vec<(String, MenuAction)>, Vec<String>) {
     let target = browser.target();
     let slot_line = if browser.typed.is_empty() {
-        format!("Slot {target:02}")
+        format!("存档位 {target:02}")
     } else {
-        format!("Slot {:_<2}", browser.typed)
+        format!("存档位 {:_<2}", browser.typed)
     };
     let info_line = match slot_info(target) {
         Some(info) => {
             let tag = if target == AUTOSAVE_SLOT {
-                " (autosave)"
+                "（自动存档）"
             } else if saving {
-                " (overwrite)"
+                "（覆盖）"
             } else {
                 ""
             };
             format!(
-                "seed {} | {} | {}/{} chunks{}",
+                "种子 {} | {} | {}/{} 区块{}",
                 info.seed,
-                info.season.label(),
+                info.season.label_zh(),
                 info.explored_chunks,
                 bitmap.total(),
                 tag
             )
         }
-        None if saving => "empty - Enter saves here".to_string(),
-        None => "empty".to_string(),
+        None if saving => "空存档位，回车保存到此处".to_string(),
+        None => "空存档位".to_string(),
     };
     let hint = if saving {
-        "left/right slot, digits jump, Enter saves, Esc back"
+        "左右键换位，数字键跳转，回车保存，Esc 返回"
     } else {
-        "left/right slot, digits jump, Enter loads, Esc back"
+        "左右键换位，数字键跳转，回车读取，Esc 返回"
     };
     (
         vec![title.to_string(), String::new(), slot_line, info_line],
@@ -433,7 +441,7 @@ fn title_visuals(
     fade: Res<TitleFade>,
     root: Res<MenuUiRoot>,
     mut images: Query<(&ChildOf, &mut ImageNode)>,
-    mut hints: Query<&mut TextColor, With<TitleHint>>,
+    mut texts: Query<(&ChildOf, &mut TextColor)>,
 ) {
     if *phase != GamePhase::MainMenu || *screen != MenuScreen::Title {
         return;
@@ -447,8 +455,12 @@ fn title_visuals(
             image.color = tint;
         }
     }
-    for mut color in &mut hints {
-        color.0 = tint;
+    // Only the text stand-in (headless tests, missing art) fades with the
+    // drawn title; the real title screen is the image alone.
+    for (parent, mut color) in &mut texts {
+        if parent.0 == entity {
+            color.0 = tint;
+        }
     }
 }
 
@@ -462,6 +474,7 @@ fn sync_ui_root(
     screen: Res<MenuScreen>,
     browser: Res<LoadBrowser>,
     art: Res<TitleArt>,
+    font: Res<UiFont>,
     mut selection: ResMut<MenuSelection>,
     mut root: ResMut<MenuUiRoot>,
     mut commands: Commands,
@@ -498,29 +511,44 @@ fn sync_ui_root(
             .with_children(|parent| {
                 // HUD text is deliberately small: it is a status readout, not
                 // something to read while walking.
-                parent.spawn(text_node(&hud_line(&bitmap), 14.0));
+                parent.spawn(text_node(&font, &hud_line(&bitmap), 14.0));
             })
             .id()
     } else if *phase == GamePhase::Paused {
         if *screen == MenuScreen::SavePick {
-            let (headers, rows, hints) = slot_pick_panels("SAVE", &browser, &bitmap, true);
-            spawn_text_panel(&mut commands, &headers, &rows, &hints, selection.index)
+            let (headers, rows, hints) = slot_pick_panels("保存", &browser, &bitmap, true);
+            spawn_text_panel(
+                &mut commands,
+                &font,
+                &headers,
+                &rows,
+                &hints,
+                selection.index,
+            )
         } else {
             spawn_text_panel(
                 &mut commands,
-                &["PAUSED".to_string(), String::new()],
+                &font,
+                &["已暂停".to_string(), String::new()],
                 &pause_rows(),
-                &["arrows select, Enter confirms, Esc resumes".to_string()],
+                &["方向键选择，回车确认，Esc 继续游戏".to_string()],
                 selection.index,
             )
         }
     } else {
         match &*screen {
-            MenuScreen::Title => spawn_title_panel(&mut commands, &art),
+            MenuScreen::Title => spawn_title_panel(&mut commands, &font, &art),
             screen => {
                 let (headers, rows, hints) =
                     screen_panels(screen, &seed_input, &season, &browser, &bitmap);
-                spawn_text_panel(&mut commands, &headers, &rows, &hints, selection.index)
+                spawn_text_panel(
+                    &mut commands,
+                    &font,
+                    &headers,
+                    &rows,
+                    &hints,
+                    selection.index,
+                )
             }
         }
     };
@@ -530,6 +558,7 @@ fn sync_ui_root(
 /// Spawns a text panel: header lines, cursor rows, hint lines.
 fn spawn_text_panel(
     commands: &mut Commands,
+    font: &UiFont,
     headers: &[String],
     rows: &[(String, MenuAction)],
     hints: &[String],
@@ -540,7 +569,7 @@ fn spawn_text_panel(
         .with_children(|parent| {
             for (line_no, line) in headers.iter().enumerate() {
                 let size = if line_no == 0 { 48.0 } else { 24.0 };
-                parent.spawn(text_node(line, size));
+                parent.spawn(text_node(font, line, size));
             }
             for (row, (label, _)) in rows.iter().enumerate() {
                 let selected = row == cursor;
@@ -552,14 +581,14 @@ fn spawn_text_panel(
                 };
                 parent.spawn((
                     Text::new(format!("{marker}{label}")),
-                    TextFont::from_font_size(24.0),
+                    font.at(24.0),
                     TextColor(color),
                 ));
             }
             for hint in hints {
                 parent.spawn((
                     Text::new(hint.clone()),
-                    TextFont::from_font_size(16.0),
+                    font.at(16.0),
                     TextColor(HINT_COLOR),
                 ));
             }
@@ -568,8 +597,9 @@ fn spawn_text_panel(
 }
 
 /// Spawns the title screen: the handwriting art (or a text stand-in when no
-/// asset server / file is available) and the fading hint.
-fn spawn_title_panel(commands: &mut Commands, art: &TitleArt) -> Entity {
+/// asset server / file is available). No key hint: the handwriting is the
+/// whole screen, and any key still dismisses it.
+fn spawn_title_panel(commands: &mut Commands, font: &UiFont, art: &TitleArt) -> Entity {
     let art_handle = art.0.clone();
     commands
         .spawn(panel())
@@ -589,15 +619,9 @@ fn spawn_title_panel(commands: &mut Commands, art: &TitleArt) -> Entity {
                 None => {
                     // No art (headless tests, missing file): plain text
                     // stands in for the handwriting.
-                    parent.spawn(text_node("NO ONE LOOKS UP", 48.0));
+                    parent.spawn(text_node(font, "即使独自漫步你也很少看天", 48.0));
                 }
             }
-            parent.spawn((
-                Text::new("press any key"),
-                TextFont::from_font_size(20.0),
-                TextColor(Color::WHITE.with_alpha(0.0)),
-                TitleHint,
-            ));
         })
         .id()
 }
@@ -726,7 +750,7 @@ fn menu_input(
         match &current {
             MenuScreen::Title => {} // the fade systems own this screen
             MenuScreen::Root => {
-                let rows = root_rows(&effective_seed(&seed_input), season.season.label());
+                let rows = root_rows(&effective_seed(&seed_input), season.season.label_zh());
                 if selection.index >= rows.len() {
                     selection.index = 0;
                 }
@@ -916,6 +940,10 @@ fn cursor_by_phase(
 }
 
 /// Refreshes the HUD's exploration text (the HUD lives only while playing).
+///
+/// Only writes when the line actually changed: reassigning `Text` every frame
+/// marks it changed every frame, which re-runs the text layout (and, for
+/// Chinese, re-logs the ICU line-break notice each time).
 fn update_hud(
     phase: Res<GamePhase>,
     bitmap: Res<ExploredBitmap>,
@@ -928,12 +956,16 @@ fn update_hud(
     let Some(entity) = root.entity else {
         return;
     };
+    let line = hud_line(&bitmap);
     for (parent, mut text) in &mut texts {
         if parent.0 != entity {
             continue;
         }
         // While playing the panel only holds the HUD line.
-        **text = hud_line(&bitmap);
+        if text.0 == line {
+            continue;
+        }
+        **text = line.clone();
     }
 }
 
@@ -1048,13 +1080,24 @@ mod tests {
         app.update();
         assert_eq!(*app.world().resource::<MenuScreen>(), MenuScreen::Root);
 
-        // The title panel is gone (no "press any key" hint anywhere).
+        // The title panel is gone and the root menu is just its rows: no key
+        // hint on the title, and no title heading above the rows either.
         let mut query = app.world_mut().query::<&Text>();
+        let lines: Vec<String> = query
+            .iter(app.world())
+            .map(|text| text.to_string())
+            .collect();
         assert!(
-            !query
-                .iter(app.world())
-                .any(|text| text.starts_with("press any key")),
-            "the title hint must be despawned once the menu shows"
+            lines.iter().any(|line| line.contains("开始")),
+            "the root menu rows must be up, got: {lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|line| line.contains("即使独自漫步")),
+            "the menu must not repeat the title, got: {lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|line| line.contains("按任意键")),
+            "the title must show no key hint, got: {lines:?}"
         );
     }
 
@@ -1448,11 +1491,11 @@ mod tests {
             .map(|text| text.to_string())
             .collect();
         assert!(
-            lines.iter().any(|line| line.contains("Seed:")),
+            lines.iter().any(|line| line.contains("种子")),
             "the root rows must be listed, got: {lines:?}"
         );
         assert!(
-            !lines.iter().any(|line| line.starts_with("Slot")),
+            !lines.iter().any(|line| line.contains("存档位")),
             "the slot picker must not resurface"
         );
         let _ = std::fs::remove_file(save_path(5));
@@ -1473,8 +1516,8 @@ mod tests {
         let marked: Vec<&String> = lines.iter().filter(|line| line.starts_with("> ")).collect();
         assert_eq!(marked.len(), 1, "exactly one row carries the cursor");
         assert!(
-            marked[0].contains("Seed"),
-            "the cursor starts on the first row (Seed), got: {}",
+            marked[0].contains("种子"),
+            "the cursor starts on the first row (seed), got: {}",
             marked[0]
         );
 
@@ -1490,8 +1533,8 @@ mod tests {
         let marked: Vec<&String> = lines.iter().filter(|line| line.starts_with("> ")).collect();
         assert_eq!(marked.len(), 1);
         assert!(
-            marked[0].contains("Quit"),
-            "ArrowUp must wrap to the last row (Quit), got: {}",
+            marked[0].contains("退出"),
+            "ArrowUp must wrap to the last row (quit), got: {}",
             marked[0]
         );
     }
@@ -1509,12 +1552,13 @@ mod tests {
         let mut query = app.world_mut().query::<&Text>();
         let hud = query
             .iter(app.world())
-            .find(|text| text.starts_with("Explored:"))
+            .find(|text| text.starts_with("已探索"))
             .map(|text| (**text).clone())
             .expect("the playing HUD shows exploration progress");
         assert!(
-            hud.contains(&format!("/ {total} ")),
+            hud.contains(&format!("/ {total}")),
             "HUD must use the live grid size, got: {hud}"
         );
     }
+
 }

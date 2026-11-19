@@ -17,6 +17,10 @@
 # ...and the processed title art: small, load-bearing for the title screen,
 # regenerated from a photo by an offline script (not committed).
 !/assets/ui/
+# NOTE: /assets/fonts/ (the 27 MB ink face every on-screen string uses) stays
+# local-only with the models. It is required at runtime -- without it the
+# Chinese menus render as empty boxes -- so `scripts/package.sh` verifies it
+# and copies it into `dist/`.
 # The shader must be `.wesl`: `#import`/`import` are WESL syntax and a `.wgsl`
 # file is fed to plain WGSL, which rejects the imports. A stale copy with the
 # wrong extension is a trap, not a file.

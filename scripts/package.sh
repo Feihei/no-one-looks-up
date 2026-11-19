@@ -7,6 +7,7 @@
 #     no_one_looks_up[.exe]
 #     assets/shaders/*.wesl    runtime shaders (trees, facades, cirrus)
 #     assets/ui/title.png      title art
+#     assets/fonts/*.ttf       ink UI face (every on-screen Chinese string)
 #     README.md
 #
 # Why the assets have to travel with the binary: bevy_asset resolves its asset
@@ -109,12 +110,16 @@ shopt -u nullglob
 [[ -f "$ROOT/README.md" ]] && cp -- "$ROOT/README.md" "$OUT/"
 
 # --- verify ------------------------------------------------------------------
+# verify list: the font path mirrors `core::ui_font::UI_FONT_PATH`. Without it
+# the Chinese menus fall back to Bevy's Latin-only face and render as empty
+# boxes -- again no error, just unreadable text.
 missing=0
 for required in \
     "assets/shaders/tree_sway.wesl" \
     "assets/shaders/facade_uv.wesl" \
     "assets/shaders/cirrus.wesl" \
-    "assets/ui/title.png"
+    "assets/ui/title.png" \
+    "assets/fonts/ZhaohuaTypeWriterLight.ttf"
 do
     if [[ ! -f "$OUT/$required" ]]; then
         echo "missing after packaging: $required" >&2

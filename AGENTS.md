@@ -74,6 +74,9 @@ serde_json = "1"
 4. **Conventional Commits**：小步增量提交，明确提交范围；spec/文档与实现拆分提交；**Git push 由 Feihei 本人执行**。
 5. **决策表达**：方案讨论用 A/B/C 选项；计划以 checkbox 分阶段呈现（见 dev-plan.md）。
 6. **输入**：专用 action 常量（`move_forward`/`turn_left`/`speed_up` 等），不使用魔法键位字符串散落各处。
+7. **UI 文本（2026-11-19 用户决定）**：玩家可见文本一律中文，字体统一用油墨打字机体 `assets/fonts/ZhaohuaTypeWriterLight.ttf`——通过 `core::ui_font::UiFont`（`TextFont` 由 `UiFont::at(size)` 生成，或用 `menu::text_node`）取字体，禁止直接 `TextFont::from_font_size` 另起一套字体。日志/调试面板仍用英文（ASCII 便于 grep），季节等枚举保留 `label()`（英文日志）与 `label_zh()`（菜单）两个名字。标题画面只有手写标题图、**不显示任何按键提示**（任意键仍可跳过）；按键后进入的主菜单也**不再重复标题**，只有菜单行与操作提示。
+   - 该字体是本地资产（27 MB，`assets/*` 默认不入库），缺字体会让中文变成豆腐块且不报错；`scripts/package.sh` 已把字体列入必需文件校验。
+   - `ICU4X data error: No segmentation model for complex script: Chinese/Japanese` 是**只在 debug 构建出现**的噪音：Bevy 的 `bevy_text` 默认不开 `complex_script_segmentation`，parley 用 `LineSegmenter::new_for_non_complex_scripts`，CJK 段没有词典模型；而 `icu_provider` 在未开 `logging` feature 且 `debug_assertions` 时把 warn 直接 `eprintln!`，绕过 tracing 与 `RUST_LOG`（release 里这段是空宏，完全不打印）。影响仅限「CJK 段内部没有换行机会，靠 parley 的紧急断行」，短标签看不出差别。想彻底消掉就开 `bevy_text/complex_script_segmentation`（带 5 MB CJ 词典，换来中日按词断行）。
 
 ## 核心设计不变量（迁移中不得丢失，Agent 每步自查）
 
@@ -109,7 +112,7 @@ serde_json = "1"
 3. 设计取舍用 A/B/C 选项向 Feihei 提案，不擅自扩大范围（主动标记 scope creep）。
 4. 每阶段完成后：build + fmt + clippy + test 全绿，再小步提交（Conventional Commits），更新 dev-plan。
 5. 跨平台验证：Windows 优先，关键渲染特性（大气/云/TAA）在核验时注意不同 GPU 后端（Vulkan/DX12）差异。
-6. **发布打包**：`scripts/package.sh`（Git Bash，`--no-build` 可复用已有 release）→ `dist/`（exe + `assets/shaders` + `assets/ui` + README）。**不要单独分发裸 exe**：缺少 `CARGO_MANIFEST_DIR` 时 Bevy 以 exe 同目录为资产根，缺 `assets/` 不报错，只是树和建筑立面（含窗光）整片不渲染、路灯照旧亮——最容易被误判成 release 优化 bug。
+6. **发布打包**：`scripts/package.sh`（Git Bash，`--no-build` 可复用已有 release）→ `dist/`（exe + `assets/shaders` + `assets/ui` + `assets/fonts` + README）。**不要单独分发裸 exe**：缺少 `CARGO_MANIFEST_DIR` 时 Bevy 以 exe 同目录为资产根，缺 `assets/` 不报错，只是树和建筑立面（含窗光）整片不渲染、路灯照旧亮——最容易被误判成 release 优化 bug；缺 `assets/fonts` 同理，中文菜单会变成一片空白方块。
 
 ## AI Agent 测试工作流
 

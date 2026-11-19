@@ -49,6 +49,8 @@ pub struct GamePlugins;
 impl PluginGroup for GamePlugins {
     fn build(self) -> PluginGroupBuilder {
         PluginGroupBuilder::start::<Self>()
+            // The UI face first: every screen below asks `UiFont` for it.
+            .add(crate::core::ui_font::UiFontPlugin)
             .add(SkyPlugin)
             // The game's volumetric clouds replace the crate's disabled
             // CloudPlugin (adr-0007); right after the sky so its depth
