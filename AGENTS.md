@@ -77,6 +77,7 @@ serde_json = "1"
 7. **UI 文本（2026-11-19 用户决定）**：玩家可见文本一律中文，字体统一用油墨打字机体 `assets/fonts/ZhaohuaTypeWriterLight.ttf`——通过 `core::ui_font::UiFont`（`TextFont` 由 `UiFont::at(size)` 生成，或用 `menu::text_node`）取字体，禁止直接 `TextFont::from_font_size` 另起一套字体。日志/调试面板仍用英文（ASCII 便于 grep），季节等枚举保留 `label()`（英文日志）与 `label_zh()`（菜单）两个名字。标题画面只有手写标题图、**不显示任何按键提示**（任意键仍可跳过）；按键后进入的主菜单也**不再重复标题**，只有菜单行与操作提示。
    - 该字体是本地资产（27 MB，`assets/*` 默认不入库），缺字体会让中文变成豆腐块且不报错；`scripts/package.sh` 已把字体列入必需文件校验。
    - `ICU4X data error: No segmentation model for complex script: Chinese/Japanese` 是**只在 debug 构建出现**的噪音：Bevy 的 `bevy_text` 默认不开 `complex_script_segmentation`，parley 用 `LineSegmenter::new_for_non_complex_scripts`，CJK 段没有词典模型；而 `icu_provider` 在未开 `logging` feature 且 `debug_assertions` 时把 warn 直接 `eprintln!`，绕过 tracing 与 `RUST_LOG`（release 里这段是空宏，完全不打印）。影响仅限「CJK 段内部没有换行机会，靠 parley 的紧急断行」，短标签看不出差别。想彻底消掉就开 `bevy_text/complex_script_segmentation`（带 5 MB CJ 词典，换来中日按词断行）。
+8. **变更检测（2026-11-19 教训）**：`ResMut`/`Mut` 的 `&mut` 方法即使什么都没改也会点亮 changed 标记——`track_player_chunk` 曾每帧 `bitmap.mark(key)`，导致 `bitmap.is_changed()` 恒为真、HUD 面板每帧重建（也是 debug 下 ICU4X 刷屏的真凶）。写入前先查（`is_explored` → 才 `mark`）；`menu::sync_ui_root` 的重建条件必须列全依赖（phase/seed/season/screen/browser/selection/bitmap），漏一个就会出现「光标不动」这类假死。
 
 ## 核心设计不变量（迁移中不得丢失，Agent 每步自查）
 

@@ -97,7 +97,15 @@ pub(crate) fn track_player_chunk(
         return;
     };
     let key = chunk_key(Vec2::new(camera.translation.x, camera.translation.z));
-    bitmap.mark(key);
+    // Only touch the resource when the chunk is genuinely new. `mark` takes
+    // `&mut self`, and change detection cannot tell a no-op insert from a real
+    // edit: marking every frame flagged `ExploredBitmap` as changed on every
+    // tick, which made the HUD's rebuild guard respawn the whole panel each
+    // frame (and re-lay out its Chinese line, printing an ICU4X warning per
+    // layout in debug builds).
+    if !bitmap.is_explored(key) {
+        bitmap.mark(key);
+    }
     if *last != Some(key) {
         changed.write(PlayerChunkChanged {
             new_chunk: key,
@@ -120,6 +128,31 @@ mod tests {
         assert_eq!(bitmap.len(), 1);
         assert!(bitmap.fraction() > 0.0);
         assert!(!bitmap.is_complete());
+    }
+
+    #[test]
+    fn revisiting_a_chunk_does_not_touch_the_bitmap() {
+        use bevy::ecs::change_detection::DetectChanges;
+
+        let mut app = App::new();
+        app.init_resource::<ExploredBitmap>()
+            .add_message::<PlayerChunkChanged>()
+            .add_systems(Update, track_player_chunk);
+        app.world_mut()
+            .spawn((Camera3d::default(), Transform::default()));
+
+        app.update(); // first tick marks the chunk the camera stands in
+        assert_eq!(app.world().resource::<ExploredBitmap>().len(), 1);
+
+        // Standing still must not re-flag the resource: the HUD rebuild guard
+        // keys off `is_changed`, and a per-frame flag respawns the panel every
+        // frame.
+        app.world_mut().clear_trackers();
+        app.update();
+        assert!(
+            !app.world().resource_ref::<ExploredBitmap>().is_changed(),
+            "an already-explored chunk must not mark the bitmap as changed"
+        );
     }
 
     #[test]

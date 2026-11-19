@@ -485,6 +485,7 @@ fn sync_ui_root(
         && !season.is_changed()
         && !screen.is_changed()
         && !browser.is_changed()
+        && !selection.is_changed()
         && root.entity.is_some()
         && !bitmap.is_changed()
     {
@@ -1561,4 +1562,35 @@ mod tests {
         );
     }
 
+    /// Marker used to prove a UI root survived: a respawned root would lose it.
+    #[derive(Component)]
+    struct HudMarker;
+
+    #[test]
+    fn the_hud_is_not_respawned_every_frame() {
+        let mut app = app_with_ui();
+        app.update();
+        app.update();
+        start_a_run(&mut app);
+        app.update();
+
+        let root = app
+            .world()
+            .resource::<MenuUiRoot>()
+            .entity
+            .expect("the playing phase shows the HUD");
+        app.world_mut().entity_mut(root).insert(HudMarker);
+
+        // Standing still changes nothing, so `sync_ui_root` must early-return.
+        // It used to rebuild the panel every frame because the exploration
+        // tracker marked the bitmap on every tick (change detection cannot
+        // tell a no-op insert from a real one).
+        for _ in 0..3 {
+            app.update();
+        }
+        assert!(
+            app.world().get::<HudMarker>(root).is_some(),
+            "the HUD was respawned without any content change"
+        );
+    }
 }
