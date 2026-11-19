@@ -25,6 +25,8 @@
 # Agent/session housekeeping
 /.box-agent/
 /.box-agent-scratch/
+/.box-agent-staging/
+/.screenshots/
 /.workbuddy/
 # Per-file chat-retention markers the editor writes next to files it has
 # referenced in a conversation (`{"retain_for_chat": true}`). Runtime
