@@ -43,7 +43,17 @@ pub struct SaveData {
 }
 
 /// Current save format version.
-pub const SAVE_VERSION: u32 = 1;
+///
+/// 2 (2026-11-18, ADR-0009): the arterial cross changed the tier-0 RNG draw
+/// order, so the same seed produces a different world. The save only stores
+/// the seed, so old saves would silently load onto a changed map — bumped so
+/// the loader rejects them cleanly instead.
+///
+/// 3 (2026-11-19, R3.20): same-kind district growth (同类连片), the apartment
+/// no-lanes rule and the junction spawn point all change what the same seed
+/// produces — old saves would load onto a different map again, so bumped
+/// per the ADR-0009 precedent.
+pub const SAVE_VERSION: u32 = 3;
 
 impl SaveData {
     /// Captures the current game state.

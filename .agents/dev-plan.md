@@ -625,6 +625,9 @@ R3.15 环路外景物带    [██████████] 实现完成（带�
 R3.16 抗锯齿 / TAA    [████████░░] 接入完成 + 立面采样器修线性 mip（2026-11-11，快门 ≈6 ms，待实机验收）
 R5.1-5 天空调参+云    [████████░░] 面板/云种/sky_gain/dome 完成；云边缘块状属已知边界（2026-10-27 收尾）
 R6: 自研体积云        [█████████░] 6.0–6.5 完成 + 视 uniform 锚定修复（2026-11-16），待人眼复测
+R3.18 两级路网细分    [██████████] 实现完成（ADR-0008，2026-11-17，待实机验收）
+R3.19 主干道十字      [██████████] 实现完成（ADR-0009，2026-11-18，待实机验收）
+R3.20 连片+出生点     [██████████] 实现完成（ADR-0010，2026-11-19，待实机验收）
 ```
 
 ### R3.11 屋顶轮廓（2026-10-31，步骤 11.3）
@@ -755,6 +758,60 @@ R6: 自研体积云        [█████████░] 6.0–6.5 完成 + �
 - [x] **验证**：`cargo fmt --check`、`cargo clippy --all-targets`（0 警告）、`cargo test --all-targets`（252 lib + 4 集成）全绿；`world_map` 顶视图渲染正常
 - **待实机确认**：① 2-3.5 m 巷道在 22.55-60° 相机下的压迫感与天空占比是否达标；② 外挂楼梯 63° 陡度与 1.5 m 出挑在巷中的遮挡感；③ 村巷电线（3 层杆线 + 85% 跨街线）密度是否够"凌乱"；④ 首层退 1 m（骑楼）未做——现有 setback 0.25 m 是排水缝，骑楼需要按层几何退台，另立条目
 - **已知限制**：合并长边只记录首段 unit edge 的左右街区（既有 quirk），长边中段贴村巷的跨街线可能悬在无建筑 plan 里；如观感突兀，后续把 placement 改成按 unit edge 分段规划
+
+### R3.18 街区内部细分：两级路网（2026-11-17，ADR-0008）
+
+**背景**：ADR-0002 的 50 m 格子把路网空间频率锁死——老城/城中村 1×1 街区内部一个岔口都没有，巷距 50 m 与实地 6-10 m 相差一个量级。ADR-0008 决策：保留 tier-0 骨架，在街区内部加一层子地块细分（tier-1 巷道），按类型分级强度。
+
+- [x] **数据结构**（`layout_graph.rs`）：`SubBlock`/`SubFrontage`/`EdgeKind`；`LayoutBlock.children` 与 `LayoutEdge.kind` 均 `#[serde(default)]`，旧格式 JSON（无 children/kind）反序列化为不细分 + Street，行为与重构前一致（`pre_subdivision_graph_json_still_loads` 钉死）；新增 `NodeKind::LaneMouth`（巷口 T 节点）
+- [x] **细分 pass**（新模块 `world/subdivision.rs`，`generate_world` 在边关联后调用）：按类型参数表分发（城中村 13 m 巷距/2.4-3.2 m 巷宽/11 m 地块，老城 24 m/3.5-5.0 m/18 m，公寓 46 m/5.0-6.0 m/30 m；厂房/广场/树林不细分）；主轴长边优先 + 30% 翻转；巷距/地块长度随机抖动；**地块之间紧邻无缝隙**（贴线由 spacing/setback 表达）；**巷道贯穿街区全深**，两端停在 tier-0 街道中心线上形成 T（否决原型 D 的碎片死胡同）；巷宽上限 = 较窄邻街宽（收口风险缓解）。独立 RNG salt（`subdivision_rng`），tier-0 生成流零位移；巷道边追加在街道边之后，既有 per-edge RNG 流索引不变
+- [x] **几何稳健性**：行/地块用半平面裁剪切分；共享切口 snap 到 1/64 m、顶点 snap 到 1/256 m（~4 mm）格，贴邻地块共享边 bit-exact（消除浮点毛刺被判穿插）；切完再裁回父多边形保证包含；面积 <8 m² 或任一边 <2 m 的角料丢弃。**外侧两排房排保持整排单地块**——临街面必须是单一 frontage（切成小片会低于 MIN_FACADE 让整条街空掉），其巷侧面仍开 tier-1 行、碰撞仍按地块开巷
+- [x] **放置**（`placement.rs`）：`place_buildings` 增加 `polygon` 参数（街区本体或子地块），`usable_frontage`/深度探针/包含测试全部作用于该多边形；children 空 = 原整块行为。细分子块按 plot 放临街行（salt 32+side*16+child*64）；巷侧行按 `SubFrontage` 放置（salt 14000+，curb=0 因 plot 边即巷边）；plot 行最小深度放宽到 2 m（巷排浅于参数表深度时不再整排拒绝）。Lane 边跳过建筑/树/道具/跨街层
+- [x] **碰撞**（`collision.rs`）：细分子块按 plot 生成凸棱柱（`SolidPrism.child` 区分），children 空回退整块；chunk 分桶不变；新增 `walking_every_lane_reaches_the_far_end`（全部巷道 0.5 m 步长步行可达）与棱柱计数/桶上限断言
+- [x] **可视化**：minimap 巷道 0.75 px 细线 + 更暗配色（`lane_segments_are_tagged_as_lanes`）；debug_viz 巷道青色中心线 + 子地块浅灰轮廓；`world_map` 巷口青色小点
+- [x] **测试（净增 17，lib 总数 283）**：细分确定性、类型分发、子地块不重叠（SAT 深度 ≤0.01 m，贴邻共享边不误判）+ 父包含、巷宽区间 + 收口上限、每巷两端 degree-3 T 且落在街道中心线上、巷道贯穿全深（非碎片）、frontage 贴巷半宽、步行尺度节点间距带（10-24 m 间隔 >20/seed）、主轴方向分布（20-80%）、tier-0 线宽不变、旧存档兼容、建筑覆盖率下限 20%、巷道步行、棱柱计数
+- [x] **实测（`examples/subdiv_stats`，3 seed）**：生成 2 ms；巷 160-177 条/图，巷口 T 323-355 个，degree-3 节点占比 77-79%（重构前 38-46% 且全在 100-250 m 合并块边界）；**10-24 m 步行尺度节点间隔 315-342 个/图（重构前该带为 0）**；巷宽 2.42-6.00 m 全在类型区间；城中村每块 6-17 个地块；棱柱 425-477（重构前 ~200，约 2.2×，分桶后单桶 <400）
+- [x] **验证**：`cargo fmt --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test`（283 lib + 4 集成）全绿；`world_map` 顶视图确认两级路网、无单向条纹、无碎片死胡同
+- **待实机确认**：① 城中村 13 m 巷距 + 2.4-3.2 m 巷宽在仰视相机下的步行节奏；② 巷侧建筑行（2 m 最小深度棚屋档）观感；③ 公寓 46 m 内部巷是否过疏/过密
+- **已知限制**：巷口道具避让未做——tier-0 电线杆按整边中点流放置，split 后个别杆落在巷口附近（测试按共线直线度量通过）；如观感突兀，后续给 `pole_slots` 加巷口避让带
+- **地形图烘焙（2026-11-17，`examples/world_map.rs`）**：改为「地块按类型着色 → 建筑占地（0.45 暗化）→ 街道/巷道中线 → 街区轮廓 → 节点」的绘制顺序，并额外输出三类街区 100 m 宽 1:1 特写。命令 `cargo run --example world_map`（可加 `SEED=` / `WORLD_MAP_PX=` / `WORLD_MAP_CROPS=0`）。产物 `target/world_map*.png`，交付副本见 `docs/maps/`。实测 seed 0x48454144：149 块 / 110 细分 / 461 地块 / 698 街道段 + 177 巷道 / 355 巷口 / 9141 栋建筑
+- **地块填充（2026-11-18 补完）**：覆盖率老城 **92-93%**、城中村 **81-87%**、公寓 **69-76%**；空地块 0-5%，**所有细分街区覆盖率 ≥35%（无空心街区）**。四处关键修复：① **逐列进深预算**——原先用「最浅一列」代表整排，L 形/斜条地块只能建到最窄处；改为每列各持 `budgets[column]`。② **进深自适应回退**——倾斜地块向深部收窄，整排深度放不下时按 100%→75%→50%→`min_depth` 四档回退，让地块建到后沿而非整列丢弃。③ **巷道切排与接街解耦**——巷口交点若落在既有节点上会成为十字路口（违反 ADR 的 T 形契约，测试钉死 degree==3），此时该巷不生成边，但**仍参与切分房排**，否则整块塌成两块大板。④ **无巷回退网格** `plot_grid_without_lanes`——四条巷全部接不上街时，按巷距与地块长度切出二维地块网格（不产巷道边、不产 T），彻底消除空心街区（此前 10-12% 合格街区无地块）。另外修掉一处**重叠 bug**：双面各 0.5 份额的多排会互相穿压（实测覆盖率 111-146%，房子里套房子），现已按「每面各占半深、于中点相接」收敛
+- **已知残留（非缺陷，可接受）**：公寓 67-74% 的「留白」主要是 12-14 m 进深板楼 + 楼间距的院落/停车空间（`BuildingParams::Apartment` 本身只有 12-14 m 深，而地块深 22-33 m），与真实住区形态一致；若要更高密度，应调整公寓参数表（进深/巷距）而非放置逻辑
+
+### R3.19 主干道十字切分（2026-11-18，ADR-0009）
+
+**背景**：R3.18 评审反馈"一级道路太多、50m 街区重复感强"。根因：tier-0 的每条街区接缝都是同级街道（6-10 m），老城 87% 强制 1×1 → 全图约七成面积是 50 m 等距同级路网。Feihei 决策：**先用一条 10-15 m 主干道十字（一竖一横 lattice 线）把地图切成 4 象限，每个象限内部继续用现有两级算法**；地图范围保持 800 m。
+
+- [x] **十字抽取**（`path_network.rs`）：`ArterialCross { col, row, width_v, width_h }`，`generate_world` 开头按 col→row→width_v→width_h 固定顺序从同一 RNG 抽取；抖动 `{7,8}`（最小象限 6 格 = 300 m > 厂房 5×5 = 250 m，零合并退化）
+- [x] **钉住**：`perturbed_nodes` 钉住十字两线（与 ring 同理），主干道笔直；两端与外环 T 汇、交叉点 4 度 Junction；钉住分支消耗同样的两次 draw，RNG 流对齐
+- [x] **四象限剖分**：`partition_blocks` 按 NW→NE→SW→SE 行主序扫描，范围不跨十字线；类型/merge/退化逻辑零改动；块永不跨越主干道
+- [x] **逐边 inset**：临主干道侧退 `arterial/2`（其余退自身半宽）；`street_unit_edges` 中十字线接缝宽 = 主干道绘制宽、`EdgeKind::Arterial`（新变体，serde 兼容；`StreetUnitEdge` 加 `kind`）
+- [x] **巷道口放行主干道**：`subdivision.rs` 六处 `!= Street` 改 `== Lane` 才跳过；`place_mouth` reach 改按候选边 `width*0.5+3.0`（否则 15 m 主干道侧的巷口够不到中心线）；主干道即一条街——建筑/树/街具/行人语义零改动
+- [x] **下游视觉**：minimap 主干道 2.5 px 加粗加亮（tier 由 bool 升为 `RoadTier` 三级）；debug_viz 品红臂；`examples/world_map` 加粗
+- [x] **连带修复**：`overhead.rs` `SCAFFOLD_END_MARGIN` 6→8 m（主干道最大半宽 7.5 m 必须在棚架立柱内收距离内）；**碰撞凸包裁剪**——大合并块沿强扰动街道时 convex_hull 弦越过自身 inset 面凸进街道（实测 seed 0x48454144 厂房凸包越过 6.9 m 街道中心线 0.3 m 夹死行走者），`prism_polygon` 把凸包剪裁回多边形各边半平面内（棱柱 ⊆ 多边形，退化回退凸包）
+- [x] **存档**：SAVE_VERSION 1→2（同 seed 世界改变，旧档干净拒绝）
+- [x] **测试**：新增 `arterial_cross_splits_the_map_into_four_quadrants`（恰好一竖一横/宽度/无块跨线/临线退够半宽，4 seed）；`lattice_nodes...` 加钉住断言 + 阈值 0.95→0.8；`street_widths_stay_in_range` 按 kind 分支；lib 总数 283→285，全部通过
+- [x] **验证**：`cargo fmt`、`cargo clippy --all-targets -- -D warnings`、`cargo test`（285 lib + 4 集成）全绿
+- **待实机确认**：① 十字在 350/400 m 抖动下的象限均衡观感；② T 路口处路面瞬时收窄（mitre 顶点 = 两半宽均值）是否可接受；③ 出生点 (400,400) 在十字取 7 时可能落块内（既有风险，非本次引入）——③ 已由 R3.20 出生点随机路口解决
+
+### R3.20 同类街区连片 + 出生点随机路口（2026-11-19，ADR-0010）
+
+**背景**：R3.19 评审反馈"50m 方块感还是太强，同类地块相邻时内部道路应降级或取消形成连片的住宅区/森林区/城中村区；城中村不能单块独立、至少 2×2；蓝色区域不应该有内部路了"；"出生点可以随机指定一个路口点，避免落地块内"。Feihei 三点决策：**同类连片（接缝降级/取消）+ 公寓不切内路 + spawn 落路口**。
+
+- [x] **连片机制**（`path_network.rs`）：`partition_blocks` 两阶段——Phase A 行主序扫描，每格按 `district_size`（公寓/厂房 2–3²/4–5²、老城 1..=2²、城中村 (1..=2)×(2..=3) 保证 ≥2 跨度、森林 (2..=3)²、广场 1×1）长矩形 district，`largest_free_rect`（按面积最大，取代 largest_free_square）放块，`try_extend_district` 以 0.65 概率把相邻自由格沿行/列吸收进同类 district（矩形保持、永不跨象限/主干道）；Phase B 统一从 rect 建逐边 inset 多边形（主干道 > 同类接缝 > 自身半宽）
+- [x] **同类接缝降级**：`seam_width` 规则表——城中村取两侧 min（2–3.5 m 窄巷）、老城 4.0、森林 3.0、其余平均；`street_unit_edges` 非道路格接缝改用它
+- [x] **概率重标定**：per-roll = 目标面积占比 / 期望 district 面积 → `P_PLAZA_END 0.1531`、`P_FOREST_END 0.2102`、`P_VILLAGE_END 0.2783`（面积配比与 R3.19 持平）
+- [x] **公寓不细分**：`subdivision.rs::params_of` 对 Apartment 返回 None——蓝色片区板楼直接沿街、内部整体成片
+- [x] **出生点**：`spawn_point(graph, seed)`——Junction 集合 + 加盐 RNG（SPAWN_SALT，独立流不扰生成）随机选一路口，yaw 朝第一条 tier-0 街；`main.rs::place_player_at_spawn`（Update 一次性，先于 streaming）+ `menu.rs::start_run` fresh SaveData 同源；空 graph 回退世界中心
+- [x] **`NodeKind::Pass`**：度=2 直行格点也建节点（修复环线 100 m 破洞/块底边消失）；`street_segments` 保持逐 unit 发射（节点对长边弦偏离摆动走廊导致行走失败，已回滚）
+- [x] **法线翻转修复**：质心启发式在细长地块条（6×250 m）上法线朝外 → inset 外凸 5 m 进街道；`geometry::inward_normals`（按绕向）替换 geometry/collision/subdivision 共 4 处
+- [x] **碰撞凸分解**：半平面裁剪 kernel 丢质心 vs 凸包桥接凹口的两难 → `geometry::convex_decompose` 耳切三角剖分 + `register_chunk` 每凸片段一个 SolidPrism；输入先去重闭合轮廓（重复顶点使耳切产出覆盖凹口的无效三角形——实测 `[A,C,E]` 片段西缘伸进街道卡死行走者 + `[A,D,A]` 零面积碎片）
+- [x] **`push_out` 角点修复**：旧浅轴判定把"全边 dist_out < radius"当内部，凸角外 2.06 m（圆不相交）也被横推卡死；重写为内部点浅轴推出（沿墙滑动）+ 外部点最近边界点径向推出
+- [x] **存档**：SAVE_VERSION 2→3（同 seed 世界改变，旧档干净拒绝）
+- [x] **测试**：新增 `same_kind_cells_coalesce_into_districts`（共享接缝 ≥0.5）、`same_kind_district_seams_are_narrow_lanes`、`spawn_point_is_a_deterministic_street_junction`（落在 Junction 上且不在块内）；`block_types_match_the_merge_table` 更新（village ≥2 跨度）；行走下限改绝对值 `MIN_WALKED_EDGES = 64`、巷道 >15；村 plot 按格数缩放；lib 总数 285→287，全部通过
+- [x] **厂房预留**（R3.20b，当日评审"没有厂房吗？" → "改成整张图预留一个厂区就好"）：填充扫描 + 0.65 吸收把象限碎片化，厂房 roll 时找不出 4×4 → 3% 配额全部退化成老城（5 seed 实测 3 个零厂房）。修正：**整图预留一个厂区**——RNG 抽宿主象限、空象限中心放置（必放下、远离主干道与环路），填充扫描绕开；填充扫描的 3% 厂房 roll 移除（份额归还老城，built 分割 87/10/3 → 90/10），厂区唯一来源即预留；测试断言 `factory == 1`
+- [x] **验证**：`cargo fmt`、`cargo clippy --all-targets -- -D warnings`、`cargo test`（287 lib + 4 集成）全绿；`world_map` 顶视图确认连片肌理（城中村多格带状、森林 2–3²、公寓无内路、厂区 4–5²），`docs/maps/` 已更新
+- **待实机确认**：① spawn 路口观感与朝向；② 连片 district 的巷道密度是否偏均匀（`try_extend_district` 概率 0.65 可调）；③ 棱柱数上升对碰撞查询的影响（按 chunk 分片，预期无感）
 
 ## 风险与依赖
 

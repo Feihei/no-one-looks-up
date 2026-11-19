@@ -209,10 +209,12 @@ pub const SCAFFOLD_STEP: f32 = 1.0;
 /// junction.
 ///
 /// A street's corridor is `width / 2` either side of its centreline, and the
-/// widest street the generator makes is `STREET_WIDTH_MAX` = 10 m. A post
-/// 6 m past the edge node is therefore clear of the crossing street's
-/// corridor -- 3 m was not: measured, a post stood 0.63 m inside a junction.
-pub const SCAFFOLD_END_MARGIN: f32 = 6.0;
+/// widest tier-0 road the generator makes is now the arterial cross
+/// (ADR-0009): `ARTERIAL_WIDTH_MAX` = 15 m, half = 7.5 m. A post 8 m past the
+/// edge node is therefore clear of the crossing arterial's corridor -- the
+/// old 6 m (sized against `STREET_WIDTH_MAX` = 10 m) would have put a post
+/// 1.5 m inside a 15 m arterial.
+pub const SCAFFOLD_END_MARGIN: f32 = 8.0;
 
 /// How far the longitudinal beams run past the posts (m).
 pub const SCAFFOLD_BEAM_OVERHANG: f32 = 0.3;

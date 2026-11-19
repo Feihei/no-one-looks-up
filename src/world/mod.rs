@@ -24,6 +24,7 @@ pub mod placement;
 pub mod props;
 pub mod roof;
 pub mod season;
+pub mod subdivision;
 pub mod tree_mesh;
 pub mod tree_shape;
 pub mod world_grid;
@@ -75,6 +76,17 @@ pub const STREET_WIDTH_MAX: f32 = 10.0;
 /// that [`STREET_WIDTH`] needs does not apply here.
 pub const VILLAGE_STREET_WIDTH_MIN: f32 = 2.0;
 pub const VILLAGE_STREET_WIDTH_MAX: f32 = 3.5;
+
+/// Tier-0 arterial range (ADR-0009): the cross that splits the map into four
+/// quadrants. Each axis draws one width in `[MIN, MAX]`; the arterial keeps
+/// that width along its whole run instead of averaging the flanking blocks.
+///
+/// The upper bound is coupled to `overhead::SCAFFOLD_END_MARGIN`: scaffold
+/// legs stand `MARGIN` back from a junction, and the widest arterial half
+/// (15 / 2 = 7.5 m) must stay inside it, so the legs never land in the
+/// arterial corridor.
+pub const ARTERIAL_WIDTH_MIN: f32 = 10.0;
+pub const ARTERIAL_WIDTH_MAX: f32 = 15.0;
 
 /// Maximum lattice-node perturbation on each axis, in meters.
 ///

@@ -98,9 +98,14 @@ pub(crate) fn draw_debug_viz(
         }
     }
 
-    // Street network segments (centerlines).
+    // Street network segments (centerlines). ADR-0008: lanes draw in their
+    // own cooler colour so the two road tiers read apart in the overlay.
+    // ADR-0009: the arterial cross draws hot pink-white, clearly above the
+    // ordinary street orange.
     if let Some(graph) = &graph {
         let street = Color::srgba(1.0, 0.55, 0.1, 0.8);
+        let arterial = Color::srgba(1.0, 0.3, 0.75, 0.9);
+        let lane = Color::srgba(0.4, 0.8, 1.0, 0.7);
         for edge in &graph.edges {
             let (Some(a), Some(b)) = (
                 graph.nodes.get(edge.from as usize),
@@ -108,10 +113,15 @@ pub(crate) fn draw_debug_viz(
             ) else {
                 continue;
             };
+            let color = match edge.kind {
+                crate::world::layout_graph::EdgeKind::Street => street,
+                crate::world::layout_graph::EdgeKind::Arterial => arterial,
+                crate::world::layout_graph::EdgeKind::Lane => lane,
+            };
             gizmos.line(
                 Vec3::new(a.pos.x, 0.1, a.pos.y),
                 Vec3::new(b.pos.x - a.pos.x, 0.0, b.pos.y - a.pos.y),
-                street,
+                color,
             );
         }
 
@@ -136,6 +146,21 @@ pub(crate) fn draw_debug_viz(
                 .collect();
             points.push(points[0]);
             gizmos.linestrip(points, color);
+
+            // ADR-0008: sub-block plots, a shade dimmer than the parent
+            // outline so the lane grid reads inside the block.
+            for child in &block.children {
+                if child.polygon.len() < 3 {
+                    continue;
+                }
+                let mut plot: Vec<Vec3> = child
+                    .polygon
+                    .iter()
+                    .map(|p| Vec3::new(p.x, 0.09, p.y))
+                    .collect();
+                plot.push(plot[0]);
+                gizmos.linestrip(plot, Color::srgba(0.85, 0.85, 0.9, 0.45));
+            }
         }
     }
 

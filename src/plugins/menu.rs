@@ -25,7 +25,7 @@ use crate::core::input::PAUSE;
 use crate::plugins::save::{AUTOSAVE_SLOT, LoadRequest, SaveData, Season, read_save, slot_info};
 use crate::world::chunks::DEFAULT_SEED;
 use crate::world::explored::{ExploredBitmap, WorldExplorationCompleted};
-use crate::world::path_network::WorldSeed;
+use crate::world::path_network::{WorldSeed, generate_world, spawn_point};
 use crate::world::season::SeasonState;
 use crate::world::world_center;
 
@@ -609,14 +609,22 @@ fn start_run(
     season: &SeasonState,
     phase: &mut GamePhase,
     commands: &mut Commands,
-    players: &Query<&Transform, With<Camera3d>>,
 ) {
     let seed = seed_input.0.parse::<u64>().unwrap_or(DEFAULT_SEED);
-    let pose = players
-        .single()
-        .map(|t| [t.translation.x, t.translation.z])
-        .unwrap_or([world_center(), world_center()]);
-    let fresh = SaveData::capture(seed, season.season, &ExploredBitmap::default(), pose, 0.0);
+    // R3.20 (2026-11-19 user decision: 出生点随机指定一个路口点): a fresh run
+    // spawns on a seed-picked junction, never inside a block. Same
+    // derivation the restore flow performs (handle_load_request regenerates
+    // the same graph from the same seed), so the pose restored one frame
+    // later IS this junction pose. The double generation costs well under
+    // a second of pure CPU on the menu confirm.
+    let (pose, yaw) = match generate_world(seed) {
+        Ok((_, graph)) => {
+            let (pos, yaw) = spawn_point(&graph, seed);
+            ([pos.x, pos.y], yaw)
+        }
+        Err(_) => ([world_center(), world_center()], 0.0),
+    };
+    let fresh = SaveData::capture(seed, season.season, &ExploredBitmap::default(), pose, yaw);
     commands.insert_resource(WorldSeed(seed));
     commands.queue(|world: &mut World| {
         world.write_message(LoadRequest(fresh));
@@ -740,13 +748,9 @@ fn menu_input(
                                 original: season.season,
                             };
                         }
-                        MenuAction::Start => start_run(
-                            &mut seed_input,
-                            &season,
-                            &mut phase,
-                            &mut commands,
-                            &players,
-                        ),
+                        MenuAction::Start => {
+                            start_run(&mut seed_input, &season, &mut phase, &mut commands)
+                        }
                         MenuAction::OpenLoad => {
                             *browser = LoadBrowser::default();
                             *screen = MenuScreen::Load;

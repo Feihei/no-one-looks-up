@@ -21,8 +21,9 @@ use crate::world::CELL_SIZE;
 
 /// Lattice vertex in grid-line coordinates.
 type Vertex = (u32, u32);
-/// A maximal straight street run: start vertex, end vertex, average width.
-type StreetRun = (Vertex, Vertex, f32);
+/// A maximal straight street run: start vertex, end vertex, average width,
+/// road tier (ADR-0009: the arterial cross carries `EdgeKind::Arterial`).
+type StreetRun = (Vertex, Vertex, f32, EdgeKind);
 
 /// Building style label of a block (ADR-0001: three styles plus open zones).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -49,8 +50,17 @@ pub enum NodeKind {
     Junction,
     /// Right-angle bend of a street around a block.
     Corner,
+    /// Straight mid-run vertex kept as an edge anchor (R3.20): every unit
+    /// edge endpoint hosts a node, so per-unit edge geometry survives in the
+    /// graph even where no street crosses. Never a spawn point.
+    Pass,
     /// Center of a [`BlockType::Plaza`] block.
     Plaza,
+    /// Mouth of a tier-1 lane on a tier-0 street: the T junction ADR-0008
+    /// exists to produce. One street edge passes through it and one lane
+    /// terminates on it (degree 3), at walking scale (10-46 m apart) instead
+    /// of the merged-block scale (100-250 m).
+    LaneMouth,
 }
 
 /// A point of the street network.
@@ -59,6 +69,25 @@ pub struct LayoutNode {
     /// World position (meters; grid vertices sit on the 50 m lattice).
     pub pos: Vec2,
     pub kind: NodeKind,
+}
+
+/// Road tier of a layout edge (ADR-0008 two-tier network, ADR-0009 arterial).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum EdgeKind {
+    /// Tier 0: the street between blocks (the pre-ADR-0008 behaviour).
+    /// The default so edges serialized before the field existed deserialize
+    /// as streets, exactly what they were.
+    #[default]
+    Street,
+    /// Tier 0 arterial (ADR-0009): the cross that splits the map into four
+    /// quadrants. Carries its own drawn width (10-15 m) instead of the
+    /// flanking blocks' average, reads wider on the minimap/debug view, and
+    /// behaves as a street everywhere else (buildings face it, lane mouths
+    /// end on it, walking traffic crosses it).
+    Arterial,
+    /// Tier 1: a lane inside one block, cut by the sub-block pass. Runs the
+    /// full depth of its block and ends on tier-0 streets (T junctions).
+    Lane,
 }
 
 /// A street segment between two nodes.
@@ -77,6 +106,38 @@ pub struct LayoutEdge {
     /// Block on the "right" side (the original's `edge.right_block`).
     #[serde(default)]
     pub right_block: Option<u32>,
+    /// Road tier (ADR-0008). Lanes flank the SAME block on both sides (the
+    /// parent block's id); placement, furniture and the overhead layer skip
+    /// them, the minimap and debug view draw them thinner.
+    #[serde(default)]
+    pub kind: EdgeKind,
+}
+
+/// One lane-facing boundary of a [`SubBlock`] (ADR-0008).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SubFrontage {
+    /// Boundary start (world coordinates).
+    pub a: Vec2,
+    /// Boundary end (world coordinates).
+    pub b: Vec2,
+    /// Distance from the lane centerline to this boundary (= lane half
+    /// width): buildings offset from the lane by it, exactly like a street
+    /// curb.
+    pub lane_half_width: f32,
+}
+
+/// A sub-block: one plot cut out of a block's interior by tier-1 lanes
+/// (ADR-0008). Plots inside a house row sit flush against each other — the
+/// wall-to-wall feel comes from `BuildingParams.spacing`/`setback`, never
+/// from gaps between plots.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SubBlock {
+    /// Parent block id ([`LayoutBlock::id`]).
+    pub parent: u32,
+    /// Plot polygon, inset to the lane edges (world coordinates, CCW).
+    pub polygon: Vec<Vec2>,
+    /// Boundaries facing a lane; buildings hug these lines.
+    pub frontages: Vec<SubFrontage>,
 }
 
 /// One block of the world: a merged cell group with a style label.
@@ -95,6 +156,11 @@ pub struct LayoutBlock {
     /// Block polygon inset by `street_width / 2` (world coordinates, CCW).
     /// Used by the R3 collision prisms and debug visualization.
     pub polygon: Vec<Vec2>,
+    /// Interior subdivision (ADR-0008); empty means the block is not
+    /// subdivided (factory/plaza/forest, or an old save read back). Placement
+    /// and collision fall back to `polygon` when this is empty.
+    #[serde(default)]
+    pub children: Vec<SubBlock>,
 }
 
 impl LayoutBlock {
@@ -128,8 +194,12 @@ pub(crate) struct NodeVertex {
 pub(crate) struct StreetUnitEdge {
     /// The two lattice vertices of the unit edge (unordered).
     pub vertices: ((u32, u32), (u32, u32)),
-    /// Effective width (m): average of the flanking blocks' street widths.
+    /// Effective width (m): average of the flanking blocks' street widths;
+    /// the arterial cross carries its own drawn width instead (ADR-0009).
     pub width: f32,
+    /// Road tier of this unit edge (ADR-0009): streets and the arterial cross
+    /// both arrive here from generation; lanes are appended by subdivision.
+    pub kind: EdgeKind,
 }
 
 /// The complete world layout: street network + blocks + bounds.
@@ -192,7 +262,7 @@ impl LayoutGraph {
 
         // Street segments: merge collinear unit edges into maximal straight
         // runs and attach the run endpoints to the node map.
-        for (start, end, width) in street_segments(unit_edges) {
+        for (start, end, width, kind) in street_segments(unit_edges) {
             let (Some(&from), Some(&to)) = (node_index.get(&start), node_index.get(&end)) else {
                 // Maximal run endpoints always host a node (junction, corner,
                 // or border-adjacent turn): generation guarantees it. Skip
@@ -205,6 +275,7 @@ impl LayoutGraph {
                 width,
                 left_block: None,
                 right_block: None,
+                kind,
             });
         }
         graph
@@ -219,22 +290,41 @@ impl LayoutGraph {
     }
 }
 
-/// Merges street unit edges into maximal straight runs.
+/// Merges street unit edges into maximal straight runs and emits one segment
+/// per unit edge.
 ///
-/// Returns `(start_vertex, end_vertex, width)` triples in lattice
-/// coordinates; the width is the average over the merged unit edges. Runs end
-/// at map ends or at vertices where the street turns or branches — exactly
-/// the vertices that host graph nodes.
+/// Returns `(start_vertex, end_vertex, width, kind)` tuples in lattice
+/// coordinates; the width is the average over the merged unit edges. A run
+/// continues while a collinear unit edge exists — it passes straight THROUGH
+/// degree-4 junctions (a north-south street keeps both its halves at a
+/// crossroad, even when the crossing street is the arterial), and ends only
+/// where the line stops: at the ring, at a T head, or at a corner. Every
+/// unit edge along one lattice line carries the same kind (the arterial
+/// cross owns its two lines whole, ADR-0009), so the run's kind is read off
+/// its first unit edge.
+///
+/// Per-unit emission is load-bearing (R3.1): a merged run would give
+/// placement one anchor mid-street, and since R3.20 every unit endpoint
+/// hosts a node, so every unit edge survives into the graph — an earlier
+/// node-pair attempt punched 50-100 m holes into streets behind 2+-cell
+/// districts (vertices between two cells of one block host no crossing
+/// street, so they had no node and their units were dropped).
 fn street_segments(unit_edges: &[StreetUnitEdge]) -> Vec<StreetRun> {
     let canonical = |a: Vertex, b: Vertex| {
         if a < b { (a, b) } else { (b, a) }
     };
-    // Adjacency: lattice vertex -> (neighbor, width).
-    let mut adjacency: HashMap<Vertex, Vec<(Vertex, f32)>> = HashMap::new();
+    // Adjacency: lattice vertex -> (neighbor, width, kind).
+    let mut adjacency: HashMap<Vertex, Vec<(Vertex, f32, EdgeKind)>> = HashMap::new();
     for edge in unit_edges {
         let (v0, v1) = edge.vertices;
-        adjacency.entry(v0).or_default().push((v1, edge.width));
-        adjacency.entry(v1).or_default().push((v0, edge.width));
+        adjacency
+            .entry(v0)
+            .or_default()
+            .push((v1, edge.width, edge.kind));
+        adjacency
+            .entry(v1)
+            .or_default()
+            .push((v0, edge.width, edge.kind));
     }
 
     // Walk maximal straight runs, marking each unit edge visited once. Runs
@@ -246,12 +336,12 @@ fn street_segments(unit_edges: &[StreetUnitEdge]) -> Vec<StreetRun> {
     let mut segments = Vec::new();
     for start in starts {
         // Collect neighbors to keep `adjacency` borrow-free below.
-        for (next, _) in adjacency[&start].clone() {
+        for (next, _, _) in adjacency[&start].clone() {
             let key = canonical(start, next);
             if !visited.insert(key) {
                 continue;
             }
-            let mut total_width = edge_width(unit_edges, key);
+            let (mut total_width, kind) = edge_info(unit_edges, key);
             let mut run = vec![start, next];
 
             // Extend backward: prepend straight continuations before `start`.
@@ -263,7 +353,7 @@ fn street_segments(unit_edges: &[StreetUnitEdge]) -> Vec<StreetRun> {
                     after.1 as i64 - head.1 as i64,
                 );
                 let mut continuation = None;
-                for (cand, _) in adjacency[&head].clone() {
+                for (cand, _, _) in adjacency[&head].clone() {
                     let ckey = canonical(head, cand);
                     if visited.contains(&ckey) {
                         continue;
@@ -281,7 +371,7 @@ fn street_segments(unit_edges: &[StreetUnitEdge]) -> Vec<StreetRun> {
                     Some(cand) => {
                         let ckey = canonical(head, cand);
                         visited.insert(ckey);
-                        total_width += edge_width(unit_edges, ckey);
+                        total_width += edge_info(unit_edges, ckey).0;
                         run.insert(0, cand);
                     }
                     None => break,
@@ -294,7 +384,7 @@ fn street_segments(unit_edges: &[StreetUnitEdge]) -> Vec<StreetRun> {
                 let prev = run[run.len() - 2];
                 let dir = (tail.0 as i64 - prev.0 as i64, tail.1 as i64 - prev.1 as i64);
                 let mut continuation = None;
-                for (cand, _) in adjacency[&tail].clone() {
+                for (cand, _, _) in adjacency[&tail].clone() {
                     let ckey = canonical(tail, cand);
                     if visited.contains(&ckey) {
                         continue;
@@ -308,7 +398,7 @@ fn street_segments(unit_edges: &[StreetUnitEdge]) -> Vec<StreetRun> {
                     Some(cand) => {
                         let ckey = canonical(tail, cand);
                         visited.insert(ckey);
-                        total_width += edge_width(unit_edges, ckey);
+                        total_width += edge_info(unit_edges, ckey).0;
                         run.push(cand);
                     }
                     None => break,
@@ -320,20 +410,23 @@ fn street_segments(unit_edges: &[StreetUnitEdge]) -> Vec<StreetRun> {
             // ownership a single anchor in the middle of the map, so whole
             // street frontages would never be placed.
             for pair in run.windows(2) {
-                segments.push((pair[0], pair[1], total_width / count));
+                segments.push((pair[0], pair[1], total_width / count, kind));
             }
         }
     }
     segments
 }
 
-/// Looks up the width of a canonicalized unit edge.
-fn edge_width(unit_edges: &[StreetUnitEdge], key: ((u32, u32), (u32, u32))) -> f32 {
+/// Looks up the width and kind of a canonicalized unit edge.
+fn edge_info(unit_edges: &[StreetUnitEdge], key: ((u32, u32), (u32, u32))) -> (f32, EdgeKind) {
     unit_edges
         .iter()
         .find(|e| canonical_pair(e.vertices) == key)
-        .map(|e| e.width)
-        .unwrap_or((crate::world::STREET_WIDTH_MIN + crate::world::STREET_WIDTH_MAX) * 0.5)
+        .map(|e| (e.width, e.kind))
+        .unwrap_or((
+            (crate::world::STREET_WIDTH_MIN + crate::world::STREET_WIDTH_MAX) * 0.5,
+            EdgeKind::Street,
+        ))
 }
 
 fn canonical_pair(a: ((u32, u32), (u32, u32))) -> ((u32, u32), (u32, u32)) {
@@ -353,6 +446,7 @@ mod tests {
             street_width: 8.0,
             is_outer: false,
             polygon: vec![],
+            children: vec![],
         }
     }
 
@@ -376,6 +470,7 @@ mod tests {
                 width: 8.0,
                 left_block: None,
                 right_block: None,
+                kind: EdgeKind::Street,
             }],
             blocks: vec![LayoutBlock {
                 id: 0,
@@ -388,8 +483,86 @@ mod tests {
                     3.5,
                 )
                 .expect("valid inset"),
+                children: vec![],
             }],
         };
+        let json = serde_json::to_string(&graph).expect("serialize");
+        let restored: LayoutGraph = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(graph, restored);
+    }
+
+    /// ADR-0008 backward compatibility: a graph serialized before the
+    /// subdivision existed (no `children` on blocks, no `kind` on edges)
+    /// must deserialize with empty children (= no subdivision, the old
+    /// behaviour) and street edges.
+    #[test]
+    fn pre_subdivision_graph_json_still_loads() {
+        let legacy = r#"{
+            "bounds": [800.0, 800.0],
+            "nodes": [{"pos": [50.0, 50.0], "kind": "Junction"}],
+            "edges": [{"from": 0, "to": 0, "width": 8.0,
+                       "left_block": 0, "right_block": null}],
+            "blocks": [{"id": 0, "kind": "OldCity", "cells": [[1, 1]],
+                        "street_width": 8.0, "is_outer": false,
+                        "polygon": [[54.0, 54.0], [96.0, 54.0],
+                                    [96.0, 96.0], [54.0, 96.0]]}]
+        }"#;
+        let graph: LayoutGraph = serde_json::from_str(legacy).expect("legacy graph loads");
+        assert!(
+            graph.blocks[0].children.is_empty(),
+            "old save = no subdivision"
+        );
+        assert_eq!(graph.edges[0].kind, EdgeKind::Street);
+        assert_eq!(graph.edges[0].left_block, Some(0));
+    }
+
+    /// A subdivided graph (children + lane edges + lane-mouth nodes) must
+    /// round-trip bit-exactly through serde.
+    #[test]
+    fn subdivided_graph_round_trips() {
+        let mut graph = LayoutGraph {
+            bounds: Vec2::splat(crate::world::WORLD_SIZE),
+            ..Default::default()
+        };
+        graph.blocks.push(LayoutBlock {
+            id: 0,
+            kind: BlockType::UrbanVillage,
+            cells: vec![(1, 1)],
+            street_width: 3.0,
+            is_outer: false,
+            polygon: vec![
+                Vec2::new(51.5, 51.5),
+                Vec2::new(98.5, 51.5),
+                Vec2::new(98.5, 98.5),
+                Vec2::new(51.5, 98.5),
+            ],
+            children: vec![SubBlock {
+                parent: 0,
+                polygon: vec![
+                    Vec2::new(51.5, 51.5),
+                    Vec2::new(60.0, 51.5),
+                    Vec2::new(60.0, 98.5),
+                    Vec2::new(51.5, 98.5),
+                ],
+                frontages: vec![SubFrontage {
+                    a: Vec2::new(60.0, 51.5),
+                    b: Vec2::new(60.0, 98.5),
+                    lane_half_width: 1.4,
+                }],
+            }],
+        });
+        graph.nodes.push(LayoutNode {
+            pos: Vec2::new(61.4, 50.0),
+            kind: NodeKind::LaneMouth,
+        });
+        graph.edges.push(LayoutEdge {
+            from: 0,
+            to: 0,
+            width: 2.8,
+            left_block: Some(0),
+            right_block: Some(0),
+            kind: EdgeKind::Lane,
+        });
         let json = serde_json::to_string(&graph).expect("serialize");
         let restored: LayoutGraph = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(graph, restored);
@@ -404,10 +577,12 @@ mod tests {
         let unit = |row: u32| StreetUnitEdge {
             vertices: ((row, 1), (row + 1, 1)),
             width: 8.0,
+            kind: EdgeKind::Street,
         };
         let segments = street_segments(&[unit(0), unit(1), unit(2)]);
         assert_eq!(segments.len(), 3, "one segment per unit edge: {segments:?}");
-        for (i, ((r0, c0), (r1, c1), w)) in segments.iter().enumerate() {
+        for (i, ((r0, c0), (r1, c1), w, kind)) in segments.iter().enumerate() {
+            assert_eq!(*kind, EdgeKind::Street);
             assert_eq!((*r0, *c0), (i as u32, 1));
             assert_eq!((*r1, *c1), (i as u32 + 1, 1));
             assert_eq!(*w, 8.0);
@@ -420,10 +595,12 @@ mod tests {
         let unit = StreetUnitEdge {
             vertices: ((0, 1), (1, 1)),
             width: 7.0,
+            kind: EdgeKind::Street,
         };
         let unit_h = StreetUnitEdge {
             vertices: ((1, 1), (1, 2)),
             width: 9.0,
+            kind: EdgeKind::Street,
         };
         let segments = street_segments(&[unit, unit_h]);
         assert_eq!(segments.len(), 2, "corner splits the run: {segments:?}");

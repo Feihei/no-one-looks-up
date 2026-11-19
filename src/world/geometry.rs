@@ -21,7 +21,7 @@ const MITER_LIMIT: f32 = 1.5;
 
 /// Clips `polygon` (convex, CCW winding) against the half-plane
 /// `normal · p >= d`, keeping the inside (Sutherland–Hodgman step).
-fn clip_half_plane(polygon: &[Vec2], normal: Vec2, d: f32) -> Vec<Vec2> {
+pub(crate) fn clip_half_plane(polygon: &[Vec2], normal: Vec2, d: f32) -> Vec<Vec2> {
     let mut out = Vec::with_capacity(polygon.len() + 1);
     let n = polygon.len();
     for i in 0..n {
@@ -53,6 +53,185 @@ pub fn polygon_area(polygon: &[Vec2]) -> f32 {
     sum * 0.5
 }
 
+/// Inward unit normal per edge of a simple polygon, derived from its winding
+/// (positive signed area = interior on the left of each edge).
+///
+/// This replaces a centroid-direction heuristic: for a tall narrow polygon
+/// (a 6 m x 250 m village plot strip) the centroid sits almost due north of
+/// a west-face edge midpoint, and the nearly-horizontal normal's dot with
+/// that offset takes its sign from the tiny vertical component — the normal
+/// flipped, faces inset OUTWARD and the collision hull poked ~5 m into the
+/// street. The winding is exact for any simple polygon.
+pub fn inward_normals(polygon: &[Vec2]) -> Vec<Vec2> {
+    let ccw = polygon_area(polygon) > 0.0;
+    let n = polygon.len();
+    let mut normals = Vec::with_capacity(n);
+    for i in 0..n {
+        let a = polygon[i];
+        let b = polygon[(i + 1) % n];
+        let edge = b - a;
+        if edge.length_squared() < 1e-12 {
+            normals.push(Vec2::ZERO);
+            continue;
+        }
+        let normal = if ccw {
+            Vec2::new(-edge.y, edge.x)
+        } else {
+            Vec2::new(edge.y, -edge.x)
+        };
+        normals.push(normal.normalize());
+    }
+    normals
+}
+
+/// Whether every interior angle of the polygon turns the same way (weakly
+/// convex: collinear vertices allowed). R3.20 district polygons are mildly
+/// non-convex — a mid-edge lattice node dents by its ±4 m wobble.
+pub fn polygon_is_convex(polygon: &[Vec2]) -> bool {
+    let n = polygon.len();
+    if n < 3 {
+        return false;
+    }
+    let mut sign = 0.0_f32;
+    for i in 0..n {
+        let a = polygon[i];
+        let b = polygon[(i + 1) % n];
+        let c = polygon[(i + 2) % n];
+        let cross = (b - a).perp_dot(c - b);
+        if cross.abs() < 1e-9 {
+            continue;
+        }
+        let s = cross.signum();
+        if sign == 0.0 {
+            sign = s;
+        } else if s != sign {
+            return false;
+        }
+    }
+    true
+}
+
+/// Splits a simple polygon into convex pieces (ear-clipping triangulation).
+///
+/// Collision prisms assume convexity (`push_out` slides along one supporting
+/// edge), and R3.20's district/plot outlines are only weakly non-convex —
+/// a mid-edge lattice node dents by its ±4 m wobble. The old fix (clip the
+/// convex hull by the polygon's own edge half-planes) fails both ways on a
+/// strongly non-convex outline: a 6 m x 250 m village plot strip's kernel
+/// excludes its own centroid, so either the prism lost the plot's solid
+/// centre or the unclipped hull bridged a face dip ~5 m into the street.
+/// Triangles are always convex and always inside the polygon, so both hold.
+///
+/// Convex input passes through as one piece; a degenerate clip (collinear
+/// vertices on quantised outlines) returns the input whole as a fallback.
+///
+/// Input hygiene (R3.20): block and plot outlines are stored CLOSED
+/// (`last == first`), and a duplicated vertex turns the simple-polygon
+/// invariant of ear clipping into a lie — measured, a 6-vertex closed
+/// pentagon produced a "final" triangle spanning its concave notch (the
+/// triangle's west face ran into the street and pinned the walker) plus a
+/// zero-area `[A, D, A]` shard. So the vertex ring is deduplicated first
+/// (closing vertex and consecutive near-duplicates), and degenerate
+/// triangles are dropped from the output.
+pub fn convex_decompose(polygon: &[Vec2]) -> Vec<Vec<Vec2>> {
+    if polygon.len() < 3 {
+        return Vec::new();
+    }
+    let mut ring: Vec<Vec2> = Vec::with_capacity(polygon.len());
+    for &v in polygon {
+        if ring
+            .last()
+            .is_none_or(|last| (*last - v).length_squared() > 1e-10)
+        {
+            ring.push(v);
+        }
+    }
+    // Drop the duplicated closing vertex of a stored-closed outline.
+    while ring.len() > 1 {
+        let first = ring[0];
+        let last = ring[ring.len() - 1];
+        if (first - last).length_squared() > 1e-10 {
+            break;
+        }
+        ring.pop();
+    }
+    if ring.len() < 3 {
+        return Vec::new();
+    }
+    let polygon = ring.as_slice();
+    if polygon_is_convex(polygon) {
+        return vec![polygon.to_vec()];
+    }
+    // Ear clipping wants CCW winding.
+    let mut indices: Vec<usize> = (0..polygon.len()).collect();
+    if polygon_area(polygon) < 0.0 {
+        indices.reverse();
+    }
+    let mut triangles: Vec<Vec<Vec2>> = Vec::new();
+    let mut guard = 0_usize;
+    while indices.len() > 3 && guard < 4 * polygon.len() {
+        guard += 1;
+        let mut clipped = false;
+        for k in 0..indices.len() {
+            let i0 = indices[(k + indices.len() - 1) % indices.len()];
+            let i1 = indices[k];
+            let i2 = indices[(k + 1) % indices.len()];
+            let (a, b, c) = (polygon[i0], polygon[i1], polygon[i2]);
+            // The ear tip must be convex (CCW turn).
+            if (b - a).perp_dot(c - b) <= 1e-9 {
+                continue;
+            }
+            // And no other vertex may fall inside the ear.
+            let mut occupied = false;
+            for &j in &indices {
+                if j == i0 || j == i1 || j == i2 {
+                    continue;
+                }
+                let p = polygon[j];
+                if on_segment(a, b, p) || on_segment(b, c, p) || on_segment(c, a, p) {
+                    continue; // riding the ear's edge: not blocking
+                }
+                if point_in_polygon(p, &[a, b, c]) {
+                    occupied = true;
+                    break;
+                }
+            }
+            if occupied {
+                continue;
+            }
+            triangles.push(vec![a, b, c]);
+            indices.remove(k);
+            clipped = true;
+            break;
+        }
+        if !clipped {
+            break;
+        }
+    }
+    if indices.len() == 3 {
+        let tri: Vec<Vec2> = indices.iter().map(|&i| polygon[i]).collect();
+        // A collinear leftover ("triangle") has no interior to protect.
+        if (tri[1] - tri[0]).perp_dot(tri[2] - tri[1]) > 1e-9 {
+            triangles.push(tri);
+        }
+    } else if triangles.is_empty() {
+        // Degenerate outline: hand the input through untouched rather than
+        // dropping the collider entirely.
+        return vec![polygon.to_vec()];
+    }
+    triangles
+}
+
+/// Whether `p` sits on segment `ab` (within a small epsilon).
+fn on_segment(a: Vec2, b: Vec2, p: Vec2) -> bool {
+    let ab = b - a;
+    if ab.length_squared() < 1e-12 {
+        return (p - a).length_squared() < 1e-8;
+    }
+    let t = (p - a).dot(ab) / ab.length_squared();
+    (0.0..=1.0).contains(&t) && (p - a.lerp(b, t)).length_squared() < 1e-6
+}
+
 /// Insets a convex polygon by a per-edge amount (ADR-0004).
 ///
 /// Each vertex is moved along the **angle bisector of its two incident
@@ -73,24 +252,9 @@ pub fn inset_polygon_clip_with_insets(polygon: &[Vec2], insets: &[f32]) -> Optio
     if n < 3 {
         return None;
     }
-    let centroid = polygon_centroid(polygon);
 
-    // Inward unit normal per edge (sign resolved against the centroid, so
-    // winding order does not matter).
-    let mut normals = Vec::with_capacity(n);
-    for i in 0..n {
-        let a = polygon[i];
-        let b = polygon[(i + 1) % n];
-        let edge = b - a;
-        if edge.length_squared() < 1e-12 {
-            return None;
-        }
-        let mut normal = Vec2::new(-edge.y, edge.x).normalize();
-        if normal.dot(centroid - (a + b) * 0.5) < 0.0 {
-            normal = -normal;
-        }
-        normals.push(normal);
-    }
+    // Inward unit normal per edge, from the winding (see [`inward_normals`]).
+    let normals = inward_normals(polygon);
 
     let mut out = Vec::with_capacity(n);
     for (i, vertex) in polygon.iter().enumerate() {

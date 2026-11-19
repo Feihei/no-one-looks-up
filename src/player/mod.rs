@@ -325,6 +325,7 @@ mod tests {
         index.debug_set_chunk(
             (19, 2),
             vec![SolidPrism {
+                child: None,
                 block_id: 12,
                 polygon: convex_hull(&raw),
                 height: BLOCK_SOLID_HEIGHT,
@@ -357,6 +358,7 @@ mod tests {
         let mut index = CollisionIndex::default();
         // A wall spanning the chunk at x >= 20.
         let prism = SolidPrism {
+            child: None,
             block_id: 0,
             polygon: vec![
                 Vec2::new(20.0, 0.0),

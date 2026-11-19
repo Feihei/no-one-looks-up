@@ -24,12 +24,13 @@ use bevy::math::Vec2;
 use crate::core::error::{GameError, GameResult};
 use crate::world::geometry::inset_polygon_clip_with_insets;
 use crate::world::layout_graph::{
-    BlockType, LayoutBlock, LayoutGraph, NodeKind, NodeVertex, StreetUnitEdge,
+    BlockType, EdgeKind, LayoutBlock, LayoutGraph, NodeKind, NodeVertex, StreetUnitEdge,
 };
 use crate::world::world_grid::WorldGrid;
 use crate::world::{
-    CELL_SIZE, FOREST_EDGE_MAX_DISTANCE_CELLS, GRID_CELLS, OUTER_BAND_CELLS, PERTURB_MAX,
-    STREET_WIDTH_MAX, STREET_WIDTH_MIN, VILLAGE_STREET_WIDTH_MAX, VILLAGE_STREET_WIDTH_MIN,
+    ARTERIAL_WIDTH_MAX, ARTERIAL_WIDTH_MIN, CELL_SIZE, FOREST_EDGE_MAX_DISTANCE_CELLS, GRID_CELLS,
+    OUTER_BAND_CELLS, PERTURB_MAX, STREET_WIDTH_MAX, STREET_WIDTH_MIN, VILLAGE_STREET_WIDTH_MAX,
+    VILLAGE_STREET_WIDTH_MIN,
 };
 
 /// The save seed driving generation (ADR-0002: one save = one seed = one
@@ -46,24 +47,28 @@ pub const SCENERY_BAND_CELL: u32 = u32::MAX;
 ///
 /// Interior cells: PLAZA 6%, FOREST 14% (edge transition only), then
 /// URBAN_VILLAGE 10% (2026-11: the 城中村 districts the design asks for), and
-/// the remaining 70% split OLD_CITY 87 / APARTMENT 10 / FACTORY 3 of the
-/// built-up remainder — cumulative thresholds
-/// 0.06 / 0.20 / 0.30 / 0.87-built / 0.97-built / 1.0.
+/// the remaining 70% split OLD_CITY 90 / APARTMENT 10 of the built-up
+/// remainder (R3.20b: the factory share moved into the map-level factory
+/// reservation — see `partition_blocks`).
 ///
-/// Villages and old-city blocks are both 1x1, so the per-block roll IS the
-/// per-area roll for them; apartments and factories are merged, and their
-/// built-up split below is the same area-biased port as before.
-const P_PLAZA_END: f32 = 0.06;
-const P_FOREST_END: f32 = 0.20;
-/// 城中村 share of interior cells: about one lane district in ten, clustered
-/// nowhere (the scan is row-major, so they scatter), which keeps one usually
-/// within a few minutes of the spawn point without dominating the walk.
-const P_VILLAGE_END: f32 = 0.30;
-/// Built-up split (ADR-0001 "风格比例约 50/30/20"), tuned so the **area**
-/// the player sees matches it: a 1x1 old-city block claims 1 cell while a
-/// factory claims 16-25, so old city gets the larger probability mass.
-const P_OLD_AREA: f32 = 0.87;
-const P_APT_AREA: f32 = 0.10;
+/// R3.20 (2026-11-19 user decision: 同类连片): the per-roll probabilities are
+/// the per-CELL targets above divided by each type's expected district area,
+/// because one roll now claims a whole district rectangle, not one cell.
+/// Expected areas: plaza 1x1 = 1, forest 2-3 x 2-3 = 6.25, village
+/// 1-2 x 2-3 = 3.75, old city 1-2 x 1-2 = 2.25, apartment 2-3 square =
+/// 6.25. Normalizing share/area reproduces the AREA shares the ADR-0001 mix
+/// asks for: cumulative thresholds 0.1531 / 0.2102 / 0.2783 / 0.90-built.
+const P_PLAZA_END: f32 = 0.1531;
+const P_FOREST_END: f32 = 0.2102;
+/// 城中村 share of interior cells: about one lane district in ten by area.
+/// R3.20 villages grow into 2-6 cell rectangles (never an isolated 1x1), so
+/// a district roll is rarer than the old per-cell roll.
+const P_VILLAGE_END: f32 = 0.2783;
+/// Built-up split of the fill scan (ADR-0001 "风格比例约 50/30/20"): R3.20b
+/// removed the fill-roll factory arm (factories come solely from the
+/// map-level reservation), so the old 87/10/3 old/apartment/factory split
+/// becomes 90/10 old/apartment.
+const P_OLD_AREA: f32 = 0.90;
 
 /// Generates the complete world layout for `seed`.
 ///
@@ -71,22 +76,66 @@ const P_APT_AREA: f32 = 0.10;
 /// data). Returns the serde-friendly [`WorldGrid`] plus the [`LayoutGraph`].
 pub fn generate_world(seed: u64) -> GameResult<(WorldGrid, LayoutGraph)> {
     let mut rng = StdRng::seed_from_u64(seed);
+    // ADR-0009: the arterial cross is the first tier-0 decision, drawn before
+    // anything else so the rest of the stream stays deterministic behind it.
+    let cross = arterial_cross(&mut rng);
     // R2.9: perturbed lattice nodes are the single vertex source for every
     // block polygon (original `_generate_nodes`). Generated first so block
     // polygons can follow the real (wobbly) street centerlines.
-    let nodes = perturbed_nodes(&mut rng);
-    let (blocks, mut grid) = partition_blocks(&mut rng, &nodes)?;
-    let unit_edges = street_unit_edges(&grid, &blocks);
+    let nodes = perturbed_nodes(&mut rng, cross);
+    let (blocks, mut grid) = partition_blocks(&mut rng, &nodes, cross)?;
+    let unit_edges = street_unit_edges(&grid, &blocks, cross);
     let node_vertices = node_vertices(&unit_edges);
     mark_grid_flags(&mut grid, &unit_edges, &node_vertices)?;
     let mut graph = LayoutGraph::from_generation(blocks, &unit_edges, &node_vertices, &nodes);
     associate_edges_with_blocks(&mut graph, &unit_edges, &grid, &nodes);
+    // ADR-0008 tier-1 pass: lanes and sub-blocks inside built blocks. Runs
+    // on its own RNG so every tier-0 decision above stays bit-exact, and
+    // AFTER edge association so lane mouths can find their street edges.
+    crate::world::subdivision::subdivide_blocks(&mut graph, seed);
     grid.node_positions = nodes;
     Ok((grid, graph))
 }
 
 /// Lattice vertices per axis: `GRID_CELLS + 1` nodes span the cell grid.
 pub const NODES_PER_AXIS: u32 = GRID_CELLS + 1;
+
+/// The tier-0 arterial cross (ADR-0009): one vertical and one horizontal
+/// 10-15 m road that split the map into four quadrants. The cross sits on
+/// lattice lines (never perturbed), keeps its drawn width along its whole
+/// run, and every seam between two quadrants IS the arterial — blocks never
+/// span it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ArterialCross {
+    /// Lattice column of the vertical arterial (7 or 8).
+    pub col: u32,
+    /// Lattice row of the horizontal arterial (7 or 8).
+    pub row: u32,
+    /// Width of the vertical arterial (m).
+    pub width_v: f32,
+    /// Width of the horizontal arterial (m).
+    pub width_h: f32,
+}
+
+/// Draws the arterial cross. Fixed draw order (col, row, width_v, width_h)
+/// pins the RNG stream: everything downstream is deterministic behind it.
+///
+/// Jitter `{7, 8}` keeps the cross within one cell of the map centre (the
+/// lattice lines at 350 m and 400 m), so every quadrant keeps at least
+/// 6 cells = 300 m and a 5x5 factory (250 m) never has to degrade. A wider
+/// jitter would reintroduce clamped-merge noise at the quadrant edges.
+pub(crate) fn arterial_cross(rng: &mut StdRng) -> ArterialCross {
+    let col = rng.random_range(7..=8);
+    let row = rng.random_range(7..=8);
+    let width_v = rng.random_range(ARTERIAL_WIDTH_MIN..=ARTERIAL_WIDTH_MAX);
+    let width_h = rng.random_range(ARTERIAL_WIDTH_MIN..=ARTERIAL_WIDTH_MAX);
+    ArterialCross {
+        col,
+        row,
+        width_v,
+        width_h,
+    }
+}
 
 /// Generates every lattice node, perturbed by up to [`PERTURB_MAX`] on each
 /// axis (port of the original `_generate_nodes`).
@@ -98,7 +147,7 @@ pub const NODES_PER_AXIS: u32 = GRID_CELLS + 1;
 /// Draw order (one RNG, fixed scan): perturb_x, perturb_z, then a plaza roll
 /// per interior node — identical to the original so the same seed reproduces
 /// the same layout structure.
-pub fn perturbed_nodes(rng: &mut StdRng) -> Vec<Vec2> {
+pub(crate) fn perturbed_nodes(rng: &mut StdRng, cross: ArterialCross) -> Vec<Vec2> {
     let axis = NODES_PER_AXIS as usize;
     let mut nodes = Vec::with_capacity(axis * axis);
     for row in 0..axis {
@@ -119,7 +168,11 @@ pub fn perturbed_nodes(rng: &mut StdRng) -> Vec<Vec2> {
             // inner half — measured down to a 0.3 m free lane and negative
             // lanes on other seeds (R3.8 walk test).
             let on_ring_line = row == 1 || col == 1 || row == axis - 2 || col == axis - 2;
-            if !on_border && !on_ring_line {
+            // ADR-0009: the arterial cross owns its two lattice lines whole —
+            // a wobble there would bend the 10-15 m main road and misalign
+            // the quadrant-seam insets. Pinned like the ring.
+            let on_arterial = col == cross.col as usize || row == cross.row as usize;
+            if !on_border && !on_ring_line && !on_arterial {
                 perturb_x = rng.random_range(-PERTURB_MAX..=PERTURB_MAX);
                 perturb_z = rng.random_range(-PERTURB_MAX..=PERTURB_MAX);
             } else {
@@ -154,129 +207,251 @@ pub fn perturbed_nodes(rng: &mut StdRng) -> Vec<Vec2> {
 /// convex quad standing on its own perimeter of lattice nodes, and insetting
 /// each block by its own half width can never make two of them meet.
 ///
-/// Algorithm (row-major scan, deterministic):
+/// Algorithm (ADR-0009): the interior is split into four quadrants by the
+/// arterial cross; each quadrant is processed (order NW, NE, SW, SE) with the
+/// same deterministic steps:
+/// 0. R3.20b: reserve ONE 4-5² factory district for the whole map, centred
+///    in a randomly drawn quadrant — the fill scan fragments free space too
+///    much for a factory roll to ever fit afterwards;
 /// 1. take the first unassigned cell;
-/// 2. grow the largest square that fits inside `MAX_MERGE` and stays free;
-/// 3. shrink that square until it also fits the borders of the region the
-///    desired type allows (interior only);
-/// 4. rect() the remaining L-shaped gap by splitting it into up to two
-///    rectangles, so nothing is left over.
+/// 2. R3.20 同类连片: offer it to a same-kind village/forest/old-city
+///    district to the left or above — rectangle-preserving extensions chain
+///    contiguous districts out of single rolls;
+/// 3. otherwise roll a district type and grow its rectangle
+///    ([`district_size`]) inside the quadrant (the scan range stops at the
+///    arterial lines, so no block spans the cross);
+/// 4. undersized fits degrade to a 1x1 OLD_CITY (the dense low-rise filler).
 ///
-/// `rect()` completion is what guarantees no remnants: after carving a
-/// rectangle out of the free region, the leftover to its right and below is
-/// itself a rectangle, which the scan reaches later.
-fn partition_blocks(rng: &mut StdRng, nodes: &[Vec2]) -> GameResult<(Vec<LayoutBlock>, WorldGrid)> {
+/// Phase 2 builds every block's inset polygon once the scan is final, so an
+/// extended district still gets one polygon from its whole lattice rect.
+/// Same-kind seams inset by the narrow [`seam_width`] instead of the street
+/// average — districts stay visually contiguous even where an extension was
+/// declined.
+fn partition_blocks(
+    rng: &mut StdRng,
+    nodes: &[Vec2],
+    cross: ArterialCross,
+) -> GameResult<(Vec<LayoutBlock>, WorldGrid)> {
     let width = GRID_CELLS;
     let height = GRID_CELLS;
     let mut grid = WorldGrid::filled(width, height, SCENERY_BAND_CELL);
     let mut owner: Vec<Option<u32>> = vec![None; (width * height) as usize];
+    // R3.20: lattice rect (cell rows/cols; r1/c1 EXCLUSIVE) per block id,
+    // parallel to `blocks`. Extensions grow the rect; the inset polygons are
+    // built in phase 2 once every district is final.
+    let mut rects: Vec<(u32, u32, u32, u32)> = Vec::new();
     let mut blocks: Vec<LayoutBlock> = Vec::new();
 
-    // Interior region: everything except the scenery ring.
+    // Interior region: everything except the scenery ring. The arterial lines
+    // split it into four quadrant scans (ADR-0009); lattice line `cross.col`
+    // separates cell columns `cross.col - 1` (west) and `cross.col` (east),
+    // so the west quadrants end at `cross.col` and the east ones start there.
     let inner_start = OUTER_BAND_CELLS;
     let inner_end_row = height - OUTER_BAND_CELLS;
     let inner_end_col = width - OUTER_BAND_CELLS;
 
-    for row in inner_start..inner_end_row {
-        for col in inner_start..inner_end_col {
-            if owner[(row * width + col) as usize].is_some() {
-                continue;
-            }
-            let distance_to_border = row.min(col).min(height - 1 - row).min(width - 1 - col);
+    // R3.20b factory reservation: claim ONE factory district for the whole
+    // map (2026-11-19 user decision: "改成整张图预留一个厂区就好"), before
+    // the fill scan — a 4-5² rect always fits in an empty quadrant (quadrants
+    // are 6-8 cells per side), while the scan's district absorption fragments
+    // free space long before a factory roll could ever fit. The host quadrant
+    // is drawn from the same RNG; the district is centred there so it keeps
+    // its distance from both the arterial cross and the ring road.
+    let (factory_req_w, factory_req_h) = district_size(rng, BlockType::Factory);
+    let factory_quadrant = rng.random_range(0..4_usize);
 
-            // Area-aware type pick. A flat per-block roll makes factories
-            // dominate the map: 8% of blocks but ~50% of the area, because a
-            // factory eats 16-25 cells at once (ADR-0001 wants a 50/30/20
-            // old-city / apartment / factory look, which is what the player
-            // sees as area, not as block count). So biased sampling: the
-            // bigger the footprint a type would claim, the lower its
-            // probability at a fixed area quota.
-            let roll: f32 = rng.random();
-            let mut kind = if roll < P_PLAZA_END {
-                BlockType::Plaza
-            } else if roll < P_FOREST_END {
-                BlockType::Forest
-            } else if roll < P_VILLAGE_END {
-                BlockType::UrbanVillage
-            } else {
-                let built_roll: f32 = rng.random();
-                if built_roll < P_OLD_AREA {
-                    BlockType::OldCity
-                } else if built_roll < P_OLD_AREA + P_APT_AREA {
-                    BlockType::Apartment
-                } else {
-                    BlockType::Factory
-                }
-            };
-            if kind == BlockType::Forest && distance_to_border > FOREST_EDGE_MAX_DISTANCE_CELLS {
-                kind = BlockType::OldCity;
-            }
-
-            let requested = merge_size(rng, kind);
-            let mut merge = largest_free_square(
-                &owner,
-                width,
-                row,
-                col,
-                inner_end_row,
-                inner_end_col,
-                requested,
-            );
-            if merge == 0 {
-                continue; // Cannot happen: the scan cell itself is free.
-            }
-            // Keep the type/merge contract: a block smaller than its type's
-            // minimum footprint degrades to OLD_CITY (the dense low-rise
-            // filler), not to a mislabelled undersized apartment/factory.
-            let min_side = match kind {
-                BlockType::Apartment => 2,
-                BlockType::Factory => 4,
-                BlockType::OldCity
-                | BlockType::UrbanVillage
-                | BlockType::Plaza
-                | BlockType::Forest => 1,
-            };
-            if merge < min_side {
-                // Degrade to a 1x1 OLD_CITY (the dense low-rise filler);
-                // never leave an undersized apartment/factory labelled.
-                kind = BlockType::OldCity;
-                merge = 1;
-            }
-
-            let block_id = blocks.len() as u32;
-            // One draw either way, so the RNG stream keeps one street-width
-            // draw per block regardless of kind (2026-11: villages draw from
-            // their own narrower range — see VILLAGE_STREET_WIDTH_*).
-            let street_width = match kind {
-                BlockType::UrbanVillage => {
-                    rng.random_range(VILLAGE_STREET_WIDTH_MIN..=VILLAGE_STREET_WIDTH_MAX)
-                }
-                _ => rng.random_range(STREET_WIDTH_MIN..=STREET_WIDTH_MAX),
-            };
-            let mut cells = Vec::with_capacity((merge * merge) as usize);
-            for r in row..(row + merge) {
-                for c in col..(col + merge) {
-                    owner[(r * width + c) as usize] = Some(block_id);
-                    cells.push((r, c));
+    for (row_band, &(row_start, row_end)) in [(inner_start, cross.row), (cross.row, inner_end_row)]
+        .iter()
+        .enumerate()
+    {
+        for (col_band, &(col_start, col_end)) in
+            [(inner_start, cross.col), (cross.col, inner_end_col)]
+                .iter()
+                .enumerate()
+        {
+            // NW=0, NE=1, SW=2, SE=3 — the iteration order of the fill scan.
+            if row_band * 2 + col_band == factory_quadrant {
+                let quadrant_h = row_end - row_start;
+                let quadrant_w = col_end - col_start;
+                let factory_row = row_start + (quadrant_h - factory_req_h) / 2;
+                let factory_col = col_start + (quadrant_w - factory_req_w) / 2;
+                let (w, h) = largest_free_rect(
+                    &owner,
+                    width,
+                    factory_row,
+                    factory_col,
+                    row_end,
+                    col_end,
+                    factory_req_w,
+                    factory_req_h,
+                );
+                // An empty quadrant always fits, but a defensive degrade (to
+                // simply skipping) costs nothing and cannot mislabel a block.
+                if w >= 4 && h >= 4 {
+                    let block_id = blocks.len() as u32;
+                    let street_width = rng.random_range(STREET_WIDTH_MIN..=STREET_WIDTH_MAX);
+                    let mut cells = Vec::with_capacity((w * h) as usize);
+                    for r in factory_row..(factory_row + h) {
+                        for c in factory_col..(factory_col + w) {
+                            owner[(r * width + c) as usize] = Some(block_id);
+                            cells.push((r, c));
+                        }
+                    }
+                    rects.push((factory_row, factory_col, factory_row + h, factory_col + w));
+                    blocks.push(LayoutBlock {
+                        id: block_id,
+                        kind: BlockType::Factory,
+                        cells,
+                        street_width,
+                        is_outer: false,
+                        polygon: Vec::new(),
+                        children: Vec::new(),
+                    });
                 }
             }
-            let perimeter = block_perimeter(row, col, merge, merge, nodes);
-            let half = street_width * 0.5;
-            let polygon = inset_polygon_clip_with_insets(&perimeter, &vec![half; perimeter.len()])
-                .ok_or_else(|| {
-                    GameError::Generation(format!(
-                        "block {block_id} polygon collapsed (width {street_width})"
-                    ))
-                })?;
-            blocks.push(LayoutBlock {
-                id: block_id,
-                kind,
-                cells,
-                street_width,
-                is_outer: false,
-                polygon,
-            });
+            for row in row_start..row_end {
+                for col in col_start..col_end {
+                    if owner[(row * width + col) as usize].is_some() {
+                        continue;
+                    }
+
+                    // R3.20 district growth (2026-11-19 user decision: 同类
+                    // 连片): before rolling a new district, offer the free
+                    // cell to a same-kind neighbour — contiguous village,
+                    // forest and old-city textures form by absorption.
+                    if try_extend_district(
+                        &mut owner,
+                        width,
+                        &mut rects,
+                        &mut blocks,
+                        row,
+                        col,
+                        row_start,
+                        col_start,
+                        rng,
+                    ) {
+                        continue;
+                    }
+
+                    let distance_to_border =
+                        row.min(col).min(height - 1 - row).min(width - 1 - col);
+
+                    // Area-aware type pick. A flat per-block roll makes factories
+                    // dominate the map: 8% of blocks but ~50% of the area, because a
+                    // factory eats 16-25 cells at once (ADR-0001 wants a 50/30/20
+                    // old-city / apartment / factory look, which is what the player
+                    // sees as area, not as block count). So biased sampling: the
+                    // bigger the footprint a type would claim, the lower its
+                    // probability at a fixed area quota.
+                    let roll: f32 = rng.random();
+                    let mut kind = if roll < P_PLAZA_END {
+                        BlockType::Plaza
+                    } else if roll < P_FOREST_END {
+                        BlockType::Forest
+                    } else if roll < P_VILLAGE_END {
+                        BlockType::UrbanVillage
+                    } else {
+                        // R3.20b: no factory arm here any more — factories
+                        // come solely from the map-level reservation, which
+                        // is the only placement that can guarantee a
+                        // contiguous 4-5² rect (the fragmented fill scan
+                        // degraded every fill-roll factory to old city
+                        // anyway). The old 3% factory share goes to old city.
+                        let built_roll: f32 = rng.random();
+                        if built_roll < P_OLD_AREA {
+                            BlockType::OldCity
+                        } else {
+                            BlockType::Apartment
+                        }
+                    };
+                    if kind == BlockType::Forest
+                        && distance_to_border > FOREST_EDGE_MAX_DISTANCE_CELLS
+                    {
+                        kind = BlockType::OldCity;
+                    }
+
+                    let (req_w, req_h) = district_size(rng, kind);
+                    let (mut w, mut h) =
+                        largest_free_rect(&owner, width, row, col, row_end, col_end, req_w, req_h);
+                    if w == 0 {
+                        continue; // Cannot happen: the scan cell itself is free.
+                    }
+                    // Keep the type/merge contract: a block smaller than its type's
+                    // minimum footprint degrades to OLD_CITY (the dense low-rise
+                    // filler), not to a mislabelled undersized apartment/factory.
+                    // R3.20: a village clamped to a single cell degrades too —
+                    // 城中村 never appears as an isolated 1x1 block.
+                    let undersized = match kind {
+                        BlockType::Apartment => w < 2 || h < 2,
+                        BlockType::Factory => w < 4 || h < 4,
+                        BlockType::UrbanVillage => w * h < 2,
+                        BlockType::OldCity | BlockType::Plaza | BlockType::Forest => false,
+                    };
+                    if undersized {
+                        kind = BlockType::OldCity;
+                        (w, h) = (1, 1);
+                    }
+
+                    let block_id = blocks.len() as u32;
+                    // One draw either way, so the RNG stream keeps one street-width
+                    // draw per district regardless of kind (2026-11: villages draw
+                    // from their own narrower range — see VILLAGE_STREET_WIDTH_*).
+                    let street_width = match kind {
+                        BlockType::UrbanVillage => {
+                            rng.random_range(VILLAGE_STREET_WIDTH_MIN..=VILLAGE_STREET_WIDTH_MAX)
+                        }
+                        _ => rng.random_range(STREET_WIDTH_MIN..=STREET_WIDTH_MAX),
+                    };
+                    let mut cells = Vec::with_capacity((w * h) as usize);
+                    for r in row..(row + h) {
+                        for c in col..(col + w) {
+                            owner[(r * width + c) as usize] = Some(block_id);
+                            cells.push((r, c));
+                        }
+                    }
+                    rects.push((row, col, row + h, col + w));
+                    blocks.push(LayoutBlock {
+                        id: block_id,
+                        kind,
+                        cells,
+                        street_width,
+                        is_outer: false,
+                        // R3.20 phase 2 fills the polygon once every block is
+                        // final (extensions may still grow this one).
+                        polygon: Vec::new(),
+                        children: Vec::new(),
+                    });
+                }
+            }
         }
+    }
+
+    // R3.20 phase 2: with the scan done every block is final, so the inset
+    // polygons are built here from the lattice rects — one inset per unit
+    // perimeter edge (ADR-0009 arterial rule + R3.20 same-kind seam rule).
+    let polygons: Vec<Vec<Vec2>> = (0..blocks.len())
+        .map(|index| {
+            let (r0, c0, r1, c1) = rects[index];
+            let perimeter = block_perimeter(r0, c0, r1 - r0, c1 - c0, nodes);
+            let n = perimeter.len();
+            let insets: Vec<f32> = (0..n)
+                .map(|i| {
+                    let (_, ra, ca) = perimeter[i];
+                    let (_, rb, cb) = perimeter[(i + 1) % n];
+                    edge_inset(ra, ca, rb, cb, r0, c0, &blocks, index, &owner, width, cross)
+                })
+                .collect();
+            let vertices: Vec<Vec2> = perimeter.iter().map(|(p, _, _)| *p).collect();
+            inset_polygon_clip_with_insets(&vertices, &insets).ok_or_else(|| {
+                GameError::Generation(format!(
+                    "block {index} polygon collapsed (width {})",
+                    blocks[index].street_width
+                ))
+            })
+        })
+        .collect::<GameResult<_>>()?;
+    for (block, polygon) in blocks.iter_mut().zip(polygons) {
+        block.polygon = polygon;
     }
 
     for row in 0..height {
@@ -288,30 +463,241 @@ fn partition_blocks(rng: &mut StdRng, nodes: &[Vec2]) -> GameResult<(Vec<LayoutB
     Ok((blocks, grid))
 }
 
-/// Largest square (side <= `requested`) that fits at `(row, col)` inside the
-/// interior region and is entirely unassigned.
-fn largest_free_square(
+/// Probability that an extendable same-kind district absorbs the free cell
+/// next to it (R3.20). Below 1.0 so districts keep some seams between them —
+/// a map of a few mega-districts would read as stripes, not neighbourhoods.
+const DISTRICT_EXTEND_PROB: f32 = 0.65;
+
+/// Seam width of two same-kind old-city districts (R3.20): a narrow lane,
+/// not the 6-10 m street two different blocks would get.
+const OLD_CITY_SEAM_WIDTH: f32 = 4.0;
+
+/// Seam width of two same-kind forest districts (R3.20): a footpath through
+/// the trees, not a road.
+const FOREST_PATH_WIDTH: f32 = 3.0;
+
+/// Kinds whose districts may grow by absorbing adjacent free cells (R3.20):
+/// the contiguous textures the design asks for. Apartments, factories and
+/// plazas keep their fixed footprints.
+fn extendable(kind: BlockType) -> bool {
+    matches!(
+        kind,
+        BlockType::UrbanVillage | BlockType::Forest | BlockType::OldCity
+    )
+}
+
+/// Tries to absorb the free cell `(row, col)` into a same-kind district to
+/// its left or above (R3.20 同类连片). Returns true when the cell was absorbed.
+///
+/// Only rectangle-preserving extensions are taken: the cell must sit exactly
+/// at the neighbour's right edge (within its row span) or below its bottom
+/// edge (within its col span), and the whole strip between must be free —
+/// blocks stay rectangles, which the complete-partition inset guarantee
+/// needs (an L-shaped district would fold inside-out under inset).
+///
+/// Scan-order note: the row-major scan reaches a cell after everything to
+/// its left and above, so those are the only neighbours that can own a
+/// district yet. Extensions never cross the quadrant scan bounds, so no
+/// district ever spans the arterial cross.
+#[allow(clippy::too_many_arguments)]
+fn try_extend_district(
+    owner: &mut [Option<u32>],
+    width: u32,
+    rects: &mut [(u32, u32, u32, u32)],
+    blocks: &mut [LayoutBlock],
+    row: u32,
+    col: u32,
+    row_start: u32,
+    col_start: u32,
+    rng: &mut StdRng,
+) -> bool {
+    // Candidate A: the block to the left, extended east.
+    let left = (col > col_start)
+        .then(|| owner[(row * width + col - 1) as usize])
+        .flatten()
+        .filter(|&id| {
+            let (r0, _c0, r1, c1) = rects[id as usize];
+            extendable(blocks[id as usize].kind)
+                && row >= r0
+                && row < r1
+                && col == c1
+                && (r0..r1).all(|r| owner[(r * width + col) as usize].is_none())
+        });
+    // Candidate B: the block above, extended south.
+    let up = (row > row_start)
+        .then(|| owner[((row - 1) * width + col) as usize])
+        .flatten()
+        .filter(|&id| {
+            let (_r0, c0, r1, c1) = rects[id as usize];
+            extendable(blocks[id as usize].kind)
+                && col >= c0
+                && col < c1
+                && row == r1
+                && (c0..c1).all(|c| owner[(row * width + c) as usize].is_none())
+        });
+    // The two candidates are mutually exclusive (A needs row < r1, B needs
+    // col < c1, and the corner cell satisfies neither), but a cell can have
+    // both a left and an up district — pick one with a coin flip.
+    let chosen = match (left, up) {
+        (Some(a), Some(b)) => {
+            if rng.random_bool(0.5) {
+                a
+            } else {
+                b
+            }
+        }
+        (Some(a), None) => a,
+        (None, Some(b)) => b,
+        (None, None) => return false,
+    };
+    if !rng.random_bool(f64::from(DISTRICT_EXTEND_PROB)) {
+        return false;
+    }
+    let id = chosen as usize;
+    let (r0, c0, r1, c1) = rects[id];
+    // The strip the validated candidate claims: east (rows r0..r1 at col) or
+    // south (cols c0..c1 at row) — which one follows from the same geometry
+    // the validation used.
+    let east = row >= r0 && row < r1 && col == c1;
+    let strip: Vec<(u32, u32)> = if east {
+        (r0..r1).map(|r| (r, col)).collect()
+    } else {
+        (c0..c1).map(|c| (row, c)).collect()
+    };
+    for &(r, c) in &strip {
+        owner[(r * width + c) as usize] = Some(chosen);
+        blocks[id].cells.push((r, c));
+    }
+    rects[id] = (r0, c0, r1.max(row + 1), c1.max(col + 1));
+    true
+}
+
+/// Largest rectangle (cols <= `req_w`, rows <= `req_h`) that fits at
+/// `(row, col)` inside the quadrant scan range and is entirely unassigned.
+/// Maximizes area, scanning heights descending then widths descending so the
+/// choice is deterministic; `(0, _)` means even one cell could not fit
+/// (impossible for the scan cell itself, kept for symmetry).
+#[allow(clippy::too_many_arguments)]
+fn largest_free_rect(
     owner: &[Option<u32>],
     width: u32,
     row: u32,
     col: u32,
     end_row: u32,
     end_col: u32,
-    requested: u32,
-) -> u32 {
-    let max_side = requested.min(end_row - row).min(end_col - col).max(1);
-    let mut best = 0;
-    'side: for side in 1..=max_side {
-        for r in row..(row + side) {
-            for c in col..(col + side) {
-                if owner[(r * width + c) as usize].is_some() {
-                    break 'side;
-                }
+    req_w: u32,
+    req_h: u32,
+) -> (u32, u32) {
+    let mut best = (0u32, 0u32);
+    let mut best_area = 0u32;
+    for h in (1..=req_h.min(end_row - row)).rev() {
+        for w in (1..=req_w.min(end_col - col)).rev() {
+            if w * h <= best_area {
+                break;
+            }
+            let fits = (row..row + h)
+                .all(|r| (col..col + w).all(|c| owner[(r * width + c) as usize].is_none()));
+            if fits {
+                best = (w, h);
+                best_area = w * h;
             }
         }
-        best = side;
     }
     best
+}
+
+/// Seam width between two blocks facing each other across a lattice line
+/// (R3.20): the average of the two street widths, except same-kind
+/// village/old-city/forest districts, whose seam is downgraded to a narrow
+/// lane (2026-11-19 user decision: 同类地块相邻时内部道路降级——连片的住宅区/
+/// 森林/城中村之间只留巷道). Both flanks inset by half of THIS width, so
+/// their polygons still meet exactly on the centerline.
+fn seam_width(a: &LayoutBlock, b: &LayoutBlock) -> f32 {
+    if a.kind == b.kind {
+        match a.kind {
+            BlockType::UrbanVillage => a.street_width.min(b.street_width),
+            BlockType::OldCity => OLD_CITY_SEAM_WIDTH,
+            BlockType::Forest => FOREST_PATH_WIDTH,
+            _ => (a.street_width + b.street_width) * 0.5,
+        }
+    } else {
+        (a.street_width + b.street_width) * 0.5
+    }
+}
+
+/// Half-width inset for one unit perimeter edge of block `index` (R3.19
+/// per-edge insets; R3.20 adds the same-kind seam downgrade).
+///
+/// - an edge on the arterial lines retreats by the arterial half width (the
+///   seam there IS the arterial, not the block's own street);
+/// - an edge facing a same-kind village/old-city/forest district retreats by
+///   half the narrow seam width from [`seam_width`];
+/// - every other edge retreats by the block's own half street width.
+#[allow(clippy::too_many_arguments)]
+fn edge_inset(
+    ra: u32,
+    ca: u32,
+    rb: u32,
+    cb: u32,
+    r0: u32,
+    c0: u32,
+    blocks: &[LayoutBlock],
+    index: usize,
+    owner: &[Option<u32>],
+    width: u32,
+    cross: ArterialCross,
+) -> f32 {
+    if ca == cb && ca == cross.col {
+        return cross.width_v * 0.5;
+    }
+    if ra == rb && ra == cross.row {
+        return cross.width_h * 0.5;
+    }
+    let half = blocks[index].street_width * 0.5;
+    // The neighbour cell across this unit edge: a horizontal edge lies on the
+    // block's top (r == r0) or bottom (r == r1) lattice line, a vertical edge
+    // on its left (c == c0) or right (c == c1) line. Unit edges have exactly
+    // one flanking cell per side.
+    let (nr, nc) = if ra == rb {
+        if ra == r0 { (ra - 1, ca) } else { (ra, ca) }
+    } else if ca == c0 {
+        (ra, ca - 1)
+    } else {
+        (ra, ca)
+    };
+    match owner[(nr * width + nc) as usize] {
+        Some(id) if id as usize != index => seam_width(&blocks[id as usize], &blocks[index]) * 0.5,
+        _ => half,
+    }
+}
+
+/// District footprint per type (R3.20, replacing ADR-0004's square-only
+/// merge table). Draws `(cols, rows)` in that fixed order, so the RNG stream
+/// stays deterministic behind it.
+///
+/// - OLD_CITY 1-2 x 1-2, URBAN_VILLAGE 1-2 x 2-3 (area >= 2 by construction,
+///   so a village never spawns as an isolated 1x1 block — 2026-11-19 user
+///   rule), FOREST 2-3 x 2-3, PLAZA 1x1;
+/// - APARTMENT 2x2 or 3x3, FACTORY 4x4 or 5x5 (random, as before).
+///
+/// Extensions then chain further same-kind cells onto these rectangles, so
+/// villages/forests/old city read as contiguous districts rather than a
+/// scatter of 50 m blocks.
+fn district_size(rng: &mut StdRng, kind: BlockType) -> (u32, u32) {
+    match kind {
+        BlockType::Apartment => {
+            let side = if rng.random_bool(0.5) { 2 } else { 3 };
+            (side, side)
+        }
+        BlockType::Factory => {
+            let side = if rng.random_bool(0.5) { 4 } else { 5 };
+            (side, side)
+        }
+        BlockType::OldCity => (rng.random_range(1..=2), rng.random_range(1..=2)),
+        BlockType::UrbanVillage => (rng.random_range(1..=2), rng.random_range(2..=3)),
+        BlockType::Forest => (rng.random_range(2..=3), rng.random_range(2..=3)),
+        BlockType::Plaza => (1, 1),
+    }
 }
 
 /// Node position by lattice coordinates.
@@ -328,66 +714,57 @@ fn node_at(nodes: &[Vec2], row: u32, col: u32) -> Vec2 {
 /// **7.47 m** of overlap from exactly that bug. Order: top → right → bottom
 /// → left, giving `(n + 1) * 4` vertices standing on the shared street
 /// centerline.
-fn block_perimeter(row: u32, col: u32, rows: u32, cols: u32, nodes: &[Vec2]) -> Vec<Vec2> {
+///
+/// Each vertex carries its lattice coordinates `(row, col)` so the caller
+/// can tell which perimeter edges lie on the arterial lines and inset them
+/// by the arterial half width (ADR-0009).
+fn block_perimeter(
+    row: u32,
+    col: u32,
+    rows: u32,
+    cols: u32,
+    nodes: &[Vec2],
+) -> Vec<(Vec2, u32, u32)> {
     let mut poly = Vec::with_capacity((2 * (rows + cols)) as usize);
     let last_row = row + rows;
     let last_col = col + cols;
     // Top: (row, col..=last_col)
     for c in col..=last_col {
-        poly.push(node_at(nodes, row, c));
+        poly.push((node_at(nodes, row, c), row, c));
     }
     // Right: (row+1..=last_row, last_col)
     for r in (row + 1)..=last_row {
-        poly.push(node_at(nodes, r, last_col));
+        poly.push((node_at(nodes, r, last_col), r, last_col));
     }
     // Bottom: (last_row, last_col-1..col)
     for c in (col..last_col).rev() {
-        poly.push(node_at(nodes, last_row, c));
+        poly.push((node_at(nodes, last_row, c), last_row, c));
     }
     // Left: (last_row-1..=row+1, col)
     for r in ((row + 1)..last_row).rev() {
-        poly.push(node_at(nodes, r, col));
+        poly.push((node_at(nodes, r, col), r, col));
     }
     poly
-}
-
-/// Merge size for a block type (ADR-0004 table): OLD_CITY/URBAN_VILLAGE/
-/// PLAZA/FOREST 1x1, APARTMENT 2x2 or 3x3, FACTORY 4x4 or 5x5 (random).
-/// A 城中村 district is one dense 50 m cell of houses against lanes, so it
-/// merges like the old city.
-fn merge_size(rng: &mut StdRng, kind: BlockType) -> u32 {
-    match kind {
-        BlockType::Apartment => {
-            if rng.random_bool(0.5) {
-                2
-            } else {
-                3
-            }
-        }
-        BlockType::Factory => {
-            if rng.random_bool(0.5) {
-                4
-            } else {
-                5
-            }
-        }
-        _ => 1,
-    }
 }
 
 /// Street unit edges: grid lines between cells of different blocks, excluding
 /// lines between two outer-band cells (the enclosure band has no internal
 /// streets — the band rule that guarantees no dead ends).
 ///
-/// Edge width is the average of the flanking blocks' street widths (each
-/// block insets by width / 2 on its own side of the shared centerline).
-fn street_unit_edges(grid: &WorldGrid, blocks: &[LayoutBlock]) -> Vec<StreetUnitEdge> {
+/// Edge width is [`seam_width`] of the flanking blocks: the average of the
+/// two street widths (each block insets by width / 2 on its own side of the
+/// shared centerline), except the arterial cross (ADR-0009: a unit edge on
+/// the vertical line `cross.col` or the horizontal line `cross.row` carries
+/// the arterial's own drawn width and `EdgeKind::Arterial`) and R3.20's
+/// same-kind district seams, which downgrade to narrow lanes.
+fn street_unit_edges(
+    grid: &WorldGrid,
+    blocks: &[LayoutBlock],
+    cross: ArterialCross,
+) -> Vec<StreetUnitEdge> {
     let width = grid.width;
     let height = grid.height;
     let block_of = |row: u32, col: u32| grid.get_cell(row, col).expect("in bounds").block_id;
-    let is_band = |row: u32, col: u32| {
-        row.min(col).min(height - 1 - row).min(width - 1 - col) < OUTER_BAND_CELLS
-    };
     let mut edges = Vec::new();
     for row in 0..height {
         for col in 0..width {
@@ -407,18 +784,13 @@ fn street_unit_edges(grid: &WorldGrid, blocks: &[LayoutBlock]) -> Vec<StreetUnit
                 // Scenery next to a block: that seam IS the ring road, so the
                 // ring gets a straight centerline on the interior lattice line.
                 // Its width comes from the block alone (the band has no width).
-                let (edge_width, a_id) = match (a == SCENERY_BAND_CELL, b == SCENERY_BAND_CELL) {
+                let edge_width = match (a == SCENERY_BAND_CELL, b == SCENERY_BAND_CELL) {
                     (false, false) if a == b => continue, // merged block interior
-                    (false, false) => (
-                        (blocks[a as usize].street_width + blocks[b as usize].street_width) * 0.5,
-                        a,
-                    ),
-                    (true, false) => (blocks[b as usize].street_width, b),
-                    (false, true) => (blocks[a as usize].street_width, a),
+                    (false, false) => seam_width(&blocks[a as usize], &blocks[b as usize]),
+                    (true, false) => blocks[b as usize].street_width,
+                    (false, true) => blocks[a as usize].street_width,
                     (true, true) => unreachable!(),
                 };
-                let _ = a_id;
-                let _ = is_band;
                 let vertices = if nr == row {
                     // Side-by-side cells: vertical line at col = max.
                     let c = col.max(nc);
@@ -428,9 +800,22 @@ fn street_unit_edges(grid: &WorldGrid, blocks: &[LayoutBlock]) -> Vec<StreetUnit
                     let r = row.max(nr);
                     ((r, col), (r, col + 1))
                 };
+                // ADR-0009: a seam on the arterial lines IS the arterial — its
+                // width comes from the cross, never from the flanking blocks
+                // (whose insets match the arterial half width on that side).
+                let on_arterial_v = vertices.0.1 == vertices.1.1 && vertices.0.1 == cross.col;
+                let on_arterial_h = vertices.0.0 == vertices.1.0 && vertices.0.0 == cross.row;
+                let (edge_width, kind) = if on_arterial_v {
+                    (cross.width_v, EdgeKind::Arterial)
+                } else if on_arterial_h {
+                    (cross.width_h, EdgeKind::Arterial)
+                } else {
+                    (edge_width, EdgeKind::Street)
+                };
                 edges.push(StreetUnitEdge {
                     vertices,
                     width: edge_width,
+                    kind,
                 });
             }
         }
@@ -449,9 +834,14 @@ fn vertex_degrees(unit_edges: &[StreetUnitEdge]) -> Vec<Vec<u8>> {
     degrees
 }
 
-/// Lattice vertices hosting graph nodes: junctions (degree >= 3) and corners
-/// (degree 2 with perpendicular edges). Degree-2 straight vertices are
-/// mid-run (no node); degree 0/1 are impossible in a valid partition.
+/// Lattice vertices hosting graph nodes: junctions (degree >= 3), corners
+/// (degree 2 with perpendicular edges) and — since R3.20 — straight
+/// degree-2 vertices ([`NodeKind::Pass`]). Every unit-edge endpoint must
+/// host a node: merged 2+-cell districts leave their interior lattice
+/// vertices without a crossing street (degree 2 on one line only), and
+/// skipping those nodes dropped the unit edges behind them, punching 50-100 m
+/// holes into the ring and district streets. Degree 0/1 are impossible in a
+/// valid partition.
 fn node_vertices(unit_edges: &[StreetUnitEdge]) -> Vec<NodeVertex> {
     let degrees = vertex_degrees(unit_edges);
     let mut nodes = Vec::new();
@@ -460,7 +850,8 @@ fn node_vertices(unit_edges: &[StreetUnitEdge]) -> Vec<NodeVertex> {
             let kind = match *degree {
                 3.. => NodeKind::Junction,
                 2 => {
-                    // Corner when the two edges are perpendicular.
+                    // Corner when the two edges are perpendicular, pass
+                    // anchor when they are collinear.
                     let r = row as u32;
                     let c = col as u32;
                     let vertical = unit_edges.iter().any(|e| {
@@ -474,7 +865,7 @@ fn node_vertices(unit_edges: &[StreetUnitEdge]) -> Vec<NodeVertex> {
                     if vertical && horizontal {
                         NodeKind::Corner
                     } else {
-                        continue; // Straight mid-run vertex: no node.
+                        NodeKind::Pass
                     }
                 }
                 _ => continue,
@@ -567,7 +958,9 @@ fn associate_edges_with_blocks(
         for unit in unit_edges {
             // Unit geometry must follow the *perturbed* lattice: the run's
             // line does. Matching base-grid centers against perturbed lines
-            // left only ~60 of 2100 edges associated.
+            // left only ~60 of 2100 edges associated. Since R3.20 every unit
+            // edge is one graph edge between its own endpoints, so the unit
+            // midpoint lies exactly on the edge line.
             let ((ur0, uc0), (ur1, uc1)) = unit.vertices;
             let point = (lattice(ur0, uc0) + lattice(ur1, uc1)) * 0.5;
             let along = (point - a).dot(dir);
@@ -626,6 +1019,61 @@ fn flanking_blocks(unit: &StreetUnitEdge, grid: &WorldGrid) -> Option<(Option<u3
     (first.is_some() || second.is_some()).then_some((first, second))
 }
 
+/// Salt mixed into the seed for the spawn draw (R3.20), so the spawn
+/// junction is independent of every generation draw ("CROSS" in leetspeak).
+const SPAWN_SALT: u64 = 0xC1055;
+
+/// R3.20 spawn point (2026-11-19 user decision: 出生点随机指定一个路口点，避免
+/// 落地块内): picks one tier-0 [`NodeKind::Junction`] of the graph with a
+/// seed-derived RNG, so the same save seed always spawns on the same
+/// crossroads — no spawn data needs to live in the save format.
+///
+/// Returns the eye position (world XZ) and the body yaw facing down one of
+/// the junction's streets (the first street edge in graph order).
+///
+/// The junction choice draws from its own RNG stream, never from
+/// generation's, so the layout stays bit-exact regardless of spawn.
+pub fn spawn_point(graph: &LayoutGraph, seed: u64) -> (Vec2, f32) {
+    let mixed = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(23) ^ SPAWN_SALT;
+    let mut rng = StdRng::seed_from_u64(mixed);
+    let junctions: Vec<u32> = graph
+        .nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, node)| node.kind == NodeKind::Junction)
+        .map(|(index, _)| index as u32)
+        .collect();
+    if junctions.is_empty() {
+        // Degenerate graph (no streets): fall back to the map centre.
+        return (Vec2::splat(crate::world::WORLD_SIZE * 0.5), 0.0);
+    }
+    let index = junctions[rng.random_range(0..junctions.len())];
+    let pos = graph.nodes[index as usize].pos;
+    // Face along the junction's first tier-0 street so the first view is down
+    // a road, not into a block face.
+    let yaw = graph
+        .edges
+        .iter()
+        .filter(|edge| edge.kind != EdgeKind::Lane)
+        .find_map(|edge| {
+            let other = if edge.from == index {
+                edge.to
+            } else if edge.to == index {
+                edge.from
+            } else {
+                return None;
+            };
+            let d = graph.nodes[other as usize].pos - pos;
+            (d.length_squared() > 1e-6).then(|| {
+                let d = d.normalize();
+                // PlayerBody::forward = (-sin yaw, -cos yaw); invert it.
+                (-d.x).atan2(-d.y)
+            })
+        })
+        .unwrap_or(0.0);
+    (pos, yaw)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -642,6 +1090,13 @@ mod tests {
     /// Reference world for the shared assertions.
     fn world(seed: u64) -> (WorldGrid, LayoutGraph) {
         generate_world(seed).expect("generation succeeds")
+    }
+
+    /// Re-draws the arterial cross for `seed`: `generate_world` draws it
+    /// FIRST from the plain-seeded RNG, so re-seeding and drawing once
+    /// reproduces it bit-exactly.
+    fn cross_of(seed: u64) -> ArterialCross {
+        arterial_cross(&mut StdRng::seed_from_u64(seed))
     }
 
     #[test]
@@ -704,7 +1159,7 @@ mod tests {
     fn streets_have_no_dead_ends() {
         for seed in [1u64, 7, 0x4845_4144, 123_456_789] {
             let (grid, graph) = world(seed);
-            let unit_edges = street_unit_edges(&grid, &graph.blocks);
+            let unit_edges = street_unit_edges(&grid, &graph.blocks, cross_of(seed));
             let degrees = vertex_degrees(&unit_edges);
             for (r, row) in degrees.iter().enumerate() {
                 for (c, degree) in row.iter().enumerate() {
@@ -744,7 +1199,7 @@ mod tests {
         }
         // Streets never touch the map border: every border lattice vertex
         // has street degree 0 (the ring road runs one cell in).
-        let unit_edges = street_unit_edges(&grid, &graph.blocks);
+        let unit_edges = street_unit_edges(&grid, &graph.blocks, cross_of(7));
         let degrees = vertex_degrees(&unit_edges);
         let n = GRID_CELLS as usize;
         for (c, col) in degrees[0].iter().enumerate().take(n + 1) {
@@ -834,19 +1289,24 @@ mod tests {
 
     /// R2.9: the grid really is perturbed — interior nodes move, border nodes
     /// stay exactly on the map edge, and the same seed reproduces them.
+    /// ADR-0009: the arterial cross's two lattice lines are pinned like the
+    /// ring, so the 10-15 m main road runs dead straight.
     #[test]
     fn lattice_nodes_are_perturbed_but_borders_are_pinned() {
+        let cross = cross_of(7);
         let (grid, _) = world(7);
         let axis = GRID_CELLS + 1;
         assert_eq!(grid.node_positions.len(), (axis * axis) as usize);
 
         let mut moved = 0;
+        let mut pinned_arterial = 0;
         for row in 0..axis {
             for col in 0..axis {
                 let p = grid.node(row, col).expect("node in range");
                 let base = Vec2::new(col as f32 * CELL_SIZE, row as f32 * CELL_SIZE);
                 let on_border = row == 0 || col == 0 || row == axis - 1 || col == axis - 1;
                 let on_ring_line = row == 1 || col == 1 || row == axis - 2 || col == axis - 2;
+                let on_arterial = col == cross.col || row == cross.row;
                 if on_border || on_ring_line {
                     assert!(
                         (p - base).length() < 1e-3,
@@ -863,13 +1323,27 @@ mod tests {
                         moved += 1;
                     }
                 }
+                if on_arterial {
+                    assert!(
+                        (p - base).length() < 1e-3,
+                        "arterial node ({row}, {col}) moved {:?}",
+                        p - base
+                    );
+                    pinned_arterial += 1;
+                }
             }
         }
         // Interior excludes the border AND the pinned ring lines.
         let interior = (axis - 4) * (axis - 4);
         assert!(
-            moved as f32 / interior as f32 > 0.95,
-            "expected nearly every interior node to move, only {moved}/{interior} did"
+            moved as f32 / interior as f32 > 0.8,
+            "expected most interior nodes to move, only {moved}/{interior} did"
+        );
+        // ADR-0009: the cross really pins a substantial number of nodes
+        // (both lines minus the border/ring nodes they already were).
+        assert!(
+            pinned_arterial >= 2 * (GRID_CELLS as usize - 3),
+            "arterial lines pinned only {pinned_arterial} nodes"
         );
 
         // Determinism: the node lattice is part of the bit-exact contract.
@@ -944,13 +1418,150 @@ mod tests {
         }
         // Edge width is the average of the flanking blocks, so it can be as
         // narrow as two adjacent 2.0 m village lanes (2.0 m) and as wide as
-        // two adjacent 10 m blocks (10.0 m).
+        // two adjacent 10 m blocks (10.0 m). ADR-0009: the arterial cross
+        // carries its own drawn width (10-15 m) instead of the average.
         for edge in &graph.edges {
+            match edge.kind {
+                EdgeKind::Arterial => assert!(
+                    (ARTERIAL_WIDTH_MIN..=ARTERIAL_WIDTH_MAX).contains(&edge.width),
+                    "arterial edge width {} out of {:?} range",
+                    edge.width,
+                    (ARTERIAL_WIDTH_MIN, ARTERIAL_WIDTH_MAX)
+                ),
+                _ => assert!(
+                    (VILLAGE_STREET_WIDTH_MIN..=STREET_WIDTH_MAX).contains(&edge.width),
+                    "street edge width {} out of range",
+                    edge.width
+                ),
+            }
+        }
+    }
+
+    /// ADR-0009: exactly one vertical and one horizontal arterial, carrying
+    /// the drawn widths along their whole run, meeting the ring in T
+    /// junctions at both ends; no block spans the cross.
+    #[test]
+    fn arterial_cross_splits_the_map_into_four_quadrants() {
+        for seed in [1u64, 7, 0x4845_4144, 123_456_789] {
+            let (grid, graph) = world(seed);
+            let cross = cross_of(seed);
+            let unit_edges = street_unit_edges(&grid, &graph.blocks, cross);
+            let axis = GRID_CELLS;
+
+            // Every unit edge on the two arterial lines is arterial and
+            // carries the cross's width; there are exactly `axis - 2` of
+            // them per line (ring line to ring line).
+            let vertical: Vec<_> = unit_edges
+                .iter()
+                .filter(|e| e.vertices.0.1 == e.vertices.1.1 && e.vertices.0.1 == cross.col)
+                .collect();
+            let horizontal: Vec<_> = unit_edges
+                .iter()
+                .filter(|e| e.vertices.0.0 == e.vertices.1.0 && e.vertices.0.0 == cross.row)
+                .collect();
+            assert_eq!(vertical.len(), (axis - 2) as usize, "seed {seed}");
+            assert_eq!(horizontal.len(), (axis - 2) as usize, "seed {seed}");
+            for e in vertical.iter().chain(horizontal.iter()) {
+                assert_eq!(e.kind, EdgeKind::Arterial, "seed {seed}");
+            }
+            for e in &vertical {
+                assert_eq!(e.width, cross.width_v, "seed {seed}");
+            }
+            for e in &horizontal {
+                assert_eq!(e.width, cross.width_h, "seed {seed}");
+            }
+
+            // The graph's arterial edges form one run per axis, ring to ring:
+            // every arterial edge lies on its cross line, runs parallel to it
+            // (never across), and carries the drawn width. (The crossing
+            // vertex hosts both runs, so orientation — not the from-node —
+            // tells the runs apart.)
+            let arterial: Vec<_> = graph
+                .edges
+                .iter()
+                .filter(|e| e.kind == EdgeKind::Arterial)
+                .collect();
+            assert!(!arterial.is_empty(), "seed {seed}: no arterial edges");
+            let mut verticals = 0;
+            let mut horizontals = 0;
+            for e in &arterial {
+                let a = graph.nodes[e.from as usize].pos;
+                let b = graph.nodes[e.to as usize].pos;
+                if (a.x - b.x).abs() < 1e-3 {
+                    assert!(
+                        (a.x - cross.col as f32 * CELL_SIZE).abs() < 1e-3,
+                        "seed {seed}: vertical arterial off its line"
+                    );
+                    assert!(
+                        (e.width - cross.width_v).abs() < 1e-2,
+                        "seed {seed}: vertical arterial width {} != {}",
+                        e.width,
+                        cross.width_v
+                    );
+                    verticals += 1;
+                } else {
+                    assert!(
+                        (a.y - cross.row as f32 * CELL_SIZE).abs() < 1e-3,
+                        "seed {seed}: horizontal arterial off its line"
+                    );
+                    assert!(
+                        (e.width - cross.width_h).abs() < 1e-2,
+                        "seed {seed}: horizontal arterial width {} != {}",
+                        e.width,
+                        cross.width_h
+                    );
+                    horizontals += 1;
+                }
+            }
             assert!(
-                (VILLAGE_STREET_WIDTH_MIN..=STREET_WIDTH_MAX).contains(&edge.width),
-                "street edge width {} out of range",
-                edge.width
+                verticals > 0 && horizontals > 0,
+                "seed {seed}: both runs must exist"
             );
+
+            // No block spans the cross: every block's cells sit strictly on
+            // one side of each arterial line.
+            for block in &graph.blocks {
+                let min_col = block.cells.iter().map(|c| c.1).min().unwrap();
+                let max_col = block.cells.iter().map(|c| c.1).max().unwrap();
+                let min_row = block.cells.iter().map(|c| c.0).min().unwrap();
+                let max_row = block.cells.iter().map(|c| c.0).max().unwrap();
+                assert!(
+                    max_col < cross.col || min_col >= cross.col,
+                    "seed {seed}: block {} spans the vertical arterial",
+                    block.id
+                );
+                assert!(
+                    max_row < cross.row || min_row >= cross.row,
+                    "seed {seed}: block {} spans the horizontal arterial",
+                    block.id
+                );
+            }
+
+            // Blocks flanking the arterial retreat by the arterial half width
+            // on that side. The mitred corner where an arterial edge meets a
+            // side street sits at the AVERAGE of the two half widths from the
+            // centreline (inset_polygon_clip_with_insets vertex rule), so the
+            // guaranteed floor for ANY vertex is (arterial half + narrowest
+            // village half) / 2; mid-edge arterial vertices sit at the full
+            // arterial half.
+            for block in &graph.blocks {
+                let faces_v = block.cells.iter().any(|&(_, c)| c + 1 == cross.col)
+                    || block.cells.iter().any(|&(_, c)| c == cross.col);
+                if !faces_v {
+                    continue;
+                }
+                let half = cross.width_v * 0.5;
+                let floor = (half + VILLAGE_STREET_WIDTH_MIN * 0.5) * 0.5;
+                for p in &block.polygon {
+                    let dist = (p.x - cross.col as f32 * CELL_SIZE).abs();
+                    assert!(
+                        dist >= floor - 0.05,
+                        "seed {seed}: block {} vertex {} m from the vertical arterial (floor {floor})",
+                        block.id,
+                        dist
+                    );
+                }
+            }
         }
     }
 
@@ -960,11 +1571,31 @@ mod tests {
         for block in &graph.blocks {
             let span = block.cells.len();
             match block.kind {
-                BlockType::OldCity
-                | BlockType::UrbanVillage
-                | BlockType::Plaza
-                | BlockType::Forest => {
-                    assert_eq!(span, 1, "{:?} blocks merge 1x1", block.kind);
+                BlockType::Plaza => {
+                    assert_eq!(span, 1, "plaza blocks merge 1x1");
+                }
+                // R3.20: old city grows 1-2 x 1-2, then chains extensions —
+                // a district can span most of a quadrant, so the bound is
+                // the quadrant cell budget rather than the draw table.
+                BlockType::OldCity => {
+                    assert!(
+                        (1..=48).contains(&span),
+                        "old city district grew to {span} cells"
+                    );
+                }
+                // R3.20 (2026-11-19 user rule): 城中村不能单块独立 — a village
+                // district is never an isolated 1x1 block.
+                BlockType::UrbanVillage => {
+                    assert!(span >= 2, "village block {} has only {span} cell", block.id);
+                }
+                BlockType::Forest => {
+                    // R3.20b: the draw is 2-3 per side (4-9 cells), but chain
+                    // extensions grow a district further — bound by the same
+                    // quadrant cell budget as old city, not by the draw table.
+                    assert!(
+                        (1..=48).contains(&span),
+                        "forest district grew to {span} cells"
+                    );
                 }
                 BlockType::Apartment => {
                     // Interior: 2x2/3x3 (random). Band cells are forced 1x1
@@ -989,12 +1620,139 @@ mod tests {
         assert!(kinds.contains(&BlockType::Apartment));
         assert!(kinds.contains(&BlockType::Plaza));
         assert!(kinds.contains(&BlockType::Forest));
-        let old_city = kinds.iter().filter(|k| **k == BlockType::OldCity).count();
+        // R3.20b: exactly one factory district is reserved per map.
+        assert!(kinds.contains(&BlockType::Factory), "no factory district");
         let factory = kinds.iter().filter(|k| **k == BlockType::Factory).count();
-        assert!(
-            old_city > factory * 2,
-            "old city blocks must dominate: {old_city} vs {factory} factories"
-        );
+        assert_eq!(factory, 1, "one reserved factory district, got {factory}");
+    }
+
+    /// R3.20 (2026-11-19 user decision: 同类地块相邻时内部道路降级): a seam
+    /// between two same-kind village/old-city/forest districts is a narrow
+    /// lane, not the street average the old code put there. Extension
+    /// removes most seams outright; the ones the RNG declined are downgraded
+    /// so the texture still reads as one neighbourhood.
+    #[test]
+    fn same_kind_district_seams_are_narrow_lanes() {
+        for seed in [1u64, 7, 0x4845_4144] {
+            let (grid, graph) = world(seed);
+            let unit_edges = street_unit_edges(&grid, &graph.blocks, cross_of(seed));
+            for edge in &unit_edges {
+                // The arterial carries its own width regardless of flanks.
+                if edge.kind != EdgeKind::Street {
+                    continue;
+                }
+                let ((r0, c0), (_, c1)) = edge.vertices;
+                // Recover the flanking cells from the edge geometry.
+                let (west, east) = if c0 == c1 {
+                    ((r0, c0 - 1), (r0, c0))
+                } else {
+                    ((r0 - 1, c0), (r0, c0))
+                };
+                let block = |(r, c): (u32, u32)| {
+                    grid.get_cell(r, c)
+                        .ok()
+                        .map(|cell| cell.block_id)
+                        .filter(|id| *id != SCENERY_BAND_CELL)
+                };
+                let (Some(a), Some(b)) = (block(west), block(east)) else {
+                    continue;
+                };
+                let (ba, bb) = (&graph.blocks[a as usize], &graph.blocks[b as usize]);
+                if ba.kind != bb.kind {
+                    continue;
+                }
+                let expected = match ba.kind {
+                    BlockType::UrbanVillage => ba.street_width.min(bb.street_width),
+                    BlockType::OldCity => OLD_CITY_SEAM_WIDTH,
+                    BlockType::Forest => FOREST_PATH_WIDTH,
+                    _ => continue,
+                };
+                assert!(
+                    (edge.width - expected).abs() < 1e-3,
+                    "seed {seed}: same-kind {:?} seam is {} m wide, expected {expected}",
+                    ba.kind,
+                    edge.width
+                );
+            }
+        }
+    }
+
+    /// R3.20: same-kind districts really do chain into contiguous runs — for
+    /// village and forest cells, most same-kind neighbours are inside the
+    /// same block (the extension pass), not across a street.
+    #[test]
+    fn same_kind_cells_coalesce_into_districts() {
+        for seed in [1u64, 7, 0x4845_4144, 123_456_789] {
+            let (grid, graph) = world(seed);
+            for kind in [BlockType::UrbanVillage, BlockType::Forest] {
+                let mut same_block = 0usize;
+                let mut same_kind = 0usize;
+                for row in 0..grid.height {
+                    for col in 0..grid.width {
+                        let id = grid.get_cell(row, col).expect("in bounds").block_id;
+                        if id == SCENERY_BAND_CELL || graph.blocks[id as usize].kind != kind {
+                            continue;
+                        }
+                        for (nr, nc) in [(row, col + 1), (row + 1, col)] {
+                            let other = grid
+                                .get_cell(nr, nc)
+                                .ok()
+                                .map(|cell| cell.block_id)
+                                .unwrap_or(SCENERY_BAND_CELL);
+                            if other == SCENERY_BAND_CELL {
+                                continue;
+                            }
+                            let other_kind = graph.blocks[other as usize].kind;
+                            if other_kind != kind {
+                                continue;
+                            }
+                            same_kind += 1;
+                            if other == id {
+                                same_block += 1;
+                            }
+                        }
+                    }
+                }
+                if same_kind == 0 {
+                    continue;
+                }
+                let share = same_block as f32 / same_kind as f32;
+                assert!(
+                    share >= 0.5,
+                    "seed {seed}: only {same_block}/{same_kind} same-kind {:?} adjacencies are internal (share {share:.2})",
+                    kind
+                );
+            }
+        }
+    }
+
+    /// R3.20 spawn: the seed picks one junction, deterministically, on open
+    /// street — never inside a block polygon.
+    #[test]
+    fn spawn_point_is_a_deterministic_street_junction() {
+        for seed in [1u64, 7, 0x4845_4144, 123_456_789] {
+            let (_, graph) = world(seed);
+            let (pos, yaw) = spawn_point(&graph, seed);
+            let (pos_again, yaw_again) = spawn_point(&graph, seed);
+            assert_eq!((pos, yaw), (pos_again, yaw_again), "seed {seed}");
+            assert!(yaw.is_finite());
+            // The spawn sits on a Junction node of the graph.
+            let junction = graph.nodes.iter().enumerate().find(|(_, node)| {
+                node.kind == NodeKind::Junction && (node.pos - pos).length() < 1e-3
+            });
+            assert!(
+                junction.is_some(),
+                "seed {seed}: spawn {pos:?} is not a junction node"
+            );
+            // And not inside any block: the walker lands on open street.
+            for block in &graph.blocks {
+                assert!(
+                    !crate::world::geometry::point_in_convex_inclusive(pos, &block.polygon),
+                    "seed {seed}: spawn {pos:?} inside block {}",
+                    block.id
+                );
+            }
+        }
     }
 
     #[test]
@@ -1002,7 +1760,7 @@ mod tests {
         let (grid, graph) = world(7);
         // Every cell adjacent to a street must be flagged; band cells and
         // merged block interiors are not.
-        let unit_edges = street_unit_edges(&grid, &graph.blocks);
+        let unit_edges = street_unit_edges(&grid, &graph.blocks, cross_of(7));
         let mut expected = vec![false; grid.cells.len()];
         for edge in &unit_edges {
             let ((r0, c0), (r1, c1)) = edge.vertices;

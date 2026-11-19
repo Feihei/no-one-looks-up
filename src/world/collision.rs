@@ -23,7 +23,7 @@ use std::collections::HashMap;
 use bevy::math::Vec2;
 use bevy::prelude::*;
 
-use crate::world::geometry::{convex_hull, point_in_convex_polygon};
+use crate::world::geometry::{convex_decompose, convex_hull, point_in_convex_polygon};
 use crate::world::layout_graph::{BlockType, LayoutGraph};
 use crate::world::{
     BLOCK_SOLID_HEIGHT, CELL_SIZE, CHUNK_SIZE, GRID_CELLS, OUTER_BAND_CELLS, STREET_WIDTH,
@@ -39,6 +39,10 @@ pub const PLAYER_RADIUS: f32 = 0.3;
 pub struct SolidPrism {
     /// Block this prism belongs to (`u32::MAX` for the scenery ring).
     pub block_id: u32,
+    /// Sub-block index within the parent's `children` (ADR-0008), or
+    /// `None` for a whole-block prism. Distinguishes the plots of one
+    /// subdivided block in [`CollisionIndex::prism_count`].
+    pub child: Option<u32>,
     /// XZ cross-section, convex, CCW.
     pub polygon: Vec<Vec2>,
     /// Top of the prism (m). Collisions only apply up to this height.
@@ -95,13 +99,13 @@ impl CollisionIndex {
     pub fn prisms_in(&self, key: (i32, i32)) -> &[SolidPrism] {
         self.buckets.get(&key).map(Vec::as_slice).unwrap_or(&[])
     }
-
-    /// Number of prisms registered (diagnostics / tests).
+    /// Number of prisms registered (diagnostics / tests). Sub-block plots
+    /// count individually (ADR-0008: one prism per plot).
     pub fn prism_count(&self) -> usize {
         let mut seen = std::collections::HashSet::new();
         for prisms in self.buckets.values() {
             for prism in prisms {
-                seen.insert((prism.block_id, prism.kind));
+                seen.insert((prism.block_id, prism.child, prism.kind));
             }
         }
         seen.len()
@@ -117,26 +121,55 @@ impl CollisionIndex {
             if !is_solid(block.kind, block.is_outer) || block.polygon.len() < 3 {
                 continue;
             }
-            // Inset can make a merged block's perimeter slightly concave:
-            // its middle lattice vertices are inset along their own edge
-            // normals, so the corner between two segments can dip inward
-            // (measured: cross products go negative at alternating vertices).
-            // `push_out` assumes convexity, so collide against the hull.
-            // Shrinking to the hull only makes the block slightly *larger*
-            // than its visual outline by the dip depth — imperceptible at
-            // ±4 m perturbation, and far safer than mis-resolving a reflex
-            // corner and letting the player through.
-            let prism = SolidPrism {
-                block_id: block.id,
-                polygon: convex_hull(&block.polygon),
-                height: BLOCK_SOLID_HEIGHT,
-                kind: prism_kind(block.kind),
+            // ADR-0008: a subdivided block collides per PLOT, so the lanes
+            // between the plots stay walkable. Empty children = the old
+            // one-prism-per-block behaviour.
+            //
+            // R3.20: each polygon is `convex_decompose`d into convex pieces
+            // and every piece gets its own prism. The previous hull + edge
+            // half-plane clip could not satisfy both goals at once on a
+            // strongly non-convex outline (a 6 m x 250 m village plot strip):
+            // the intersection of the half-planes is the kernel, which may
+            // exclude the polygon's own centroid, while the unclipped hull
+            // bridges a wobble dip ~5 m INTO the street and pinches the
+            // walker. Triangles are always convex and always inside the
+            // polygon, so `push_out`'s convexity assumption holds AND the
+            // streets keep their full inset width.
+            let pieces_of = |polygon: &[Vec2]| -> Vec<Vec<Vec2>> {
+                if polygon.len() < 3 {
+                    Vec::new()
+                } else {
+                    convex_decompose(polygon)
+                }
             };
-            if prism.polygon.len() < 3 {
-                continue;
-            }
-            if prism_touches_chunk(&prism, key) {
-                prisms.push(prism);
+            if block.children.is_empty() {
+                for piece in pieces_of(&block.polygon) {
+                    let prism = SolidPrism {
+                        block_id: block.id,
+                        child: None,
+                        polygon: piece,
+                        height: BLOCK_SOLID_HEIGHT,
+                        kind: prism_kind(block.kind),
+                    };
+                    if prism_touches_chunk(&prism, key) {
+                        prisms.push(prism);
+                    }
+                }
+            } else {
+                for (child_index, child) in block.children.iter().enumerate() {
+                    for piece in pieces_of(&child.polygon) {
+                        let prism = SolidPrism {
+                            block_id: block.id,
+                            child: Some(child_index as u32),
+                            polygon: piece,
+                            height: BLOCK_SOLID_HEIGHT,
+                            kind: prism_kind(block.kind),
+                        };
+                        if prism_touches_chunk(&prism, key) {
+                            prisms.push(prism);
+                        }
+                    }
+                }
             }
         }
         // The scenery band is closed by a ring wall rather than by blocks.
@@ -294,6 +327,7 @@ fn scenery_ring_prisms(key: (i32, i32)) -> Vec<SolidPrism> {
     clipped
         .into_iter()
         .map(|(ax0, az0, ax1, az1)| SolidPrism {
+            child: None,
             block_id: u32::MAX,
             polygon: vec![
                 Vec2::new(ax0, az0),
@@ -311,17 +345,58 @@ fn scenery_ring_prisms(key: (i32, i32)) -> Vec<SolidPrism> {
 ///
 /// `None` when the circle does not overlap the polygon at all.
 ///
-/// For a convex polygon the shortest way out is through the nearest edge, so
+/// Inside the polygon, the shortest way out is through the nearest edge, so
 /// the algorithm tracks the edge with the largest outward distance from the
 /// centre (i.e. the least-overlapping one) and pushes along its outward
-/// normal by exactly enough to clear the radius.
+/// normal by exactly enough to clear the radius — the shallowest-axis slide
+/// that keeps walking along a street wall smooth.
+///
+/// Outside, the circle overlaps iff the boundary comes within `radius`; the
+/// push is then radial from the closest boundary point, which is the only
+/// correct resolution at a convex corner (a corner lies within `radius` of
+/// the centre long before either flanking face does).
 fn push_out(polygon: &[Vec2], center: Vec2, radius: f32) -> Option<Vec2> {
     if polygon.len() < 3 {
         return None;
     }
 
-    // Outward normal per edge, resolved because winding is not guaranteed.
-    let mut best: Option<(f32, Vec2)> = None; // (outward distance, normal)
+    // Centre inside the prism: push along the shallowest axis (the face with
+    // the largest outward distance), which is what keeps the slide smooth
+    // along a street wall.
+    if point_in_convex_polygon(center, polygon) {
+        let mut best: Option<(f32, Vec2)> = None; // (outward distance, normal)
+        for i in 0..polygon.len() {
+            let a = polygon[i];
+            let b = polygon[(i + 1) % polygon.len()];
+            let edge = b - a;
+            if edge.length_squared() < 1e-9 {
+                continue;
+            }
+            let mut normal = Vec2::new(-edge.y, edge.x).normalize();
+            // Point the normal away from the interior: the polygon's own
+            // centre must lie on the opposite side of the edge.
+            let to_centroid = crate::world::geometry::polygon_centroid(polygon) - (a + b) * 0.5;
+            if normal.dot(to_centroid) > 0.0 {
+                normal = -normal;
+            }
+            let dist_out = (center - a).dot(normal);
+            if best.is_none_or(|(d, _)| dist_out > d) {
+                best = Some((dist_out, normal));
+            }
+        }
+        let (dist_out, normal) = best?;
+        // If the centre is inside (dist_out < 0) the push is radius -
+        // dist_out, which always clears the edge.
+        return Some(normal * (radius - dist_out));
+    }
+
+    // Centre outside: overlap iff the BOUNDARY comes within `radius`. Resolve
+    // via the closest boundary point — radial pushes also handle corners.
+    // The old single shallowest-axis test read "all per-edge distances <
+    // radius" as *inside* and pushed walkers that merely stood near a convex
+    // corner (R3.20, measured: an OldCity plot corner 2.06 m from a narrow
+    // seam centreline teleported the walker sideways and stalled the walk).
+    let mut best: Option<(f32, Vec2, Vec2)> = None; // (distance, closest point, edge)
     for i in 0..polygon.len() {
         let a = polygon[i];
         let b = polygon[(i + 1) % polygon.len()];
@@ -329,26 +404,27 @@ fn push_out(polygon: &[Vec2], center: Vec2, radius: f32) -> Option<Vec2> {
         if edge.length_squared() < 1e-9 {
             continue;
         }
+        let t = ((center - a).dot(edge) / edge.length_squared()).clamp(0.0, 1.0);
+        let closest = a.lerp(b, t);
+        let d = (center - closest).length();
+        if best.is_none_or(|(bd, _, _)| d < bd) {
+            best = Some((d, closest, edge));
+        }
+    }
+    let (d, closest, edge) = best?;
+    if d >= radius {
+        return None;
+    }
+    if d < 1e-6 {
+        // Centre exactly on the boundary: push along the outward face normal.
         let mut normal = Vec2::new(-edge.y, edge.x).normalize();
-        // Point the normal away from the interior: the polygon's own centre
-        // must lie on the opposite side of the edge.
-        let to_centroid = crate::world::geometry::polygon_centroid(polygon) - (a + b) * 0.5;
+        let to_centroid = crate::world::geometry::polygon_centroid(polygon) - closest;
         if normal.dot(to_centroid) > 0.0 {
             normal = -normal;
         }
-        let dist_out = (center - a).dot(normal);
-        if best.is_none_or(|(d, _)| dist_out > d) {
-            best = Some((dist_out, normal));
-        }
+        return Some(normal * radius);
     }
-
-    let (dist_out, normal) = best?;
-    if dist_out >= radius {
-        return None; // Fully outside on every axis: no overlap.
-    }
-    // If the centre is inside (dist_out < 0) the push is radius - dist_out,
-    // which always clears the edge.
-    Some(normal * (radius - dist_out))
+    Some((center - closest) / d * (radius - d))
 }
 
 /// Convex hull of a block polygon, exposed for tests and R3.4.
@@ -391,15 +467,46 @@ mod tests {
                 continue;
             }
             let center = block.center();
-            // The block centre must be inside its prism (inset shrinks the
-            // polygon but never past the centre of a convex block).
-            assert!(
-                index.is_blocked(center),
-                "block {} centre {:?} should be solid",
-                block.id,
-                center
-            );
+            if block.children.is_empty() {
+                // The block centre must be inside its prism (inset shrinks
+                // the polygon but never past the centre of a convex block).
+                assert!(
+                    index.is_blocked(center),
+                    "block {} centre {:?} should be solid",
+                    block.id,
+                    center
+                );
+            } else {
+                // ADR-0008: a subdivided block's centre may sit ON a lane
+                // (walkable by design). Every PLOT centre must be solid,
+                // and every lane midpoint must be free.
+                for child in &block.children {
+                    let plot_center = crate::world::geometry::polygon_centroid(&child.polygon);
+                    assert!(
+                        index.is_blocked(plot_center),
+                        "block {} plot centre {:?} should be solid",
+                        block.id,
+                        plot_center
+                    );
+                }
+            }
         }
+        // Lane midpoints are walkable negative space.
+        let mut lanes = 0;
+        for edge in &graph.edges {
+            if edge.kind != crate::world::layout_graph::EdgeKind::Lane {
+                continue;
+            }
+            let a = graph.nodes[edge.from as usize].pos;
+            let b = graph.nodes[edge.to as usize].pos;
+            let mid = (a + b) * 0.5;
+            assert!(
+                !index.is_blocked(mid),
+                "lane midpoint {mid:?} should be walkable"
+            );
+            lanes += 1;
+        }
+        assert!(lanes > 0, "world should carry lanes");
     }
 
     #[test]
@@ -457,6 +564,7 @@ mod tests {
     #[test]
     fn resolve_pushes_out_of_a_prism() {
         let prism = SolidPrism {
+            child: None,
             block_id: 0,
             polygon: vec![
                 Vec2::new(0.0, 0.0),
@@ -512,6 +620,7 @@ mod tests {
     #[test]
     fn fast_walk_does_not_tunnel_through_a_wall() {
         let prism = SolidPrism {
+            child: None,
             block_id: 0,
             polygon: vec![
                 Vec2::new(0.0, 0.0),
@@ -560,11 +669,11 @@ mod tests {
     /// guarantee the point tests check statically: no seam blocks a walker,
     /// and the scenery ring keeps them inside the map.
     ///
-    /// Share of grid cells that must yield a walkable edge. The old 500 at
-    /// 60x60 cells (40x40 grid edges) was ~2 per cell; the 800 m map still
-    /// produces well over one edge per cell.
-    const MIN_WALKED_EDGE_RATIO: usize = 1;
-
+    /// Absolute floor on walkable edges (seed 7 measured 141, 0x4845_4144
+    /// 176, seed 1 91). R3.20's same-kind district growth removed the seams
+    /// between merged districts, so the old one-edge-per-cell floor (256)
+    /// no longer holds — the new texture has fewer, longer streets.
+    const MIN_WALKED_EDGES: usize = 64;
     #[test]
     fn walking_every_street_reaches_the_far_end() {
         for seed in [7_u64, 0x4845_4144] {
@@ -642,15 +751,105 @@ mod tests {
                 );
                 walked += 1;
             }
-            // Every street edge must be traversable. The world shrank to 16x16
-            // cells (from 40x40) with the 800 m map, so the floor scales with
-            // the grid rather than sitting at a 2 km-era constant.
-            let min_edges = (GRID_CELLS * GRID_CELLS) as usize * MIN_WALKED_EDGE_RATIO;
+            // Every street edge must be traversable. R3.20 shrank the street
+            // count (merged districts share no seams), so the floor is the
+            // absolute MIN_WALKED_EDGES instead of a per-cell ratio.
             assert!(
-                walked > min_edges,
-                "seed {seed}: walked only {walked} edges (floor {min_edges})"
+                walked > MIN_WALKED_EDGES,
+                "seed {seed}: walked only {walked} edges (floor {MIN_WALKED_EDGES})"
             );
         }
+    }
+
+    /// ADR-0008: every lane must be walkable end to end, exactly like the
+    /// tier-0 streets — the plots flank it without sealing it, and the
+    /// mouth joins the street without a pinch.
+    #[test]
+    fn walking_every_lane_reaches_the_far_end() {
+        for seed in [7_u64, 0x4845_4144] {
+            let (_, graph) = world(seed);
+            let mut index = CollisionIndex::default();
+            let all_keys: Vec<(i32, i32)> = (0..GRID_CELLS as i32)
+                .flat_map(|x| (0..GRID_CELLS as i32).map(move |z| (x, z)))
+                .collect();
+            for key in &all_keys {
+                index.register_chunk(&graph, *key);
+            }
+            let mut walked = 0;
+            for edge in &graph.edges {
+                if edge.kind != crate::world::layout_graph::EdgeKind::Lane {
+                    continue;
+                }
+                let a = graph.nodes[edge.from as usize].pos;
+                let b = graph.nodes[edge.to as usize].pos;
+                let dir = b - a;
+                let length = dir.length();
+                if length < f32::EPSILON {
+                    continue;
+                }
+                let dir = dir / length;
+                let mut p = a;
+                let mut progress = 0.0_f32;
+                let steps = (length / 0.5).ceil() as usize;
+                for _ in 0..steps {
+                    p = index.resolve(p + dir * 0.5, PLAYER_RADIUS);
+                    assert!(
+                        !index.is_blocked(p),
+                        "seed {seed}: lane walker inside a plot at {p:?}"
+                    );
+                    progress = (p - a).dot(dir);
+                }
+                let miss = (length - progress).abs();
+                assert!(
+                    miss <= 0.1 * length + 1.0,
+                    "seed {seed}: lane {}->{} covered only {progress:.1}/{length:.1} m",
+                    edge.from,
+                    edge.to
+                );
+                walked += 1;
+            }
+            // R3.20: apartment lanes are gone (the blue districts keep their
+            // interior whole), so only village + old-city lanes remain —
+            // seeds 7 / 0x4845_4144 measured 19 / 31.
+            assert!(walked > 15, "seed {seed}: walked only {walked} lanes");
+        }
+    }
+
+    /// ADR-0008 verification: the prism count rises with subdivision (a
+    /// village block carries one prism per plot instead of one), and the
+    /// per-chunk bucketing keeps the query load bounded.
+    #[test]
+    fn subdivision_multiplies_prisms_but_buckets_stay_bounded() {
+        let (_, graph) = world(7);
+        let mut index = CollisionIndex::default();
+        let all_keys: Vec<(i32, i32)> = (0..GRID_CELLS as i32)
+            .flat_map(|x| (0..GRID_CELLS as i32).map(move |z| (x, z)))
+            .collect();
+        for key in &all_keys {
+            index.register_chunk(&graph, *key);
+        }
+        let plots: usize = graph.blocks.iter().map(|b| b.children.len()).sum();
+        let whole = graph
+            .blocks
+            .iter()
+            .filter(|b| is_solid(b.kind, b.is_outer) && b.children.is_empty())
+            .count();
+        assert!(plots > 0, "world should carry plots");
+        assert!(
+            index.prism_count() >= plots + whole,
+            "prisms {} < plots {plots} + whole blocks {whole}",
+            index.prism_count()
+        );
+        // A chunk's bucket stays small enough for the 3x3 resolve scan.
+        let max_bucket = all_keys
+            .iter()
+            .map(|k| index.prisms_in(*k).len())
+            .max()
+            .unwrap_or(0);
+        assert!(
+            max_bucket < 400,
+            "largest chunk bucket {max_bucket} prisms is too heavy"
+        );
     }
 
     /// Chunks that hold at least one block, so the index can be filled fully.

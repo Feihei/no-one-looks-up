@@ -31,6 +31,11 @@ const MAP_SIZE: f32 = 240.0;
 const PIXELS_PER_METER: f32 = MAP_SIZE / WORLD_SIZE;
 /// Street line thickness, in pixels.
 const ROAD_THICKNESS: f32 = 1.5;
+/// Arterial line thickness (ADR-0009): the cross reads above every street.
+const ARTERIAL_THICKNESS: f32 = 2.5;
+/// Lane line thickness (ADR-0008 tier 1): thinner and dimmer than streets
+/// so the two road tiers read apart at a glance.
+const LANE_THICKNESS: f32 = 0.75;
 /// Player marker line thickness, in pixels.
 const MARKER_THICKNESS: f32 = 2.0;
 /// Sampling step along an edge when deciding which parts are explored
@@ -39,6 +44,10 @@ const SAMPLE_STEP: f32 = 25.0;
 
 /// Roads stay quiet against the dusk sky: dim grey, slightly translucent.
 const ROAD_COLOR: Color = Color::srgba(0.55, 0.55, 0.55, 0.60);
+/// Arterial (ADR-0009): brighter than a street, clearly the main road.
+const ARTERIAL_COLOR: Color = Color::srgba(0.78, 0.78, 0.78, 0.85);
+/// Lanes (ADR-0008): quieter still, so the tier-0 skeleton dominates.
+const LANE_COLOR: Color = Color::srgba(0.50, 0.50, 0.52, 0.40);
 /// The player marker is a plain grey-white arrow, brighter than the roads.
 const PLAYER_COLOR: Color = Color::srgb(0.85, 0.85, 0.87);
 
@@ -211,12 +220,17 @@ fn rebuild_roads(
     }
     let segments = explored_segments(&graph, &bitmap);
     commands.entity(layer).with_children(|parent| {
-        for (from, to) in segments {
+        for (from, to, tier) in segments {
+            let (thickness, color) = match tier {
+                RoadTier::Lane => (LANE_THICKNESS, LANE_COLOR),
+                RoadTier::Arterial => (ARTERIAL_THICKNESS, ARTERIAL_COLOR),
+                RoadTier::Street => (ROAD_THICKNESS, ROAD_COLOR),
+            };
             parent.spawn(line_node(
                 world_to_map(from),
                 world_to_map(to),
-                ROAD_THICKNESS,
-                ROAD_COLOR,
+                thickness,
+                color,
                 MinimapRoad,
             ));
         }
@@ -253,9 +267,20 @@ fn update_player_marker(
     }
 }
 
+/// Road tier of a drawn minimap segment (ADR-0008/0009).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RoadTier {
+    /// Tier 0 street between blocks.
+    Street,
+    /// Tier 0 arterial cross (ADR-0009): thicker, brighter.
+    Arterial,
+    /// Tier 1 lane inside a block.
+    Lane,
+}
+
 /// Street sub-segments (sampled every [`SAMPLE_STEP`]) that fall inside
-/// explored chunks.
-fn explored_segments(graph: &LayoutGraph, bitmap: &ExploredBitmap) -> Vec<(Vec2, Vec2)> {
+/// explored chunks, tagged with their road tier.
+fn explored_segments(graph: &LayoutGraph, bitmap: &ExploredBitmap) -> Vec<(Vec2, Vec2, RoadTier)> {
     let mut out = Vec::new();
     for edge in &graph.edges {
         let Some(from) = graph.nodes.get(edge.from as usize) else {
@@ -263,6 +288,11 @@ fn explored_segments(graph: &LayoutGraph, bitmap: &ExploredBitmap) -> Vec<(Vec2,
         };
         let Some(to) = graph.nodes.get(edge.to as usize) else {
             continue;
+        };
+        let tier = match edge.kind {
+            crate::world::layout_graph::EdgeKind::Lane => RoadTier::Lane,
+            crate::world::layout_graph::EdgeKind::Arterial => RoadTier::Arterial,
+            crate::world::layout_graph::EdgeKind::Street => RoadTier::Street,
         };
         let start = from.pos;
         let end = to.pos;
@@ -272,25 +302,32 @@ fn explored_segments(graph: &LayoutGraph, bitmap: &ExploredBitmap) -> Vec<(Vec2,
         }
         // Walk the edge in SAMPLE_STEP probes; every probe pair whose
         // midpoint chunk is explored becomes a drawn segment. This is what
-        // lets a half-walked street show only its walked half.
+        // lets a half-walked street show only its walked half. Lanes are
+        // shorter than a chunk, so one probe usually covers them whole.
         let mut prev = start;
         let mut t = SAMPLE_STEP;
         while t < length {
             let next = start.lerp(end, t / length);
-            emit_if_explored(prev, next, bitmap, &mut out);
+            emit_if_explored(prev, next, tier, bitmap, &mut out);
             prev = next;
             t += SAMPLE_STEP;
         }
-        emit_if_explored(prev, end, bitmap, &mut out);
+        emit_if_explored(prev, end, tier, bitmap, &mut out);
     }
     out
 }
 
-/// Appends `(a, b)` when the chunk containing its midpoint is explored.
-fn emit_if_explored(a: Vec2, b: Vec2, bitmap: &ExploredBitmap, out: &mut Vec<(Vec2, Vec2)>) {
+/// Appends `(a, b, tier)` when the chunk containing its midpoint is explored.
+fn emit_if_explored(
+    a: Vec2,
+    b: Vec2,
+    tier: RoadTier,
+    bitmap: &ExploredBitmap,
+    out: &mut Vec<(Vec2, Vec2, RoadTier)>,
+) {
     let mid = (a + b) * 0.5;
     if bitmap.is_explored(chunk_key(mid)) {
-        out.push((a, b));
+        out.push((a, b, tier));
     }
 }
 
@@ -433,6 +470,7 @@ mod tests {
                 width: 8.0,
                 left_block: None,
                 right_block: None,
+                kind: crate::world::layout_graph::EdgeKind::Street,
             }],
             ..Default::default()
         };
@@ -451,6 +489,12 @@ mod tests {
         assert_eq!(segments[0].1, Vec2::new(475.0, 425.0));
         assert_eq!(segments[1].0, Vec2::new(475.0, 425.0));
         assert_eq!(segments[1].1, Vec2::new(500.0, 425.0));
+        assert!(
+            segments
+                .iter()
+                .all(|(_, _, tier)| *tier == RoadTier::Street),
+            "street tier"
+        );
 
         // Walking both chunks joins the probes back into a full line.
         explored.mark(chunk_key(Vec2::new(425.0, 425.0)));
@@ -458,6 +502,41 @@ mod tests {
         assert_eq!(segments.len(), 4);
         assert_eq!(segments[0].0, Vec2::new(400.0, 425.0));
         assert_eq!(segments[3].1, Vec2::new(500.0, 425.0));
+    }
+
+    /// ADR-0008: lane edges are tagged so the map draws them thinner.
+    #[test]
+    fn lane_segments_are_tagged_as_lanes() {
+        let graph = LayoutGraph {
+            nodes: vec![
+                LayoutNode {
+                    pos: Vec2::new(420.0, 410.0),
+                    kind: crate::world::layout_graph::NodeKind::LaneMouth,
+                },
+                LayoutNode {
+                    pos: Vec2::new(420.0, 435.0),
+                    kind: crate::world::layout_graph::NodeKind::LaneMouth,
+                },
+            ],
+            edges: vec![LayoutEdge {
+                from: 0,
+                to: 1,
+                width: 2.8,
+                left_block: Some(0),
+                right_block: Some(0),
+                kind: crate::world::layout_graph::EdgeKind::Lane,
+            }],
+            ..Default::default()
+        };
+        let mut explored = ExploredBitmap::default();
+        explored.mark(chunk_key(Vec2::new(420.0, 425.0)));
+        let segments = explored_segments(&graph, &explored);
+        assert_eq!(segments.len(), 1);
+        assert_eq!(
+            segments[0].2,
+            RoadTier::Lane,
+            "the lane must carry its tier"
+        );
     }
 
     #[test]
