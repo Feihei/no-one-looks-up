@@ -46,10 +46,11 @@ pub const SCENERY_BAND_CELL: u32 = u32::MAX;
 /// Type selection weights (port of the original `_assign_interior_type`).
 ///
 /// Interior cells: PLAZA 6%, FOREST 14% (edge transition only), then
-/// URBAN_VILLAGE 10% (2026-11: the 城中村 districts the design asks for), and
-/// the remaining 70% split OLD_CITY 90 / APARTMENT 10 of the built-up
+/// URBAN_VILLAGE 15% (R3.20d 2026-11-19 user review "红色老城区占比还是太高
+/// 了": raised from 10% — the 城中村 texture should read stronger), and
+/// the remaining 65% split OLD_CITY 80 / APARTMENT 20 of the built-up
 /// remainder (R3.20b: the factory share moved into the map-level factory
-/// reservation — see `partition_blocks`).
+/// reservation; R3.20d: apartment doubled on the same review).
 ///
 /// R3.20 (2026-11-19 user decision: 同类连片): the per-roll probabilities are
 /// the per-CELL targets above divided by each type's expected district area,
@@ -57,18 +58,20 @@ pub const SCENERY_BAND_CELL: u32 = u32::MAX;
 /// Expected areas: plaza 1x1 = 1, forest 2-3 x 2-3 = 6.25, village
 /// 1-2 x 2-3 = 3.75, old city 1-2 x 1-2 = 2.25, apartment 2-3 square =
 /// 6.25. Normalizing share/area reproduces the AREA shares the ADR-0001 mix
-/// asks for: cumulative thresholds 0.1531 / 0.2102 / 0.2783 / 0.90-built.
+/// asks for: cumulative thresholds 0.1531 / 0.2102 / 0.332 / 0.80-built.
 const P_PLAZA_END: f32 = 0.1531;
 const P_FOREST_END: f32 = 0.2102;
-/// 城中村 share of interior cells: about one lane district in ten by area.
-/// R3.20 villages grow into 2-6 cell rectangles (never an isolated 1x1), so
-/// a district roll is rarer than the old per-cell roll.
-const P_VILLAGE_END: f32 = 0.2783;
+/// 城中村 share of interior cells: 15% of area (R3.20d 2026-11-19 user
+/// review "红色老城区占比还是太高了", raised from 10%). Villages grow into
+/// 2-6 cell rectangles (never an isolated 1x1), so a district roll is rarer
+/// than the old per-cell roll: p = 0.15 x 3.05 / 3.75 on top of the forest
+/// threshold (K = 3.05 = expected built district area at the 80/20 split).
+const P_VILLAGE_END: f32 = 0.332;
 /// Built-up split of the fill scan (ADR-0001 "风格比例约 50/30/20"): R3.20b
 /// removed the fill-roll factory arm (factories come solely from the
-/// map-level reservation), so the old 87/10/3 old/apartment/factory split
-/// becomes 90/10 old/apartment.
-const P_OLD_AREA: f32 = 0.90;
+/// map-level reservation); R3.20d doubled the apartment share on the same
+/// review — 80/20 old/apartment.
+const P_OLD_AREA: f32 = 0.80;
 
 /// Generates the complete world layout for `seed`.
 ///
@@ -210,9 +213,11 @@ pub(crate) fn perturbed_nodes(rng: &mut StdRng, cross: ArterialCross) -> Vec<Vec
 /// Algorithm (ADR-0009): the interior is split into four quadrants by the
 /// arterial cross; each quadrant is processed (order NW, NE, SW, SE) with the
 /// same deterministic steps:
-/// 0. R3.20b: reserve ONE 4-5² factory district for the whole map, centred
-///    in a randomly drawn quadrant — the fill scan fragments free space too
-///    much for a factory roll to ever fit afterwards;
+/// 0. R3.20b/c: reserve ONE 4-5² factory and ONE 2-3² apartment district
+///    for the whole map, each centred in a randomly drawn (distinct)
+///    quadrant — the fill scan fragments free space too much for a
+///    factory roll to ever fit, and the same fragmentation regularly
+///    ate the apartment quota too;
 /// 1. take the first unassigned cell;
 /// 2. R3.20 同类连片: offer it to a same-kind village/forest/old-city
 ///    district to the left or above — rectangle-preserving extensions chain
@@ -250,15 +255,24 @@ fn partition_blocks(
     let inner_end_row = height - OUTER_BAND_CELLS;
     let inner_end_col = width - OUTER_BAND_CELLS;
 
-    // R3.20b factory reservation: claim ONE factory district for the whole
-    // map (2026-11-19 user decision: "改成整张图预留一个厂区就好"), before
-    // the fill scan — a 4-5² rect always fits in an empty quadrant (quadrants
-    // are 6-8 cells per side), while the scan's district absorption fragments
-    // free space long before a factory roll could ever fit. The host quadrant
-    // is drawn from the same RNG; the district is centred there so it keeps
-    // its distance from both the arterial cross and the ring road.
+    // R3.20b/c reserved districts: claim ONE factory AND ONE apartment
+    // district for the whole map (2026-11-19 user review: the fragmented
+    // fill scan could not fit a 4-5² factory — and often not a 2-3²
+    // apartment either — so every roll degraded to old city and some maps
+    // showed no factory at all while the showcase seed lost its blue
+    // apartment estate entirely), before the fill scan. Each is centred in
+    // its own drawn quadrant (quadrants are 6-8 cells per side, so any
+    // district size fits an empty one), keeping its distance from both the
+    // arterial cross and the ring road; the fill scan works around them.
+    // The scan's factory arm is gone (the reservation is the sole factory
+    // source) while apartment rolls can still chain more blue districts.
     let (factory_req_w, factory_req_h) = district_size(rng, BlockType::Factory);
+    let (apartment_req_w, apartment_req_h) = district_size(rng, BlockType::Apartment);
     let factory_quadrant = rng.random_range(0..4_usize);
+    // Distinct host quadrants (a centred 5² factory leaves no room for a
+    // centred 3² apartment in the same 6-8 cell quadrant). Deterministic
+    // shift, one draw.
+    let apartment_quadrant = (factory_quadrant + 1 + rng.random_range(0..3_usize)) % 4;
 
     for (row_band, &(row_start, row_end)) in [(inner_start, cross.row), (cross.row, inner_end_row)]
         .iter()
@@ -270,44 +284,40 @@ fn partition_blocks(
                 .enumerate()
         {
             // NW=0, NE=1, SW=2, SE=3 — the iteration order of the fill scan.
-            if row_band * 2 + col_band == factory_quadrant {
-                let quadrant_h = row_end - row_start;
-                let quadrant_w = col_end - col_start;
-                let factory_row = row_start + (quadrant_h - factory_req_h) / 2;
-                let factory_col = col_start + (quadrant_w - factory_req_w) / 2;
-                let (w, h) = largest_free_rect(
-                    &owner,
+            let quadrant = row_band * 2 + col_band;
+            if quadrant == factory_quadrant {
+                place_reserved_district(
+                    &mut owner,
                     width,
-                    factory_row,
-                    factory_col,
-                    row_end,
-                    col_end,
+                    &mut rects,
+                    &mut blocks,
+                    rng,
+                    BlockType::Factory,
                     factory_req_w,
                     factory_req_h,
+                    4,
+                    row_start,
+                    row_end,
+                    col_start,
+                    col_end,
                 );
-                // An empty quadrant always fits, but a defensive degrade (to
-                // simply skipping) costs nothing and cannot mislabel a block.
-                if w >= 4 && h >= 4 {
-                    let block_id = blocks.len() as u32;
-                    let street_width = rng.random_range(STREET_WIDTH_MIN..=STREET_WIDTH_MAX);
-                    let mut cells = Vec::with_capacity((w * h) as usize);
-                    for r in factory_row..(factory_row + h) {
-                        for c in factory_col..(factory_col + w) {
-                            owner[(r * width + c) as usize] = Some(block_id);
-                            cells.push((r, c));
-                        }
-                    }
-                    rects.push((factory_row, factory_col, factory_row + h, factory_col + w));
-                    blocks.push(LayoutBlock {
-                        id: block_id,
-                        kind: BlockType::Factory,
-                        cells,
-                        street_width,
-                        is_outer: false,
-                        polygon: Vec::new(),
-                        children: Vec::new(),
-                    });
-                }
+            }
+            if quadrant == apartment_quadrant {
+                place_reserved_district(
+                    &mut owner,
+                    width,
+                    &mut rects,
+                    &mut blocks,
+                    rng,
+                    BlockType::Apartment,
+                    apartment_req_w,
+                    apartment_req_h,
+                    2,
+                    row_start,
+                    row_end,
+                    col_start,
+                    col_end,
+                );
             }
             for row in row_start..row_end {
                 for col in col_start..col_end {
@@ -484,6 +494,57 @@ fn extendable(kind: BlockType) -> bool {
         kind,
         BlockType::UrbanVillage | BlockType::Forest | BlockType::OldCity
     )
+}
+
+/// Places one reserved district (R3.20b/c) centred in the given quadrant,
+/// claimed from the still-empty `owner` grid before the fill scan.
+///
+/// The defensive `min_side` check can only fail if the quadrant were smaller
+/// than the request (impossible: quadrants are 6-8 cells, requests are ≤5),
+/// but skipping a reservation costs nothing and cannot mislabel a block.
+#[allow(clippy::too_many_arguments)]
+fn place_reserved_district(
+    owner: &mut [Option<u32>],
+    width: u32,
+    rects: &mut Vec<(u32, u32, u32, u32)>,
+    blocks: &mut Vec<LayoutBlock>,
+    rng: &mut StdRng,
+    kind: BlockType,
+    req_w: u32,
+    req_h: u32,
+    min_side: u32,
+    row_start: u32,
+    row_end: u32,
+    col_start: u32,
+    col_end: u32,
+) {
+    let quadrant_h = row_end - row_start;
+    let quadrant_w = col_end - col_start;
+    let row = row_start + (quadrant_h - req_h) / 2;
+    let col = col_start + (quadrant_w - req_w) / 2;
+    let (w, h) = largest_free_rect(owner, width, row, col, row_end, col_end, req_w, req_h);
+    if w < min_side || h < min_side {
+        return;
+    }
+    let block_id = blocks.len() as u32;
+    let street_width = rng.random_range(STREET_WIDTH_MIN..=STREET_WIDTH_MAX);
+    let mut cells = Vec::with_capacity((w * h) as usize);
+    for r in row..(row + h) {
+        for c in col..(col + w) {
+            owner[(r * width + c) as usize] = Some(block_id);
+            cells.push((r, c));
+        }
+    }
+    rects.push((row, col, row + h, col + w));
+    blocks.push(LayoutBlock {
+        id: block_id,
+        kind,
+        cells,
+        street_width,
+        is_outer: false,
+        polygon: Vec::new(),
+        children: Vec::new(),
+    });
 }
 
 /// Tries to absorb the free cell `(row, col)` into a same-kind district to
@@ -1615,12 +1676,18 @@ mod tests {
                 }
             }
         }
-        // The world contains a realistic mix (老城区多数, 厂房极少).
+        // The world contains a realistic mix (老城区多数). R3.20b/c: the
+        // factory and apartment reservations guarantee both kinds on every
+        // map (the fill roll can still chain extra apartments). Forest is
+        // NOT guaranteed — its border band (FOREST_EDGE_MAX_DISTANCE_CELLS)
+        // competes with the reservations, and 1 of 8 measured seeds lost it;
+        // a third reservation would freeze the quadrant skeleton.
         let kinds: Vec<BlockType> = graph.blocks.iter().map(|b| b.kind).collect();
-        assert!(kinds.contains(&BlockType::Apartment));
+        assert!(
+            kinds.contains(&BlockType::Apartment),
+            "no apartment district"
+        );
         assert!(kinds.contains(&BlockType::Plaza));
-        assert!(kinds.contains(&BlockType::Forest));
-        // R3.20b: exactly one factory district is reserved per map.
         assert!(kinds.contains(&BlockType::Factory), "no factory district");
         let factory = kinds.iter().filter(|k| **k == BlockType::Factory).count();
         assert_eq!(factory, 1, "one reserved factory district, got {factory}");
