@@ -49,6 +49,9 @@
 # Local save files (player runtime data)
 /saves/
 
+# Packaged release output (scripts/package.sh)
+/dist/
+
 # Scratch dir for temporary test output
 /.tmp/
 
