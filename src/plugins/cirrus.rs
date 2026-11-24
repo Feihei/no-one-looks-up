@@ -60,11 +60,12 @@ pub struct CirrusSettings {
 impl Default for CirrusSettings {
     fn default() -> Self {
         Self {
-            // Off by default: Feihei's call is that the volumetric layer stays
-            // the main cloud and cirrus is an optional, very cheap addition.
-            amount: 0.0,
-            stretch: 4.0,
-            scale: 2.2,
+            // 2026-11-24: Feihei's live F5 tuning. A faint, long, fine veil
+            // reads better against the dusk than no cirrus at all; the
+            // volumetric stratocumulus stays the main cloud.
+            amount: 0.06,
+            stretch: 1.4,
+            scale: 3.6,
             directionality: 0.75,
             drift: 6.0,
         }
@@ -87,7 +88,9 @@ impl Default for CirrusUniform {
         Self {
             sun: Vec4::new(0.0, 0.1, -1.0, 0.0),
             tint: Vec4::new(1.0, 0.85, 0.7, 1.0),
-            params: Vec4::new(4.0, 2.2, 0.75, 0.0),
+            // Keep the material's first frame in step with `CirrusSettings`;
+            // later frames overwrite these from the live settings anyway.
+            params: Vec4::new(1.4, 3.6, 0.75, 0.0),
         }
     }
 }
@@ -286,16 +289,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cirrus_is_off_by_default_and_that_is_a_real_state() {
-        // Feihei's call: the volumetric layer stays the main cloud, cirrus is
-        // an optional cheap addition. A default that quietly showed cirrus
-        // would change the dusk look of every existing save.
+    fn tuned_cirrus_ships_on_and_off_is_still_expressible() {
+        // 2026-11-24: Feihei's live F5 tuning, pinned so it does not drift.
         let settings = CirrusSettings::default();
-        assert_eq!(settings.amount, 0.0, "cirrus must ship disabled");
+        assert_eq!(settings.amount, 0.06);
+        assert_eq!(settings.stretch, 1.4);
+        assert_eq!(settings.scale, 3.6);
 
-        // And OFF must be expressible: the dome hides at this amount rather
-        // than rendering an invisible-but-present layer.
-        assert!(settings.amount <= 0.001);
+        // OFF must remain expressible: at 0 the dome hides rather than
+        // rendering an invisible-but-present layer.
+        let off = CirrusSettings {
+            amount: 0.0,
+            ..Default::default()
+        };
+        assert!(off.amount <= 0.001);
     }
 
     #[test]

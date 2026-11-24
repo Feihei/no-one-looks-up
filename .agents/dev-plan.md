@@ -477,7 +477,8 @@ R3.11 落地时暴露的三个耦合缺陷，作为一个任务整体修复。�
 - **数值验证**（镜像 Bevy 投影矩阵）：深度 0.0 得到 `(nan, nan, -inf)`；深度 0.95 / 0.55 得到有限的朝前射线
 - **修复**：取**两个有限深度**（0.95 与 0.55）做差分。方向精确、不受退化远平面影响、也不依赖近平面位置
 - **测试**：`the_shader_does_not_unproject_the_degenerate_far_plane` —— 断言深度 0.0 的表达式不再出现，且两个有限深度存在。**失败模式是完全静默的**（无错误无警告，只是天空少一层），所以必须用 tripwire 而非运行期断言
-- **体积云默认关闭**（Feihei 决定）：`cloud_kind: None`、`cloud_amount: 0`。理由是体积层在黄金时刻呈块状几何感且无参数可解（轮廓被固定噪声分辨率量化在 32–64 m），而晴朗黄昏也更贴近 ADR-0001。F5 仍可手动开启
+- **体积云默认关闭**（Feihei 决定，2026-10-27，已被 2026-11-24 调参覆盖）：`cloud_kind: None`、`cloud_amount: 0`。理由是体积层在黄金时刻呈块状几何感且无参数可解（轮廓被固定噪声分辨率量化在 32–64 m），而晴朗黄昏也更贴近 ADR-0001。F5 仍可手动开启
+- **2026-11-24 实机调参转正**：Feihei 在 F5 面板选定 `cloud_kind: Stratocumulus` / `cloud_amount: 0.35` / `layer 1500–2400`（写入该 kind 的 `layer()` 预设）/ `cirrus 0.06 / stretch 1.4 / scale 3.6` / `ev100 12.9` / `bloom 0.3`，已写入 `DuskSky::default()` 与 `CirrusSettings::default()`。低覆盖量保留了破碎感，避免旧默认下满覆盖的块状几何；F5 仍可循环回 `cloud_kind: None` 的晴朗天空
 - **测试**：`volume_clouds_ship_disabled` —— 锁定默认值，因为「合理默认」类重构会悄悄把它改回去
 - **实测**：112 测试通过、clippy 零告警、游戏开卷云运行零 shader 错误
 
@@ -825,7 +826,7 @@ R3.21 玻璃反射/室内光 [██████████] 实现完成（烘
 - [x] **测试**（lib 287→300）：`a_lit_pane_is_a_room_not_a_sticker`（热斑/均值/角部 + 质心跟随灯位 + 全风格灯位偏心与横向移动）、`a_lit_room_wraps_its_light_around_the_mullion`（框发光但不超过**最亮玻璃**的一半——拿窗格中心当基准会误判，灯是偏心的）、`a_lit_room_spills_onto_its_sill`、`the_street_window_is_deterministic_and_inside_the_facade`、`the_far_side_of_the_street_breaks_the_horizon`（多仰角搜索"同时有天和墙"的环）、`the_reflection_has_no_seam_where_the_azimuth_wraps`、`window_glows_respect_the_per_chunk_budget_and_the_seed`、`the_same_seed_lights_the_same_windows`
 - [x] **验证**：`cargo fmt`、`cargo clippy --all-targets -- -D warnings`、`cargo test`（300 lib + 4 集成，GPU 用例 ignore）全绿
 - **待实机确认**：① `reflection` 0.0 / 0.5 / 1.0 / 2.0 四档观感（1.0 是"与大气探针同亮"，>2 开始像镜子，会把立面拉离参考照片）；② 灯位偏心 0.19–0.22 + 窗帘是否读得出来；③ 每 chunk 2 盏、45% 入选在夜景下是否偏稀（可调常量）；④ 探针替换大气探针后**环境漫反射**也会跟着变（`affects_lightmapped_mesh_diffuse: true`），若街面偏暗改 false
-- **已知限制**：探针天空线是**通用**天际线而非本图真实街谷（探针只在启动烘焙一次，地图是数据驱动的）；真正的按地点捕获需要运行时 cube 渲染，工作量大得多。云也是刻意低对比：项目默认天空无云（体积云关、cirrus 0），探针里放明显云团会与天空不符
+- **已知限制**：探针天空线是**通用**天际线而非本图真实街谷（探针只在启动烘焙一次，地图是数据驱动的）；真正的按地点捕获需要运行时 cube 渲染，工作量大得多。云也是刻意低对比：项目默认只有低覆盖层云 + 淡卷云，探针里放明显云团会与天空不符
 
 ## 风险与依赖
 

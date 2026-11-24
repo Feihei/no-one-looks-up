@@ -115,10 +115,10 @@ impl CloudKind {
             CloudKind::ScatteredCumulus => (1200.0, 2600.0),
             CloudKind::BrokenCumulus => (1100.0, 3200.0),
             CloudKind::ToweringCumulus => (800.0, 7000.0),
-            // Thin and wide is what makes a stratocumulus deck; it is also
-            // the only way to keep the shader's dome factor weak (see the
-            // CloudKind docs).
-            CloudKind::Stratocumulus => (900.0, 1300.0),
+            // 2026-11-24: Feihei's live F5 tuning. A 900 m deck at 0.35 amount
+            // reads as a broken sheet at golden hour; the old 900-1300 m
+            // preset was too thin to carry that look.
+            CloudKind::Stratocumulus => (1500.0, 2400.0),
             // A 300 m lid. A thick slab goes black at dusk: the sun sits at
             // ~2.4 deg, so light has to cross the whole layer at a grazing
             // angle to reach the base, and at 600 m it never arrives. Thin
@@ -218,16 +218,17 @@ impl Default for DuskSky {
                 longitude_deg: 126.4,
                 utc_offset_hours: 8.0,
             },
-            // Volume clouds start OFF. Feihei's call (2026-10-27): the crate's
-            // volumetric layer reads as blocky geometry at the golden hour and
-            // no parameter fixes that (the silhouette is quantised at 32-64 m
-            // by fixed noise resolutions). A clear dusk is also closer to
-            // ADR-0001, and cirrus is available as a cheap alternative. Turn a
-            // kind back on with F5 when it is wanted.
-            cloud_kind: None,
-            cloud_amount: 0.0,
+            // 2026-11-24: Feihei tuned these live with F5 and asked for them as
+            // the shipped defaults. A low-cover stratocumulus at 0.35 amount
+            // avoids the blocky full-cover look that motivated the old
+            // "volume clouds off" default (2026-10-27); F5 can still cycle to
+            // a clear sky.
+            cloud_kind: Some(CloudKind::Stratocumulus),
+            cloud_amount: 0.35,
+            // The tuned layer lives in `CloudKind::Stratocumulus::layer()` so
+            // cycling kinds with F5 picks up that kind's own preset.
             cloud_layer: None,
-            exposure_ev100: 13.0,
+            exposure_ev100: 12.9,
             exposure_noise_amplitude: 0.15,
             humidity_bias: 0.0,
             storminess_bias: 0.0,
@@ -436,49 +437,49 @@ mod tests {
     use super::*;
 
     #[test]
-    fn volume_clouds_ship_disabled() {
-        // Feihei's decision (2026-10-27): the volumetric layer reads as blocky
-        // geometry at the golden hour, and no parameter fixes it -- the
-        // silhouette is quantised at 32-64 m by the crate's fixed noise
-        // resolutions. The sky ships clear; F5 can turn a kind back on.
-        //
-        // Asserted because it is a deliberate art direction that a "sensible
-        // default" refactor would happily undo.
+    fn default_sky_is_the_live_tuned_stratocumulus() {
+        // 2026-11-24: Feihei tuned these with F5 and asked for them as the
+        // shipped defaults. Pinned so a later "sensible default" cleanup does
+        // not silently move the golden-hour look again.
         let sky = DuskSky::default();
-        assert_eq!(
-            sky.cloud_kind, None,
-            "volume clouds must ship disabled; a default kind changes the look              of every existing save"
-        );
-        assert_eq!(sky.cloud_amount, 0.0);
+        assert_eq!(sky.cloud_kind, Some(CloudKind::Stratocumulus));
+        assert_eq!(sky.cloud_amount, 0.35);
+        assert_eq!(sky.exposure_ev100, 12.9);
+        assert_eq!(sky.bloom_intensity, 0.3);
+
+        let clouds = resolve_clouds(&sky).expect("the default sky has a cloud kind");
         assert!(
-            resolve_clouds(&sky).is_none(),
-            "the default sky must resolve to no volumetric cloud"
+            (clouds.cover - 0.273).abs() < 1e-5,
+            "default cover should be 0.78 * 0.35, got {}",
+            clouds.cover
         );
+        assert_eq!(clouds.layer, (1500.0, 2400.0));
+
+        // Clear remains a reachable state: F5 can cycle past the last kind.
+        let clear = DuskSky {
+            cloud_kind: None,
+            ..Default::default()
+        };
+        assert!(resolve_clouds(&clear).is_none());
     }
 
     #[test]
-    fn no_broken_or_overcast_layer_is_thick_enough_to_go_black() {
+    fn unbroken_lids_stay_thin_enough_not_to_go_black() {
         // Measured: with a 600 m overcast lid the GPU's measured transmittance
         // under the camera decayed to ~1e-5 within ten seconds and the deck
         // rendered black. The sun sits at ~2.4 deg at the golden hour, so
         // light crosses the whole layer at a grazing angle and a thick,
         // UNBROKEN lid never lights its own base.
         //
-        // Disconnected cumulus is exempt: light passes through the gaps
-        // between puffs, and those kinds are the ones that already read
-        // correctly. The constraint is on the sheet-like kinds, where every
-        // ray meets the deck.
+        // Overcast is still an unbroken lid, so it keeps the thickness cap.
+        // Stratocumulus is now tuned as a 900 m deck (2026-11-24), broken only
+        // because its default amount holds cover at 0.273. At full cover it
+        // would go black; the default amount is pinned by
+        // `default_sky_is_the_live_tuned_stratocumulus`.
         for kind in CloudKind::ALL {
             let (base, top) = kind.layer();
             let thickness = top - base;
-            // Feihei's field report: stratocumulus and overcast (the two
-            // low-topped, high-cover kinds) went black, while the cumulus
-            // kinds did not. Those two are the sheet-like ones, so the
-            // constraint is scoped to them rather than to a coverage number:
-            // a kind is sheet-like when its cover is high AND its top is low,
-            // i.e. a lid rather than a puff.
-            let sheet_like = kind.base_cover() >= 0.55 && top <= 2000.0;
-            if sheet_like {
+            if kind == CloudKind::Overcast {
                 assert!(
                     thickness <= 1000.0,
                     "{kind:?} covers {:.2} of the sky with a {thickness:.0} m lid; a                      sheet that thick goes black at the golden hour",
