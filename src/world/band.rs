@@ -216,6 +216,9 @@ fn plan_row(
             variant: placement::facade_variant(position),
             tree: None,
             base: 0.0,
+            // The band's street is the ring road inside it: `out` points into
+            // the band, so the visible facade faces `-out`.
+            facing: -side.out,
         });
     }
 }
@@ -312,6 +315,7 @@ fn push_scenery_tree(plan: &mut ChunkPlan, position: Vec2, tree: TreeInstance) {
         variant: 0,
         tree: Some(tree),
         base: 0.0,
+        facing: Vec2::ZERO,
     });
 }
 

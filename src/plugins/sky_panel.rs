@@ -179,6 +179,19 @@ pub const PARAMS: &[SkyParam] = &[
             decimals: 2,
         },
     },
+    // R3.21: 0 turns the baked probe off, which is the A/B against the plain
+    // atmosphere probe the sky used before. Above ~2 the reflection starts to
+    // read as a mirror and pulls the facade away from the reference photos.
+    SkyParam {
+        name: "reflection",
+        value: SkyValue::Float {
+            get: |sky| sky.reflection_intensity,
+            set: |sky, v| sky.reflection_intensity = v,
+            step: 0.05,
+            range: (0.0, 3.0),
+            decimals: 2,
+        },
+    },
 ];
 
 /// Cycle order for the cloud-kind row: `None` (clear) first, then the kinds.

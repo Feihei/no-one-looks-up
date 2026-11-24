@@ -218,6 +218,7 @@ pub(crate) fn push_prop(
         variant,
         tree: None,
         base,
+        facing: bevy::math::Vec2::ZERO,
     });
 }
 
@@ -1102,6 +1103,7 @@ mod tests {
             variant: 0,
             tree: None,
             base: 0.0,
+            facing: bevy::math::Vec2::NEG_Y,
         }
     }
 

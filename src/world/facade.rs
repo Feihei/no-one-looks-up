@@ -284,18 +284,45 @@ pub fn sample(style: FacadeStyle, variant: u8, u: f32, v: f32) -> Surface {
         && fy <= spec.bottom
         && hash01(bay, floor, seed ^ 0x9e37) >= spec.blank;
 
+    let x0 = 0.5 + wander - half;
+    let x1 = 0.5 + wander + half;
+    let px = (fx - x0) / (x1 - x0);
+    let py = (fy - spec.top) / (spec.bottom - spec.top);
+    let opening = in_window_partial(fx, fy, &spec, wander);
+
     if in_window {
-        let (x0, x1) = (0.5 + wander - half, 0.5 + wander + half);
-        let px = (fx - x0) / (x1 - x0);
-        let py = (fy - spec.top) / (spec.bottom - spec.top);
         let pane = pane_at(px, py, spec.panes, bay, floor, spec.lit, seed);
         surface = window_surface(style, &surface, &pane, px, py, seed);
-    } else if !in_window_partial(fx, fy, &spec, wander) {
+    } else if !opening {
         // Nothing: keep the wall.
     } else {
         // Frame / reveal band: slightly darker (occlusion), matte.
         surface.albedo = mix3(surface.albedo, [0.30, 0.29, 0.27], 0.45);
         surface.roughness = surface.roughness.max(0.8);
+        // ...but it is not pitch black next to a lit room. The reveal and the
+        // sill catch the spill, strongest just under the opening and fading
+        // down the sill, weakest above the lintel. This is the cue that ties
+        // the glowing pane to the wall around it instead of letting it float.
+        let pane = pane_at(
+            px.clamp(0.02, 0.98),
+            py.clamp(0.02, 0.98),
+            spec.panes,
+            bay,
+            floor,
+            spec.lit,
+            seed,
+        );
+        if pane.lit {
+            let (colour, glow) = pane_light(style, &pane);
+            let vertical = if fy > spec.bottom {
+                (1.0 - ((fy - spec.bottom) / 0.055).min(1.0)) * 0.16
+            } else if fy < spec.top {
+                0.035
+            } else {
+                0.09
+            };
+            surface.emissive = scale3(colour, glow * vertical);
+        }
     }
 
     // Sill: a bright lip under every window, catching sky light. This single
@@ -324,13 +351,26 @@ fn in_window_partial(fx: f32, fy: f32, spec: &WindowSpec, wander: f32) -> bool {
 struct Pane {
     /// True when the point is inside the glass, not on a mullion or frame.
     glass: bool,
-    /// True when the glass has a light behind it.
+    /// True when the room behind the pane is lit. Deliberately independent of
+    /// `glass`: a mullion is a solid bar in a lit room, and its sides catch the
+    /// light (see `window_surface`), so "lit" must survive the glass test.
     lit: bool,
     /// 0..1 brightness of the light behind it.
     glow: f32,
     /// Deterministic per-pane seed, so the light's colour and reach are stable
     /// across bakes and every building using this variant agrees.
     seed: u32,
+    /// Where the lamp sits inside the pane, 0..1 from the pane's left/top.
+    ///
+    /// Off-centre on purpose: a pane whose brightest point is its exact centre
+    /// reads as a decal. A ceiling lamp above eye level plus a floor lamp or a
+    /// television to one side puts the hot spot off-axis, which is the single
+    /// cheapest depth cue a texture can carry.
+    source: (f32, f32),
+    /// Fraction of the pane covered by a curtain, 0 = none.
+    curtain: f32,
+    /// Whether that curtain hangs from the right edge.
+    curtain_right: bool,
 }
 
 fn pane_at(px: f32, py: f32, panes: u32, bay: u32, floor: u32, lit_chance: f32, seed: u32) -> Pane {
@@ -345,28 +385,44 @@ fn pane_at(px: f32, py: f32, panes: u32, bay: u32, floor: u32, lit_chance: f32, 
     // Lit is a property of the room, not of the bay or the floor: hashing the
     // pane index with the building variant is enough, and it keeps a whole
     // floor from switching on at once (which reads as an office, not a home).
-    let lit = glass && hash01(pane_index, pane_seed & 7, seed ^ 0xa5) < lit_chance;
+    let lit = hash01(pane_index, pane_seed & 7, seed ^ 0xa5) < lit_chance;
+    // The lamp hangs in the upper half (ceiling / wall lamp) and off to one
+    // side by up to a third of the pane. Both are per-room, so neighbouring
+    // panes never share a hot spot.
+    let source = (
+        0.30 + 0.40 * hash01(pane_seed, 11, seed),
+        0.24 + 0.18 * hash01(pane_seed, 13, seed),
+    );
+    // One pane in five has a curtain drawn part-way. It is only visible in a
+    // lit room (an unlit pane is already black), and it is what breaks the
+    // "glowing rectangle" silhouette into a room with something in it.
+    let curtain_roll = hash01(pane_seed, 17, seed);
+    let curtain = if curtain_roll < 0.20 {
+        0.28 + 0.34 * hash01(pane_seed, 19, seed)
+    } else {
+        0.0
+    };
     Pane {
         glass,
         lit,
         // Reach, so neighbouring lit panes are not equally bright.
         glow: 0.45 + 0.55 * hash01(pane_seed, 7, seed),
         seed: pane_seed,
+        source,
+        curtain,
+        curtain_right: hash01(pane_seed, 23, seed) > 0.5,
     }
 }
 
-/// Turns the wall into glass, frame or reflection.
-fn window_surface(
-    style: FacadeStyle,
-    wall: &Surface,
-    pane: &Pane,
-    px: f32,
-    py: f32,
-    seed: u32,
-) -> Surface {
+/// Colour temperature and brightness of the light in one room.
+///
+/// Split from [`window_surface`] because the frame, the sill and the glass all
+/// need the same answer: a lit pane whose mullion is lit by a different colour
+/// reads as two objects, not one window.
+fn pane_light(style: FacadeStyle, pane: &Pane) -> ([f32; 3], f32) {
     // Per-pane light: colour temperature by style, plus one odd window in ten
     // (a television, a fluorescent tube, a bare bulb).
-    let (colour, glow) = match style {
+    match style {
         FacadeStyle::OldCity => {
             if pane.seed.is_multiple_of(11) {
                 ([1.0, 0.55, 0.34], 0.62)
@@ -399,7 +455,116 @@ fn window_surface(
                 ([1.0, 0.70, 0.40], pane.glow)
             }
         }
-    };
+    }
+}
+
+/// Luminous power of one lit room's spill light (lumens).
+///
+/// First-tune parameter. The light sits outside the facade, so it stands in
+/// for the *whole* room's spill rather than one bulb. Too high and the wall
+/// around the window blows out; too low and nothing reaches the pavement. The
+/// C step exists to be judged on screen, so this number is deliberately a
+/// single constant.
+pub const WINDOW_GLOW_LUMENS: f32 = 1400.0;
+
+/// Cut-off radius of a window spill light (m).
+pub const WINDOW_GLOW_RANGE: f32 = 7.0;
+
+/// Distance from the facade plane to the spill light (m).
+///
+/// Outside, not inside: without shadows a light behind the wall cannot light
+/// the wall's outward normal at all. A metre out also keeps the hot spot off
+/// the plaster while still catching the sill and the pavement.
+pub const WINDOW_GLOW_OFFSET: f32 = 1.1;
+
+/// One lit window on a building facade, in tile terms.
+///
+/// C only needs a position and a colour, but keeping the bay/floor indices
+/// makes the value testable without a renderer: a light that lands outside the
+/// facade is a silently invisible lamp.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WindowLight {
+    /// Bay along the frontage, 0-based.
+    pub bay: u32,
+    /// Floor from the roofline, 0 = top.
+    pub floor: u32,
+    /// 0..1 across the bay (the lamp's horizontal position, not the pane's).
+    pub fx: f32,
+    /// 0..1 down the floor (0 = ceiling).
+    pub fy: f32,
+    /// sRGB light colour.
+    pub tint: [f32; 3],
+    /// 0..1 brightness of the room.
+    pub glow: f32,
+}
+
+/// The lowest open lit window on a facade, if it has one.
+///
+/// Lowest, not brightest: a point light behind a ninth-floor pane lights
+/// nothing a walker can see. `bay_count` and `floor_count` are the whole-bay /
+/// whole-floor multiples placement snapped the building to; the texture
+/// repeats every four of each, so the pattern is evaluated modulo the tile.
+pub fn street_window(
+    style: FacadeStyle,
+    variant: u8,
+    bay_count: u32,
+    floor_count: u32,
+) -> Option<WindowLight> {
+    let spec = style.window();
+    let seed = variant as u32 * 7919 + style as u32 * 104_729;
+    let mut best: Option<WindowLight> = None;
+    for floor in (0..floor_count).rev() {
+        let cell_floor = floor % FLOORS_PER_TILE;
+        for bay in 0..bay_count {
+            let cell_bay = bay % BAYS_PER_TILE;
+            if hash01(cell_bay, cell_floor, seed ^ 0x9e37) < spec.blank {
+                continue;
+            }
+            let wander = (hash01(cell_bay, cell_floor, seed ^ 0x51ed) - 0.5) * 0.06;
+            for pane_index in 0..spec.panes {
+                let center = (pane_index as f32 + 0.5) / spec.panes as f32;
+                let pane = pane_at(
+                    center, 0.5, spec.panes, cell_bay, cell_floor, spec.lit, seed,
+                );
+                // A drawn curtain hides the lamp: a point light there would
+                // light the street from behind fabric, which is worse than no
+                // light at all.
+                if !pane.lit || pane.curtain > 0.0 {
+                    continue;
+                }
+                let (tint, glow) = pane_light(style, &pane);
+                let window_pos = center + (pane.source.0 - 0.5) / spec.panes as f32;
+                let candidate = WindowLight {
+                    bay,
+                    floor,
+                    fx: 0.5 + wander + (window_pos - 0.5) * spec.width,
+                    fy: spec.top + pane.source.1 * (spec.bottom - spec.top),
+                    tint,
+                    glow,
+                };
+                if best.is_none_or(|b| candidate.glow > b.glow) {
+                    best = Some(candidate);
+                }
+            }
+        }
+        // The lowest floor wins even if a higher room is brighter.
+        if best.is_some() {
+            break;
+        }
+    }
+    best
+}
+
+/// Turns the wall into glass, frame or reflection.
+fn window_surface(
+    style: FacadeStyle,
+    wall: &Surface,
+    pane: &Pane,
+    px: f32,
+    py: f32,
+    seed: u32,
+) -> Surface {
+    let (colour, glow) = pane_light(style, pane);
 
     if !pane.glass {
         // Mullion / frame bar: painted metal, matte, darker than the wall so it
@@ -411,12 +576,25 @@ fn window_surface(
             // Village frames: cheap painted steel, a little bluer.
             FacadeStyle::UrbanVillage => [0.46, 0.45, 0.43],
         };
-        return Surface {
+        let mut surface = Surface {
             albedo: mix3(wall.albedo, frame, 0.75),
             roughness: 0.62,
             metallic: 0.0,
             emissive: [0.0; 3],
         };
+        if pane.lit {
+            // A lit room wraps its light around the mullion instead of
+            // stopping at the glass edge. Without this the frame is a black
+            // bar pasted over a glowing rectangle, which is the "sticker"
+            // look the whole rewrite is trying to avoid.
+            let panes = style.window().panes as f32;
+            let cell = (px * panes).floor().clamp(0.0, panes - 1.0);
+            let local = px * panes - cell;
+            let edge = local.min(1.0 - local).min(py.min(1.0 - py) * 3.0);
+            let wrap = 1.0 - (edge / 0.08).clamp(0.0, 1.0);
+            surface.emissive = scale3(colour, 0.09 * glow * wrap);
+        }
+        return surface;
     }
 
     // Glass: dark, because a pane at dusk shows the room behind it, not the
@@ -429,12 +607,19 @@ fn window_surface(
         FacadeStyle::Factory => [0.070, 0.074, 0.072],
         FacadeStyle::UrbanVillage => [0.052, 0.058, 0.062],
     };
+    // A soft diagonal sheen in the glass itself. The physical reflection is
+    // only ~4% at these angles and the sky it mirrors is a smooth gradient, so
+    // the pane needs a little structure of its own to read as a *surface*
+    // rather than a hole. Kept in the albedo, not emissive: it must still be
+    // lit, or it becomes a sticker in a different colour.
+    let band = (px * 0.72 + (1.0 - py) * 0.28 - 0.38).abs();
+    let sheen = 0.045 * (1.0 - (band / 0.38).min(1.0));
     // Corrugation / dust: a little variation so panes are not identical.
     let dust = 0.004 * hash01(pane.seed, 3, seed);
     let albedo = [
-        tint[0] + top_brightness + dust,
-        tint[1] + top_brightness + dust,
-        tint[2] + top_brightness * 1.15 + dust,
+        tint[0] + top_brightness + dust + sheen,
+        tint[1] + top_brightness + dust + sheen,
+        tint[2] + top_brightness * 1.15 + dust + sheen * 1.1,
     ];
 
     // Factory glass is dirtier and its frames thinner; old-city glass is the
@@ -447,20 +632,55 @@ fn window_surface(
         FacadeStyle::UrbanVillage => 0.07 + 0.06 * hash01(pane.seed, 5, seed),
     };
 
-    // A point light inside the room: brightest at the centre of the pane, with
-    // the reach falling off before the frame. This is what stops a lit window
-    // from reading as a flat sticker.
-    let d = ((px - 0.5).powi(2) + (py - 0.5).powi(2)).sqrt() * 2.0;
-    let falloff = (1.0 - 0.55 * d.min(1.0)).max(0.25);
-    let emissive = if pane.lit {
-        [
-            colour[0] * glow * falloff,
-            colour[1] * glow * falloff,
-            colour[2] * glow * falloff,
-        ]
+    // A lamp inside the room: a hot core at the lamp itself, a broad room
+    // fill around it, and the reveal eating the light at the pane's edge.
+    // This is what stops a lit window from reading as a flat sticker: the eye
+    // reads the hot spot, the falloff and the occluded border as a *room*.
+    let (sx, sy) = pane.source;
+    let dx = (px - sx) * 1.45;
+    let dy = py - sy;
+    let d2 = dx * dx + dy * dy;
+    let core = (-14.0 * d2).exp();
+    let room = (1.0 - (d2 * 1.15).min(1.0)).max(0.0);
+    let fill = 0.55 * room * room;
+
+    // The reveal: the top of the pane sits under a lintel and the sides under
+    // a frame, so the light dims before it reaches the edge.
+    let edge_x = (px.min(1.0 - px) * 2.0).min(1.0);
+    let edge_y = (py.min(1.0 - py) * 3.0).min(1.0);
+    let reveal = 0.42 + 0.58 * smoothstep01(edge_x * edge_y);
+    let lintel = 0.55 + 0.45 * smoothstep01((py / 0.14).min(1.0));
+
+    // A drawn curtain on one side: a soft edge with a sliver of light leaking
+    // past it. Only one pane in five, so it reads as a lived-in room rather
+    // than a pattern.
+    let curtain = if pane.curtain > 0.0 {
+        let edge = if pane.curtain_right {
+            1.0 - pane.curtain
+        } else {
+            pane.curtain
+        };
+        let covered = if pane.curtain_right {
+            px > edge
+        } else {
+            px < edge
+        };
+        let soft = smoothstep01(((px - edge).abs() / 0.03).min(1.0));
+        if covered {
+            0.35 + 0.65 * (1.0 - soft)
+        } else {
+            0.35 + 0.65 * soft
+        }
     } else {
-        [0.0; 3]
+        1.0
     };
+
+    let level = if pane.lit {
+        ((core + fill) * reveal * lintel * curtain).min(1.0) * 0.95
+    } else {
+        0.0
+    };
+    let emissive = scale3(colour, glow * level);
 
     Surface {
         albedo,
@@ -1286,5 +1506,251 @@ mod tests {
             }
         }
         assert_eq!(checked, (n * n) as usize);
+    }
+
+    /// A lit pane must bake into a *room*, not a glowing rectangle: a hot spot,
+    /// a broad fill and an occluded edge. The old 512² mask was a symmetric
+    /// radial falloff, which is exactly the sticker look R3.11's rewrite was
+    /// meant to avoid.
+    #[test]
+    fn a_lit_pane_is_a_room_not_a_sticker() {
+        for style in STYLES {
+            let spec = style.window();
+            let seed = style as u32 * 104_729;
+            let wall = test_wall();
+            let mut checked = 0;
+            // The lamp position is drawn per pane, so "off-centre" is a
+            // property of the facade, not of any single pane: a pane whose
+            // lamp happens to land near the middle is not a bug. These
+            // accumulators carry that claim across every pane of the style.
+            let mut off_centre_sum = 0.0f32;
+            let (mut source_x0, mut source_x1) = (f32::MAX, f32::MIN);
+            for bay in 0..BAYS_PER_TILE {
+                for floor in 0..FLOORS_PER_TILE {
+                    for pane_index in 0..spec.panes {
+                        let center = (pane_index as f32 + 0.5) / spec.panes as f32;
+                        let pane = pane_at(center, 0.5, spec.panes, bay, floor, spec.lit, seed);
+                        // A drawn curtain is a soft glow on purpose: it hides
+                        // the lamp, so the hot-spot assertions below only make
+                        // sense on an open pane.
+                        if !pane.lit || pane.curtain > 0.0 {
+                            continue;
+                        }
+                        let mut peak = 0.0f32;
+                        let mut sum = 0.0f32;
+                        let mut cx = 0.0f32;
+                        let mut cy = 0.0f32;
+                        let mut n = 0.0f32;
+                        for iy in 0..=20 {
+                            for ix in 0..=20 {
+                                let px = 0.08 + 0.84 * ix as f32 / 20.0;
+                                let py = 0.06 + 0.88 * iy as f32 / 20.0;
+                                let s = window_surface(style, &wall, &pane, px, py, seed);
+                                let l = luminance(s.emissive);
+                                peak = peak.max(l);
+                                sum += l;
+                                cx += l * px;
+                                cy += l * py;
+                                n += 1.0;
+                            }
+                        }
+                        let mean = sum / n;
+                        assert!(
+                            peak > 0.35,
+                            "{}: lit pane peaks at {peak:.2}",
+                            style.label()
+                        );
+                        assert!(
+                            mean < 0.62 * peak,
+                            "{}: lit pane is flat (mean {mean:.2} vs peak {peak:.2})",
+                            style.label()
+                        );
+                        // The reveal eats the light: a glass corner is much
+                        // darker than the lamp, or the pane ends in a glowing
+                        // rectangle.
+                        let corner = window_surface(style, &wall, &pane, 0.10, 0.10, seed);
+                        let corner_l = luminance(corner.emissive);
+                        assert!(
+                            corner_l < 0.30 * peak,
+                            "{}: glass edge glows like the lamp ({corner_l:.2} vs {peak:.2})",
+                            style.label()
+                        );
+                        // The glow sits where the lamp is, not at the pane's
+                        // midpoint: that is what makes it a room with a light
+                        // in it rather than a lit surface. Tolerance covers the
+                        // fill and the lintel pulling the centroid a little.
+                        let (cx, cy) = (cx / sum.max(1e-6), cy / sum.max(1e-6));
+                        let to_source =
+                            ((cx - pane.source.0).powi(2) + (cy - pane.source.1).powi(2)).sqrt();
+                        assert!(
+                            to_source < 0.20,
+                            "{}: the glow ignores the lamp (centroid {cx:.2}, {cy:.2} vs source {:.2}, {:.2})",
+                            style.label(),
+                            pane.source.0,
+                            pane.source.1
+                        );
+                        off_centre_sum +=
+                            ((pane.source.0 - 0.5).powi(2) + (pane.source.1 - 0.5).powi(2)).sqrt();
+                        source_x0 = source_x0.min(pane.source.0);
+                        source_x1 = source_x1.max(pane.source.0);
+                        checked += 1;
+                    }
+                }
+            }
+            assert!(checked > 0, "{}: no open lit pane to test", style.label());
+            let off_centre = off_centre_sum / checked as f32;
+            assert!(
+                off_centre > 0.10,
+                "{}: every lamp sits near the pane centre (mean {off_centre:.2})",
+                style.label()
+            );
+            assert!(
+                source_x1 - source_x0 > 0.15,
+                "{}: the lamp never moves sideways (x {source_x0:.2}..{source_x1:.2})",
+                style.label()
+            );
+        }
+    }
+
+    /// A lit room wraps its light around the mullion. Without this the frame is
+    /// a black bar pasted across a glowing pane.
+    #[test]
+    fn a_lit_room_wraps_its_light_around_the_mullion() {
+        let style = FacadeStyle::OldCity;
+        let spec = style.window();
+        let seed = style as u32 * 104_729;
+        let wall = test_wall();
+        let mut checked = 0;
+        for bay in 0..BAYS_PER_TILE {
+            for floor in 0..FLOORS_PER_TILE {
+                for pane_index in 0..spec.panes {
+                    let center = (pane_index as f32 + 0.5) / spec.panes as f32;
+                    let pane = pane_at(center, 0.5, spec.panes, bay, floor, spec.lit, seed);
+                    if !pane.lit {
+                        continue;
+                    }
+                    // The mullion is the same pane with the glass mask off: its
+                    // light comes from the room behind it, so it must share the
+                    // room's colour and brightness.
+                    let mullion_pane = Pane {
+                        glass: false,
+                        ..pane
+                    };
+                    let mullion = window_surface(style, &wall, &mullion_pane, 0.0, 0.5, seed);
+                    let mullion_l = luminance(mullion.emissive);
+                    // Compare against the pane's *brightest* glass, not its
+                    // centre: the lamp is off-centre, so a fixed sample can land
+                    // in a dim corner and make any frame look bright. The claim
+                    // is that no part of the frame out-glows the room.
+                    let mut glass_peak = 0.0f32;
+                    for iy in 0..=8 {
+                        for ix in 0..=8 {
+                            let px = 0.02 + 0.96 * ix as f32 / 8.0;
+                            let py = 0.02 + 0.96 * iy as f32 / 8.0;
+                            let s = window_surface(style, &wall, &pane, px, py, seed);
+                            glass_peak = glass_peak.max(luminance(s.emissive));
+                        }
+                    }
+                    assert!(
+                        mullion_l > 0.01,
+                        "a mullion next to a lit room must not be black ({mullion_l:.3})"
+                    );
+                    assert!(
+                        mullion_l < glass_peak * 0.5,
+                        "the mullion is lit like the glass ({mullion_l:.3} vs peak {glass_peak:.3})"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 0, "no lit pane to test");
+    }
+
+    /// The sill under a lit window catches the spill; a black sill under a
+    /// glowing pane is what makes the window look pasted on the wall.
+    #[test]
+    fn a_lit_room_spills_onto_its_sill() {
+        for style in STYLES {
+            let spec = style.window();
+            let seed = style as u32 * 104_729;
+            let mut found = false;
+            for bay in 0..BAYS_PER_TILE {
+                for floor in 0..FLOORS_PER_TILE {
+                    for pane_index in 0..spec.panes {
+                        let center = (pane_index as f32 + 0.5) / spec.panes as f32;
+                        let pane = pane_at(center, 0.5, spec.panes, bay, floor, spec.lit, seed);
+                        if !pane.lit {
+                            continue;
+                        }
+                        let wander = (hash01(bay, floor, seed ^ 0x51ed) - 0.5) * 0.06;
+                        let fx = 0.5 + wander + (center - 0.5) * spec.width;
+                        let u = (bay as f32 + fx) / BAYS_PER_TILE as f32;
+                        let v = (floor as f32 + spec.bottom + 0.012) / FLOORS_PER_TILE as f32;
+                        let sill = sample(style, 0, u, v);
+                        let l = luminance(sill.emissive);
+                        assert!(
+                            l > 0.004,
+                            "{}: the sill under a lit window is black ({l:.4})",
+                            style.label()
+                        );
+                        found = true;
+                        break;
+                    }
+                    if found {
+                        break;
+                    }
+                }
+                if found {
+                    break;
+                }
+            }
+            assert!(found, "{}: no lit pane to test", style.label());
+        }
+    }
+
+    /// The C light selector must be deterministic and stay inside the facade:
+    /// a bay/floor that does not exist is a lamp nobody can see, and a
+    /// non-deterministic pick would make chunks flicker as they stream.
+    #[test]
+    fn the_street_window_is_deterministic_and_inside_the_facade() {
+        for style in STYLES {
+            let a = street_window(style, 0, 8, 6);
+            let b = street_window(style, 0, 8, 6);
+            assert_eq!(
+                a,
+                b,
+                "{}: the window pick is not deterministic",
+                style.label()
+            );
+            let window = a.unwrap_or_else(|| panic!("{}: no open lit window", style.label()));
+            assert!(window.bay < 8, "{}: bay out of range", style.label());
+            assert!(window.floor < 6, "{}: floor out of range", style.label());
+            assert!(
+                (0.0..=1.0).contains(&window.fx),
+                "{}: fx {} outside the bay",
+                style.label(),
+                window.fx
+            );
+            assert!(
+                (0.0..1.0).contains(&window.fy),
+                "{}: fy {} outside the floor",
+                style.label(),
+                window.fy
+            );
+            assert!(window.glow > 0.0);
+        }
+    }
+
+    fn test_wall() -> Surface {
+        Surface {
+            albedo: [0.42, 0.39, 0.35],
+            roughness: 0.9,
+            metallic: 0.0,
+            emissive: [0.0; 3],
+        }
+    }
+
+    fn luminance(rgb: [f32; 3]) -> f32 {
+        rgb[0].max(rgb[1]).max(rgb[2])
     }
 }

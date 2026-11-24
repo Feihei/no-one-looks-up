@@ -18,7 +18,10 @@ use bevy::prelude::*;
 
 use crate::plugins::facade::{FacadeMaterial, facade_material};
 use crate::world::collision::CollisionIndex;
-use crate::world::facade::{FacadeStyle, STYLE_COUNT, VARIANT_COUNT, bake_facade, texture_image};
+use crate::world::facade::{
+    FacadeStyle, STYLE_COUNT, VARIANT_COUNT, WINDOW_GLOW_LUMENS, WINDOW_GLOW_OFFSET,
+    WINDOW_GLOW_RANGE, bake_facade, street_window, texture_image,
+};
 use crate::world::layout_graph::LayoutGraph;
 use crate::world::path_network::{WorldSeed, generate_world};
 use crate::world::placement;
@@ -1027,6 +1030,73 @@ fn spawn_prop(
     }
 }
 
+/// Upper bound on window spill lights per chunk.
+///
+/// Two per 50 m chunk is roughly one light every 25 m along the street: enough
+/// that walking past a row reads as lit rooms, few enough that a streaming
+/// window (about 49 chunks at peak) stays inside a 100-light budget. The
+/// lights have no shadows, so this is the whole cost.
+const MAX_WINDOW_GLOWS_PER_CHUNK: usize = 2;
+
+/// Spawns one lit room's spill light on the street face of a building.
+///
+/// The facade texture already glows, but a texture cannot light the pavement
+/// or the opposite wall. This is the half that turns "a bright rectangle" into
+/// "a room behind that window": a real, shadowless point light a metre off the
+/// glass, at the lowest open lit pane the building has.
+///
+/// Deliberately sparse. One building in roughly two is a candidate and the
+/// chunk cap keeps the rest dark; a facade where every window spills light
+/// reads as an office block at noon, not a dusk street.
+fn spawn_window_glow(
+    parent: &mut ChildSpawnerCommands,
+    object: &placement::PlacedObject,
+    style: FacadeStyle,
+    left: &mut usize,
+) {
+    if *left == 0 || object.facing == Vec2::ZERO {
+        return;
+    }
+    // Position hash rather than the placement RNG: this runs at spawn time and
+    // must not consume a draw from a stream that is already approved.
+    let key = ((object.position.x * 8.0) as i32 as u32).wrapping_mul(73_856_093)
+        ^ ((object.position.y * 8.0) as i32 as u32).wrapping_mul(19_349_663);
+    if key % 100 >= 45 {
+        return;
+    }
+    let dims = style.dims();
+    let bays = (object.size.x / dims.bay).round().max(1.0) as u32;
+    let floors = (object.size.y / dims.floor).round().max(1.0) as u32;
+    let Some(window) = street_window(style, object.variant, bays, floors) else {
+        return;
+    };
+
+    let along = Quat::from_rotation_y(object.yaw) * Vec3::X;
+    let local_x = (window.bay as f32 + window.fx) / bays as f32 - 0.5;
+    let face = object.size.z * 0.5 + WINDOW_GLOW_OFFSET;
+    let position = Vec3::new(
+        object.position.x + along.x * local_x * object.size.x + object.facing.x * face,
+        // Floors count down from the roofline, matching the facade shader.
+        object.size.y * (1.0 - (window.floor as f32 + window.fy) / floors as f32),
+        object.position.y + along.z * local_x * object.size.x + object.facing.y * face,
+    );
+
+    parent.spawn((
+        Name::new("WindowGlow"),
+        PointLight {
+            color: Color::srgb(window.tint[0], window.tint[1], window.tint[2]),
+            intensity: WINDOW_GLOW_LUMENS * window.glow,
+            range: WINDOW_GLOW_RANGE,
+            // No shadow maps: a 7 m pool costs little, a cube shadow pass per
+            // room does not fit the 30 fps budget.
+            shadow_maps_enabled: false,
+            ..default()
+        },
+        Transform::from_translation(position),
+    ));
+    *left -= 1;
+}
+
 /// Spawns a chunk's planned content under its root: buildings as BoxMesh
 /// placeholders (ADR-0004 §4; R3.6 adds wear materials), trees as glTF
 /// scenes, the plaza pad as a thin box. Called inside the streaming system so
@@ -1037,6 +1107,7 @@ fn spawn_chunk_content(
     root: Entity,
     plan: &placement::ChunkPlan,
 ) {
+    let mut window_glows_left = MAX_WINDOW_GLOWS_PER_CHUNK;
     for object in &plan.objects {
         match object.kind {
             // Band masses are ordinary buildings: same cube, same facade
@@ -1080,6 +1151,14 @@ fn spawn_chunk_content(
                     // building tops watched from the shoulders up, and the wall
                     // texture stops at the parapet.
                     spawn_roof(parent, roof, &assets.unit_cube, object);
+                    // C: one real light for the lowest lit room, on the
+                    // street face only, capped per chunk.
+                    spawn_window_glow(
+                        parent,
+                        object,
+                        FacadeStyle::ALL[style],
+                        &mut window_glows_left,
+                    );
                 });
             }
             placement::PlacedKind::Prop(_) => {
@@ -1814,5 +1893,127 @@ mod tests {
         assert!(!graph.blocks.is_empty());
         assert!(!graph.edges.is_empty());
         assert!((graph.bounds.x - WORLD_SIZE).abs() < 1e-3);
+    }
+
+    /// What one run of the world produced, for the two tests below.
+    struct Glows {
+        /// One entry per light: chunk, then the bits of position and intensity.
+        /// Bits rather than floats so two runs compare exactly.
+        lights: Vec<((i32, i32), [u32; 4])>,
+        /// Chunks whose frontage got at least one light.
+        lit_chunks: std::collections::HashSet<(i32, i32)>,
+        /// Chunks currently streamed in.
+        active_chunks: usize,
+        /// Every light's range (m), for the budget check.
+        ranges: Vec<f32>,
+    }
+
+    fn window_glows() -> Glows {
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, super::WorldPlugin))
+            .init_resource::<ButtonInput<KeyCode>>()
+            .init_resource::<Assets<Mesh>>()
+            .init_resource::<Assets<StandardMaterial>>()
+            .init_resource::<Assets<crate::plugins::season::TreeSeasonMaterial>>();
+        app.world_mut().spawn((
+            Camera3d::default(),
+            Transform::from_xyz(CENTER, 1.6, CENTER),
+        ));
+        for _ in 0..12 {
+            app.update();
+        }
+
+        let lights: Vec<_> = {
+            let world = app.world_mut();
+            let mut query = world.query_filtered::<(&Transform, &PointLight), With<Name>>();
+            query
+                .iter(world)
+                .map(|(transform, light)| {
+                    let chunk = (
+                        (transform.translation.x / CHUNK_SIZE).floor() as i32,
+                        (transform.translation.z / CHUNK_SIZE).floor() as i32,
+                    );
+                    let bits = [
+                        transform.translation.x.to_bits(),
+                        transform.translation.y.to_bits(),
+                        transform.translation.z.to_bits(),
+                        light.intensity.to_bits(),
+                    ];
+                    (chunk, bits)
+                })
+                .collect()
+        };
+        let ranges = {
+            let world = app.world_mut();
+            let mut query = world.query::<&PointLight>();
+            query.iter(world).map(|light| light.range).collect()
+        };
+        let mut lights = lights;
+        lights.sort_unstable();
+        let lit_chunks = lights.iter().map(|(chunk, _)| *chunk).collect();
+        Glows {
+            lights,
+            lit_chunks,
+            active_chunks: app.world().resource::<ChunkManager>().active.len(),
+            ranges,
+        }
+    }
+
+    /// R3.21 (C): lit rooms spill real light onto the street, but the budget is
+    /// the whole point — every one of these is a shadowless point light in the
+    /// forward pass, and a window that streams in must not add a third.
+    #[test]
+    fn window_glows_respect_the_per_chunk_budget_and_the_seed() {
+        let report = window_glows();
+        let glows = &report.lights;
+        assert!(
+            !glows.is_empty(),
+            "no window glows at all: the street is lit only by the facade texture"
+        );
+
+        let mut per_chunk: std::collections::HashMap<(i32, i32), usize> =
+            std::collections::HashMap::new();
+        for (chunk, _) in glows {
+            *per_chunk.entry(*chunk).or_default() += 1;
+        }
+        for (chunk, count) in &per_chunk {
+            assert!(
+                *count <= MAX_WINDOW_GLOWS_PER_CHUNK,
+                "chunk {chunk:?} spawned {count} window lights (cap {MAX_WINDOW_GLOWS_PER_CHUNK})"
+            );
+        }
+        // The cap has to bite, or it is not a budget: with one light per
+        // building the streamed window would be far denser than this.
+        assert!(
+            glows.len() <= report.active_chunks * MAX_WINDOW_GLOWS_PER_CHUNK,
+            "{} lights across {} streamed chunks exceeds the {MAX_WINDOW_GLOWS_PER_CHUNK}/chunk budget",
+            glows.len(),
+            report.active_chunks
+        );
+        // And they are sparse on purpose: a lit window on every frontage reads
+        // as an office block at noon, not a dusk street.
+        assert!(
+            report.lit_chunks.len() < report.active_chunks,
+            "every one of the {} streamed chunks has a lit window",
+            report.active_chunks
+        );
+        for range in &report.ranges {
+            assert!(
+                (*range - WINDOW_GLOW_RANGE).abs() < 1e-3,
+                "a window light has range {range:.2} m, expected {WINDOW_GLOW_RANGE}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_same_seed_lights_the_same_windows() {
+        // Position-hashed, not drawn from the placement RNG: rebuilding the
+        // world must light the same windows, and it must not consume a draw
+        // that would shift every later placement decision.
+        assert_eq!(
+            window_glows().lights,
+            window_glows().lights,
+            "window lights moved between two runs with the same seed"
+        );
     }
 }

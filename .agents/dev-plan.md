@@ -628,6 +628,7 @@ R6: 自研体积云        [█████████░] 6.0–6.5 完成 + �
 R3.18 两级路网细分    [██████████] 实现完成（ADR-0008，2026-11-17，待实机验收）
 R3.19 主干道十字      [██████████] 实现完成（ADR-0009，2026-11-18，待实机验收）
 R3.20 连片+出生点     [██████████] 实现完成（ADR-0010，2026-11-19，待实机验收）
+R3.21 玻璃反射/室内光 [██████████] 实现完成（烘焙热斑+窗帘/自产立方图探针+街道天际线/每chunk 2盏窗光，2026-11-24，待实机验收）
 ```
 
 ### R3.11 屋顶轮廓（2026-10-31，步骤 11.3）
@@ -813,6 +814,18 @@ R3.20 连片+出生点     [██████████] 实现完成（ADR-0
 - [x] **配比上调**（R3.20d，当日评审"红色老城区占比还是太高了，适当加一些橙色和蓝色的比例吧"）：城中村份额 10%→15%（`P_VILLAGE_END` 0.2783→0.332，p_i = 份额×K/期望面积，K = 3.05 = 80/20 分割下 built 期望面积）、built 分割 90/10→80/20（`P_OLD_AREA` 0.90→0.80，公寓填充 roll 翻倍）。6 seed 实测：老城 36→25–32 块、城中村 3–7 带、公寓 1–6 片；森林 5/6 seed 存在（展示 seed 恰好为 0，同 R3.20b/c 林带挤压方差）
 - [x] **验证**：`cargo fmt`、`cargo clippy --all-targets -- -D warnings`、`cargo test`（287 lib + 4 集成）全绿；`world_map` 顶视图确认连片肌理（城中村多格带状、森林 2–3²、公寓无内路、厂区 4–5²），验证副本见本地 `.tmp/maps/`（gitignore，不入库）
 - **待实机确认**：① spawn 路口观感与朝向；② 连片 district 的巷道密度是否偏均匀（`try_extend_district` 概率 0.65 可调）；③ 棱柱数上升对碰撞查询的影响（按 chunk 分片，预期无感）
+
+### R3.21 窗玻璃反射与室内光（2026-11-24，Feihei："窗玻璃有自发光但还没有反射，所以不够真实，室内灯光也没立体感"）
+
+**背景**：R3.11 落地时玻璃走的是 Bevy 自带 PBR fragment（`reflectance 0.5` → F0 ≈ 4%，`roughness 0.045–0.16`），反射链路本身是通的，但视觉上读不出来：相机上的 `AtmosphereEnvironmentMapLight`（默认 128²）只含平滑大气渐变，项目自己的云是 fullscreen composite + 独立 cirrus 网格，**都不进探针** —— 等于镜子里什么都没有；同时 `WINDOW_EMISSIVE = 3.0` 的自发光把 4% 的镜面项淹没，而室内灯只是"以窗格中心为圆心的径向衰减"。三段顺序由 Feihei 敲定：A 烘焙层做厚 → B 给反射环境加结构 → C 真局部光。**不采用 SSR**：`ScreenSpaceReflections` 需 deferred + `DeferredPrepass`，与项目 `Msaa::Off` + depth prepass + 全屏云 composite 冲突，且屏幕空间里没有东西可反射。
+
+- [x] **A 烘焙层**（`world/facade.rs`）：`Pane` 扩 `source`（灯位）/`curtain`/`curtain_right`，`lit` 与 `glass` 解耦；自发光改 `core（exp 热斑）+ fill（房间填充）)× reveal（边缘遮蔽）× lintel（顶部）× curtain`，灯位 `(0.30+0.40h₁, 0.24+0.18h₂)` 偏心，1/5 概率拉窗帘；`pane_light()` 抽出供玻璃/框/窗台共用色温；框与竖梃在点亮时加 `0.09·glow·wrap` 溢出（不再是黑条）；窗台/窗楣/两侧加 spill；玻璃 albedo 加对角 `sheen`（0.045，进 albedo 不进 emissive，否则又成贴纸）
+- [x] **B 反射环境**（新增 `plugins/reflection.rs`）：`LightProbe` + `GeneratedEnvironmentMapLight` 喂 64² 自产立方图，内容为黄昏渐变 + 太阳瓣 + 淡高层云 + **对面街道天际线**（roofline 1°–17° 摆动，下方近黑）。三条实现要点：① cubemap 是 6 层 D2 + `TextureViewDimension::Cube` 视图（`TextureDimension` 无 `Cube`）；② 噪声按**圆周**采样（`atan2` 在 ±π 跳变，线性噪声会在每个朝那个方向的窗里留一条竖线）；③ fbm 实测只覆盖 ≈0.25–0.65，roofline 前先绕中点拉伸，否则所有屋顶挤在同一条细带里。`DuskSky::reflection_intensity` 默认 1.0（与大气探针同 cd/m² 标度），**0 = 隐藏探针**退回大气探针，F5 面板可现场 A/B。探针覆盖全图 → 权重上**替换**而非叠加相机大气探针，已在模块文档写明
+- [x] **C 真局部光**（`world/chunks.rs` + `placement.rs`/`band.rs`/`props.rs`）：`PlacedObject.facing`（朝街单位向量，非建筑为 0）；`facade::street_window()` 从最低层向上挑"非 blank、未拉窗帘、最亮"的窗格；每 chunk 最多 `MAX_WINDOW_GLOWS_PER_CHUNK = 2` 盏 `PointLight`（1400 lm、7 m、`shadow_maps_enabled: false`），45% 位置哈希入选——**位置哈希而非 placement RNG 抽样**，不改变已批准的随机流
+- [x] **测试**（lib 287→300）：`a_lit_pane_is_a_room_not_a_sticker`（热斑/均值/角部 + 质心跟随灯位 + 全风格灯位偏心与横向移动）、`a_lit_room_wraps_its_light_around_the_mullion`（框发光但不超过**最亮玻璃**的一半——拿窗格中心当基准会误判，灯是偏心的）、`a_lit_room_spills_onto_its_sill`、`the_street_window_is_deterministic_and_inside_the_facade`、`the_far_side_of_the_street_breaks_the_horizon`（多仰角搜索"同时有天和墙"的环）、`the_reflection_has_no_seam_where_the_azimuth_wraps`、`window_glows_respect_the_per_chunk_budget_and_the_seed`、`the_same_seed_lights_the_same_windows`
+- [x] **验证**：`cargo fmt`、`cargo clippy --all-targets -- -D warnings`、`cargo test`（300 lib + 4 集成，GPU 用例 ignore）全绿
+- **待实机确认**：① `reflection` 0.0 / 0.5 / 1.0 / 2.0 四档观感（1.0 是"与大气探针同亮"，>2 开始像镜子，会把立面拉离参考照片）；② 灯位偏心 0.19–0.22 + 窗帘是否读得出来；③ 每 chunk 2 盏、45% 入选在夜景下是否偏稀（可调常量）；④ 探针替换大气探针后**环境漫反射**也会跟着变（`affects_lightmapped_mesh_diffuse: true`），若街面偏暗改 false
+- **已知限制**：探针天空线是**通用**天际线而非本图真实街谷（探针只在启动烘焙一次，地图是数据驱动的）；真正的按地点捕获需要运行时 cube 渲染，工作量大得多。云也是刻意低对比：项目默认天空无云（体积云关、cirrus 0），探针里放明显云团会与天空不符
 
 ## 风险与依赖
 

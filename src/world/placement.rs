@@ -215,6 +215,15 @@ pub struct PlacedObject {
     /// spawn side centres unit meshes at `base + size.y/2` and hangs baked
     /// meshes (whose origin sits at the mount point) at `base` directly.
     pub base: f32,
+    /// Unit direction from a building out to its street, on the ground plane.
+    /// `Vec2::ZERO` for anything that is not a building.
+    ///
+    /// The street side is *not* recoverable from `yaw`: local +Z flips with
+    /// the edge's winding, so the same yaw can face a street or a back lot.
+    /// Placement knows the answer when it builds the row (it is
+    /// `-edge_normal`), so it publishes it instead of leaving the renderer to
+    /// guess. The window glow uses it to put lights on the street face only.
+    pub facing: bevy::math::Vec2,
 }
 
 /// Everything one chunk displays, in spawn order.
@@ -535,6 +544,7 @@ impl PlazaPadObject {
             variant: 0,
             tree: None,
             base: 0.0,
+            facing: bevy::math::Vec2::ZERO,
         }
     }
 }
@@ -773,6 +783,7 @@ fn place_buildings(
                     variant: facade_variant(position),
                     tree: None,
                     base: 0.0,
+                    facing: -edge_normal,
                 };
                 if let Some(style) = FacadeStyle::of(block.kind) {
                     crate::world::props::place_building_props(plan, &object, style, -edge_normal);
@@ -856,6 +867,7 @@ fn place_buildings(
                 variant: facade_variant(position),
                 tree: None,
                 base: 0.0,
+                facing: -edge_normal,
             };
             if let Some(style) = FacadeStyle::of(block.kind) {
                 crate::world::props::place_building_props(plan, &object, style, -edge_normal);
@@ -1222,6 +1234,7 @@ fn place_street_trees(
             variant: 0,
             tree: Some(tree),
             base: 0.0,
+            facing: bevy::math::Vec2::ZERO,
         });
     }
 }
@@ -1359,6 +1372,7 @@ fn push_tree(
         variant: 0,
         tree: Some(TreeInstance { asset, scale, yaw }),
         base: 0.0,
+        facing: bevy::math::Vec2::ZERO,
     });
 }
 

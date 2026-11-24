@@ -187,6 +187,18 @@ pub struct DuskSky {
     /// Bloom intensity (R1.3 tuned this by eye; exposed so it can be retuned
     /// without a rebuild).
     pub bloom_intensity: f32,
+    /// Strength of the baked reflection probe (`plugins::reflection`), in the
+    /// same cd/m² scale as `AtmosphereEnvironmentMapLight::intensity`.
+    ///
+    /// 1.0 ≈ "same brightness as the atmosphere probe this replaces", which is
+    /// what makes the two directly comparable. **0.0 switches the probe off**
+    /// and hands the view back to the atmosphere probe exactly as before R3.21
+    /// — that is the A/B switch for "did the reflections gain structure?".
+    ///
+    /// The probe covers the whole map, so it does not blend with the
+    /// atmosphere; it replaces it (light probes accumulate by weight and this
+    /// one fills the camera's box). See `plugins::reflection` for why.
+    pub reflection_intensity: f32,
 }
 
 impl Default for DuskSky {
@@ -221,6 +233,7 @@ impl Default for DuskSky {
             storminess_bias: 0.0,
             wind_speed_ms: 3.0,
             bloom_intensity: 0.3,
+            reflection_intensity: 1.0,
         }
     }
 }

@@ -11,6 +11,7 @@ pub mod facade;
 pub mod hills;
 pub mod menu;
 pub mod minimap;
+pub mod reflection;
 pub mod save;
 pub mod save_data;
 pub mod season;
@@ -35,6 +36,7 @@ use facade::FacadePlugin;
 use hills::HillsPlugin;
 use menu::MenuPlugin;
 use minimap::MinimapPlugin;
+use reflection::ReflectionProbePlugin;
 use save::SavePlugin;
 use season::SeasonPlugin;
 use sky::SkyPlugin;
@@ -52,6 +54,11 @@ impl PluginGroup for GamePlugins {
             // The UI face first: every screen below asks `UiFont` for it.
             .add(crate::core::ui_font::UiFontPlugin)
             .add(SkyPlugin)
+            // R3.21: the reflection probe reads `DuskSky` at Startup, so it must
+            // come after the sky plugin that inserts the resource. It is a
+            // world-space `LightProbe`, independent of the camera setup, so it
+            // does not care about the cloud/anti-alias ordering below.
+            .add(ReflectionProbePlugin)
             // The game's volumetric clouds replace the crate's disabled
             // CloudPlugin (adr-0007); right after the sky so its depth
             // prepass observer is registered before any camera spawns.
